@@ -1,0 +1,6 @@
+aiogram>=3.10.0
+openai
+SpeechRecognition
+pydub
+python-dotenv
+aiohttp
