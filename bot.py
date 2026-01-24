@@ -5,7 +5,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardRemove
 
-from services import GroqService, CacheManager
 from keyboards import KeyboardFactory
 from utils import HealthServer
 import handlers
