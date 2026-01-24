@@ -233,6 +233,24 @@ def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
     
     return builder.as_markup()
 
+def create_after_basic_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Создаем клавиатуру для текста после базовой обработки"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="✨ Обработать красиво", callback_data=f"convert_{user_id}_basic_to_premium"),
+    )
+    
+    builder.row(
+        InlineKeyboardButton(text="📊 Сделать саммари", callback_data=f"convert_{user_id}_basic_to_summary"),
+    )
+    
+    builder.row(
+        InlineKeyboardButton(text="💾 Экспортировать", callback_data=f"export_{user_id}_basic_txt"),
+    )
+    
+    return builder.as_markup()
+
 def create_export_keyboard(user_id: int, text_type: str) -> InlineKeyboardMarkup:
     """Создаем клавиатуру для экспорта"""
     builder = InlineKeyboardBuilder()
@@ -305,20 +323,26 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> str:
     
     return None
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER/UPTIME ROBOT ---
 async def health_check(request):
+    """Uptime Robot и Render пингуют этот адрес, чтобы проверить, жив ли бот"""
     return web.Response(text="Bot is alive!", status=200)
 
 async def start_web_server():
+    """Запуск фонового веб-сервера для Uptime Robot"""
     try:
         app = web.Application()
         app.router.add_get('/', health_check)
-        app.router.add_get('/health', health_check)
+        app.router.add_get('/health', health_check) # Два пути для надежности
+        app.router.add_get('/ping', health_check)   # Еще один путь для Uptime Robot
         
         runner = web.AppRunner(app)
         await runner.setup()
         
+        # Render передает порт через переменную PORT, локально используем 8080
         port = int(os.environ.get("PORT", 8080))
+        
+        # 0.0.0.0 - слушаем все интерфейсы
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         logger.info(f"✅ WEB SERVER STARTED ON PORT {port}")
@@ -475,16 +499,195 @@ async def process_callback(callback: types.CallbackQuery):
         user_context[target_user_id]["processed"] = result
         user_context[target_user_id]["result_type"] = result_type
         
-        # Отправляем результат
+        # Отправляем результат (БЕЗ заголовка "Результат...")
         if len(result) > 4000:
             # Если текст длинный, разбиваем
             await processing_msg.delete()
             
-            # Первая часть с заголовком
-            await callback.message.answer(
-                f"✅ <b>Результат ({process_type}):</b>\n\n{result[:4000]}",
-                parse_mode="HTML"
-            )
+            # Первая часть
+            await callback.message.answer(result[:4000])
+            
+            # Остальные части
+            for i in range(4000, len(result), 4000):
+                await callback.message.answer(result[i:i+4000])
+            
+            # Для базовой обработки добавляем кнопки дальнейших действий
+            if result_type == "basic":
+                await callback.message.answer(
+                    "📝 <b>Текст исправлен. Что дальше?</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_after_basic_keyboard(target_user_id)
+                )
+            else:
+                # Для других типов добавляем кнопки экспорта к последнему сообщению
+                await callback.message.answer(
+                    "💾 <b>Экспортировать текст?</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_export_keyboard(target_user_id, result_type)
+                )
+            
+        else:
+            # Если текст короткий
+            if result_type == "basic":
+                # Для базовой обработки сразу добавляем кнопки дальнейших действий
+                await processing_msg.edit_text(
+                    result,
+                    reply_markup=create_after_basic_keyboard(target_user_id)
+                )
+            else:
+                # Для других типов добавляем кнопки экспорта
+                await processing_msg.edit_text(
+                    result,
+                    reply_markup=create_export_keyboard(target_user_id, result_type)
+                )
+            
+    except Exception as e:
+        logger.error(f"Process error: {e}")
+        await callback.message.edit_text("❌ Ошибка обработки")
+
+@dp.callback_query(F.data.startswith("convert_"))
+async def convert_callback(callback: types.CallbackQuery):
+    """Обработка конвертации из базовой обработки в другие форматы"""
+    await callback.answer()
+    
+    try:
+        # Парсим callback data: convert_{user_id}_{from}_to_{to}
+        parts = callback.data.split("_")
+        if len(parts) < 5:
+            return
+        
+        target_user_id = int(parts[1])
+        from_type = parts[2]
+        to_type = parts[4]
+        
+        # Проверяем права
+        if callback.from_user.id != target_user_id:
+            return
+        
+        # Получаем контекст
+        if target_user_id not in user_context or "processed" not in user_context[target_user_id]:
+            await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
+            return
+        
+        # Получаем уже обработанный текст
+        current_text = user_context[target_user_id]["processed"]
+        
+        # Обновляем сообщение
+        processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({to_type})...")
+        
+        # Обрабатываем в зависимости от типа
+        if to_type == "premium":
+            result = await correct_text_premium(current_text)
+            result_type = "premium"
+        elif to_type == "summary":
+            result = await summarize_text(current_text)
+            result_type = "summary"
+        else:
+            result = "Неизвестный тип обработки"
+            result_type = "error"
+        
+        # Сохраняем результат в контекст
+        user_context[target_user_id]["processed"] = result
+        user_context[target_user_id]["result_type"] = result_type
+        
+        # Отправляем результат (БЕЗ заголовка "Результат...")
+        if len(result) > 4000:
+            # Если текст длинный, разбиваем
+            await processing_msg.delete()
+            
+            # Первая часть
+            await callback.message.answer(result[:4000])
+            
+            # Остальные части
+            for i in range(4000, len(result), 4000):
+                await callback.message.answer(result[i:i+4000])
+            
+            # Для базовой обработки добавляем кнопки дальнейших действий
+            if result_type == "basic":
+                await callback.message.answer(
+                    "📝 <b>Текст исправлен. Что дальше?</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_after_basic_keyboard(target_user_id)
+                )
+            else:
+                # Для других типов добавляем кнопки экспорта к последнему сообщению
+                await callback.message.answer(
+                    "💾 <b>Экспортировать текст?</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_export_keyboard(target_user_id, result_type)
+                )
+            
+        else:
+            # Если текст короткий
+            if result_type == "basic":
+                # Для базовой обработки сразу добавляем кнопки дальнейших действий
+                await processing_msg.edit_text(
+                    result,
+                    reply_markup=create_after_basic_keyboard(target_user_id)
+                )
+            else:
+                # Для других типов добавляем кнопки экспорта
+                await processing_msg.edit_text(
+                    result,
+                    reply_markup=create_export_keyboard(target_user_id, result_type)
+                )
+            
+    except Exception as e:
+        logger.error(f"Process error: {e}")
+        await callback.message.edit_text("❌ Ошибка обработки")
+
+@dp.callback_query(F.data.startswith("convert_"))
+async def convert_callback(callback: types.CallbackQuery):
+    """Обработка конвертации из базовой обработки в другие форматы"""
+    await callback.answer()
+    
+    try:
+        # Парсим callback data: convert_{user_id}_{from}_to_{to}
+        parts = callback.data.split("_")
+        if len(parts) < 5:
+            return
+        
+        target_user_id = int(parts[1])
+        from_type = parts[2]
+        to_type = parts[4]
+        
+        # Проверяем права
+        if callback.from_user.id != target_user_id:
+            return
+        
+        # Получаем контекст
+        if target_user_id not in user_context or "processed" not in user_context[target_user_id]:
+            await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
+            return
+        
+        # Получаем уже обработанный текст
+        current_text = user_context[target_user_id]["processed"]
+        
+        # Обновляем сообщение
+        processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({to_type})...")
+        
+        # Обрабатываем в зависимости от типа
+        if to_type == "premium":
+            result = await correct_text_premium(current_text)
+            result_type = "premium"
+        elif to_type == "summary":
+            result = await summarize_text(current_text)
+            result_type = "summary"
+        else:
+            result = "Неизвестный тип обработки"
+            result_type = "error"
+        
+        # Сохраняем результат в контекст
+        user_context[target_user_id]["processed"] = result
+        user_context[target_user_id]["result_type"] = result_type
+        
+        # Отправляем результат (БЕЗ заголовка)
+        if len(result) > 4000:
+            # Если текст длинный, разбиваем
+            await processing_msg.delete()
+            
+            # Первая часть
+            await callback.message.answer(result[:4000])
             
             # Остальные части
             for i in range(4000, len(result), 4000):
@@ -500,13 +703,12 @@ async def process_callback(callback: types.CallbackQuery):
         else:
             # Если текст короткий
             await processing_msg.edit_text(
-                f"✅ <b>Результат ({process_type}):</b>\n\n{result}",
-                parse_mode="HTML",
+                result,
                 reply_markup=create_export_keyboard(target_user_id, result_type)
             )
             
     except Exception as e:
-        logger.error(f"Process error: {e}")
+        logger.error(f"Convert error: {e}")
         await callback.message.edit_text("❌ Ошибка обработки")
 
 @dp.callback_query(F.data.startswith("export_"))
@@ -555,8 +757,16 @@ async def export_callback(callback: types.CallbackQuery):
         document = FSInputFile(filepath, filename=filename)
         await callback.message.answer_document(document=document, caption=caption)
         
-        # Восстанавливаем предыдущее сообщение
-        await callback.message.delete()
+        # Восстанавливаем предыдущее сообщение с текстом
+        if len(text) <= 4000:
+            await callback.message.delete()
+            await callback.message.answer(
+                text,
+                reply_markup=create_export_keyboard(target_user_id, text_type)
+            )
+        else:
+            # Для длинных текстов просто удаляем сообщение "Создаю файл"
+            await callback.message.delete()
         
         # Удаляем временный файл
         try:
@@ -575,7 +785,8 @@ async def main():
     # Инициализируем Groq клиенты
     init_groq_clients()
     
-    # Запускаем веб-сервер
+    # Запускаем веб-сервер ДЛЯ UPTIME ROBOT (в фоне)
+    # Важно: через create_task, чтобы не блокировать основной поток
     asyncio.create_task(start_web_server())
     
     # Запускаем бота
@@ -590,3 +801,4 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
+```
