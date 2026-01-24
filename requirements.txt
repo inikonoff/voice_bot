@@ -2,4 +2,4 @@ aiogram>=3.10.0
 openai>=1.0.0
 python-dotenv
 aiohttp
-reportlab>=4.0.0  # Для PDF экспорта
+reportlab>=4.0.0
