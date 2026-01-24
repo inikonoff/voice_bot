@@ -1,4 +1,4 @@
-M python:3.10-slim
+FROM python:3.10-slim
 
 # Обновляем систему и устанавливаем FFmpeg (необходим для работы с аудио)
 RUN apt-get update && \
