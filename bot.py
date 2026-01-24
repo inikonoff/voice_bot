@@ -4,9 +4,11 @@ import io
 import logging
 import asyncio
 import sys
+from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
-from datetime import datetime
+from openai import AsyncOpenAI
+import random
 
 from aiogram import Bot, Dispatcher, types, F, html
 from aiogram.filters import Command
@@ -18,19 +20,11 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Импортируем наши сервисы
-from groq_services import (
-    transcribe_voice,
-    correct_text_basic,
-    correct_text_premium,
-    summarize_text,
-    check_text_length
-)
-
 load_dotenv()
 
 # --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
 
 # Логирование
 logging.basicConfig(
@@ -47,8 +41,269 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище контекста: {user_id: {type: "voice/text", original: "...", processed: {...}}}
+# Хранилище контекста
 user_context = {}
+
+# --- ИНИЦИАЛИЗАЦИЯ GROQ КЛИЕНТОВ ---
+groq_clients = []
+current_client_index = 0
+
+def init_groq_clients():
+    """Инициализация клиентов Groq"""
+    global groq_clients
+    
+    if not GROQ_API_KEYS:
+        logger.warning("GROQ_API_KEYS не настроены!")
+        return
+    
+    keys = [key.strip() for key in GROQ_API_KEYS.split(",") if key.strip()]
+    
+    for key in keys:
+        try:
+            client = AsyncOpenAI(
+                api_key=key,
+                base_url="https://api.groq.com/openai/v1",
+                timeout=30.0,
+            )
+            groq_clients.append(client)
+            logger.info(f"✅ Groq client: {key[:8]}...")
+        except Exception as e:
+            logger.error(f"❌ Error client {key[:8]}: {e}")
+    
+    logger.info(f"✅ Total clients: {len(groq_clients)}")
+
+def get_client():
+    """Получаем следующего клиента по кругу"""
+    if not groq_clients:
+        return None
+    
+    global current_client_index
+    client = groq_clients[current_client_index]
+    current_client_index = (current_client_index + 1) % len(groq_clients)
+    return client
+
+async def make_groq_request(func, *args, **kwargs):
+    """Делаем запрос с перебором ключей"""
+    if not groq_clients:
+        raise Exception("No Groq clients available")
+    
+    errors = []
+    
+    for _ in range(len(groq_clients) * 2):  # Пробуем каждый ключ 2 раза
+        client = get_client()
+        if not client:
+            break
+        
+        try:
+            return await func(client, *args, **kwargs)
+        except Exception as e:
+            errors.append(str(e))
+            logger.warning(f"Request error: {e}")
+            await asyncio.sleep(0.5 + random.random())
+    
+    raise Exception(f"All clients failed: {'; '.join(errors[:3])}")
+
+# --- GROQ СЕРВИСЫ ---
+async def transcribe_voice(audio_bytes: bytes) -> str:
+    """Транскрибация голоса через Whisper v3"""
+    async def transcribe(client):
+        return await client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=("audio.ogg", audio_bytes, "audio/ogg"),
+            language="ru",
+            response_format="text",
+        )
+    
+    try:
+        return await make_groq_request(transcribe)
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return f"❌ Ошибка распознавания: {str(e)[:100]}"
+
+async def correct_text_basic(text: str) -> str:
+    """Базовая коррекция: ошибки и пунктуация"""
+    if not text.strip():
+        return "❌ Пустой текст"
+    
+    prompt = """Исправь орфографические и пунктуационные ошибки в тексте. 
+    Сохрани оригинальный смысл и стиль. Только исправленный текст, без комментариев.
+    
+    Текст для исправления:"""
+    
+    async def correct(client):
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты редактор русского языка. Только исправляешь ошибки."},
+                {"role": "user", "content": f"{prompt}\n\n{text}"}
+            ],
+            temperature=0.1,
+        )
+        return response.choices[0].message.content.strip()
+    
+    try:
+        return await make_groq_request(correct)
+    except Exception as e:
+        logger.error(f"Basic correction error: {e}")
+        return f"❌ Ошибка коррекции: {str(e)[:100]}"
+
+async def correct_text_premium(text: str) -> str:
+    """Премиум коррекция: стиль, паразиты, мат"""
+    if not text.strip():
+        return "❌ Пустой текст"
+    
+    prompt = """Отредактируй текст профессионально:
+    1. Исправь все ошибки (орфография, пунктуация, грамматика)
+    2. Удали слова-паразиты (ну, типа, короче, как бы, блин и т.д.)
+    3. Замени матерные и грубые слова на литературные аналоги
+    4. Улучши стиль, сделай текст более гладким и читаемым
+    5. Разбей на логические абзацы если нужно
+    6. Сохрани оригинальный смысл и тон
+    
+    Верни только отредактированный текст, без пояснений.
+    
+    Текст для редактирования:"""
+    
+    async def correct(client):
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты профессиональный редактор и стилист."},
+                {"role": "user", "content": f"{prompt}\n\n{text}"}
+            ],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+    
+    try:
+        return await make_groq_request(correct)
+    except Exception as e:
+        logger.error(f"Premium correction error: {e}")
+        return f"❌ Ошибка коррекции: {str(e)[:100]}"
+
+async def summarize_text(text: str) -> str:
+    """Создание саммари"""
+    if not text.strip():
+        return "❌ Пустой текст"
+    
+    # Проверяем длину
+    words = text.split()
+    if len(words) < 50:
+        return "📝 Текст слишком короткий для саммари. Используйте обычную коррекцию."
+    
+    prompt = """Сделай краткое содержательное саммари текста:
+    1. Выдели основную мысль и ключевые моменты
+    2. Дай только суть, без деталей и примеров
+    3. Объем: примерно 10-20% от оригинала
+    4. Сохрани важные факты и выводы
+    5. Только саммари, без вступлений
+    
+    Текст для саммаризации:"""
+    
+    async def summarize(client):
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты создаешь краткие содержательные саммари."},
+                {"role": "user", "content": f"{prompt}\n\n{text}"}
+            ],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content.strip()
+    
+    try:
+        return await make_groq_request(summarize)
+    except Exception as e:
+        logger.error(f"Summarization error: {e}")
+        return f"❌ Ошибка создания саммари: {str(e)[:100]}"
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Создаем клавиатуру с вариантами обработки"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="📝 Как есть", callback_data=f"process_{user_id}_basic"),
+        InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium"),
+    )
+    
+    builder.row(
+        InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary"),
+    )
+    
+    return builder.as_markup()
+
+def create_export_keyboard(user_id: int, text_type: str) -> InlineKeyboardMarkup:
+    """Создаем клавиатуру для экспорта"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{text_type}_txt"),
+        InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{text_type}_pdf"),
+    )
+    
+    return builder.as_markup()
+
+async def save_to_file(user_id: int, text: str, format_type: str) -> str:
+    """Сохраняем текст в файл"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"text_{user_id}_{timestamp}"
+    
+    if format_type == "txt":
+        filepath = f"/tmp/{filename}.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(text)
+        return filepath
+        
+    elif format_type == "pdf":
+        try:
+            # Простой PDF без reportlab
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            import textwrap
+            
+            filepath = f"/tmp/{filename}.pdf"
+            c = canvas.Canvas(filepath, pagesize=A4)
+            width, height = A4
+            
+            margin = 50
+            line_height = 14
+            y = height - margin
+            
+            # Заголовок
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(margin, y, "Обработанный текст")
+            y -= 30
+            
+            # Дата
+            c.setFont("Helvetica", 10)
+            c.drawString(margin, y, f"Создано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+            y -= 40
+            
+            # Текст
+            c.setFont("Helvetica", 11)
+            lines = textwrap.wrap(text, width=90)
+            
+            for line in lines:
+                if y < margin:
+                    c.showPage()
+                    y = height - margin
+                    c.setFont("Helvetica", 11)
+                c.drawString(margin, y, line)
+                y -= line_height
+            
+            c.save()
+            return filepath
+            
+        except ImportError:
+            # Fallback на txt
+            logger.warning("Reportlab not installed, using txt fallback")
+            filepath = f"/tmp/{filename}.txt"
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(text)
+            return filepath
+    
+    return None
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def health_check(request):
@@ -70,103 +325,7 @@ async def start_web_server():
     except Exception as e:
         logger.error(f"❌ Error starting web server: {e}")
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру с вариантами обработки"""
-    builder = InlineKeyboardBuilder()
-    
-    # Основные варианты
-    builder.row(
-        InlineKeyboardButton(text="📝 Как есть", callback_data=f"process_{user_id}_basic"),
-        InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium"),
-    )
-    
-    # Саммари только для длинных текстов
-    builder.row(
-        InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary"),
-    )
-    
-    return builder.as_markup()
-
-def create_export_keyboard(user_id: int, text_type: str) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для экспорта"""
-    builder = InlineKeyboardBuilder()
-    
-    # Простые варианты экспорта
-    builder.row(
-        InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{text_type}_txt"),
-        InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{text_type}_pdf"),
-    )
-    
-    return builder.as_markup()
-
-async def save_to_file(user_id: int, text: str, format_type: str) -> str:
-    """Сохраняем текст в файл"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"text_{user_id}_{timestamp}"
-    
-    if format_type == "txt":
-        filepath = f"/tmp/{filename}.txt"
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(text)
-        return filepath
-    elif format_type == "pdf":
-        # Простой PDF через reportlab (установите через requirements.txt)
-        try:
-            from reportlab.lib.pagesizes import letter
-            from reportlab.pdfgen import canvas
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
-            import textwrap
-            
-            filepath = f"/tmp/{filename}.pdf"
-            
-            # Создаем PDF
-            c = canvas.Canvas(filepath, pagesize=letter)
-            width, height = letter
-            
-            # Настройки
-            margin = 50
-            line_height = 14
-            y = height - margin
-            
-            # Добавляем заголовок
-            c.setFont("Helvetica", 16)
-            c.drawString(margin, y, "Обработанный текст")
-            y -= 30
-            
-            # Добавляем дату
-            c.setFont("Helvetica", 10)
-            c.drawString(margin, y, f"Создано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-            y -= 30
-            
-            # Добавляем текст
-            c.setFont("Helvetica", 12)
-            lines = textwrap.wrap(text, width=80)
-            
-            for line in lines:
-                if y < margin:
-                    c.showPage()
-                    y = height - margin
-                    c.setFont("Helvetica", 12)
-                
-                c.drawString(margin, y, line)
-                y -= line_height
-            
-            c.save()
-            return filepath
-            
-        except ImportError:
-            # Fallback: если reportlab не установлен, сохраняем как txt
-            logger.warning("Reportlab not installed, using txt fallback")
-            filepath = f"/tmp/{filename}.txt"
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(text)
-            return filepath
-    
-    return None
-
-# --- ХЭНДЛЕРЫ ---
+# --- ХЭНДЛЕРЫ БОТА ---
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     await message.answer(
@@ -198,8 +357,8 @@ async def voice_handler(message: types.Message):
         # Распознаем
         original_text = await transcribe_voice(voice_buffer.getvalue())
         
-        if original_text.startswith("Ошибка"):
-            await msg.edit_text(f"❌ {original_text}")
+        if original_text.startswith("❌"):
+            await msg.edit_text(original_text)
             return
         
         # Сохраняем контекст
@@ -211,9 +370,10 @@ async def voice_handler(message: types.Message):
         }
         
         # Предлагаем варианты
+        preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
         await msg.edit_text(
             f"✅ <b>Распознанный текст:</b>\n\n"
-            f"<i>{original_text[:200]}...</i>\n\n"
+            f"<i>{preview}</i>\n\n"
             f"<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
             reply_markup=create_options_keyboard(user_id)
@@ -250,7 +410,6 @@ async def text_handler(message: types.Message):
         
         # Предлагаем варианты
         preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
-        
         await msg.edit_text(
             f"📝 <b>Полученный текст:</b>\n\n"
             f"<i>{preview}</i>\n\n"
@@ -321,7 +480,7 @@ async def process_callback(callback: types.CallbackQuery):
             # Если текст длинный, разбиваем
             await processing_msg.delete()
             
-            # Первая часть
+            # Первая часть с заголовком
             await callback.message.answer(
                 f"✅ <b>Результат ({process_type}):</b>\n\n{result[:4000]}",
                 parse_mode="HTML"
@@ -332,7 +491,7 @@ async def process_callback(callback: types.CallbackQuery):
                 await callback.message.answer(result[i:i+4000])
             
             # Добавляем кнопки экспорта к последнему сообщению
-            last_msg = await callback.message.answer(
+            await callback.message.answer(
                 "💾 <b>Экспортировать текст?</b>",
                 parse_mode="HTML",
                 reply_markup=create_export_keyboard(target_user_id, result_type)
@@ -394,19 +553,16 @@ async def export_callback(callback: types.CallbackQuery):
             mime_type = "text/plain"
         
         document = FSInputFile(filepath, filename=filename)
-        await callback.message.answer_document(
-            document=document,
-            caption=caption
-        )
+        await callback.message.answer_document(document=document, caption=caption)
+        
+        # Восстанавливаем предыдущее сообщение
+        await callback.message.delete()
         
         # Удаляем временный файл
         try:
             os.remove(filepath)
         except:
             pass
-        
-        # Восстанавливаем предыдущее сообщение
-        await callback.message.delete()
         
     except Exception as e:
         logger.error(f"Export error: {e}")
@@ -415,6 +571,9 @@ async def export_callback(callback: types.CallbackQuery):
 # --- ЗАПУСК ---
 async def main():
     logger.info("Bot starting process...")
+    
+    # Инициализируем Groq клиенты
+    init_groq_clients()
     
     # Запускаем веб-сервер
     asyncio.create_task(start_web_server())
