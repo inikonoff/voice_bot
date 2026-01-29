@@ -129,7 +129,7 @@ class VisionProcessor:
         
         async def analyze(client):
             response = await client.chat.completions.create(
-                model="llama-3.2-11b-vision-preview",  # Или другой vision-модель
+                                model="meta-llama/llama-4-scout-17b-16e-instruct",  # Или другой vision-модель
                 messages=[
                     {
                         "role": "user",
