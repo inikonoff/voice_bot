@@ -5,4 +5,5 @@ python-dotenv
 reportlab
 pytesseract
 Pillow
+PyPDF2
 python-docx
