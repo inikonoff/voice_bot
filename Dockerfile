@@ -1,19 +1,17 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Обновляем систему и устанавливаем FFmpeg (необходим для работы с аудио)
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Создаём рабочую папку
 WORKDIR /app
 
-# Копируем файлы проекта в контейнер
 COPY requirements.txt .
-COPY bot.py .
-
-# Устанавливаем библиотеки Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Команда запуска бота
+COPY bot.py .
+
 CMD ["python", "bot.py"]
