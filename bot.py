@@ -9,6 +9,9 @@ from dotenv import load_dotenv
 from aiohttp import web
 from openai import AsyncOpenAI
 import random
+import base64
+import mimetypes
+import tempfile
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -119,6 +122,144 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
     except Exception as e:
         logger.error(f"Transcription error: {e}")
         return f"❌ Ошибка распознавания: {str(e)[:100]}"
+
+async def extract_text_from_image_via_groq(image_bytes: bytes) -> str:
+    """Распознавание текста с картинки через Groq Vision"""
+    
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    async def extract(client):
+        response = await client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Распознай и перепиши ВЕСЬ текст с этого изображения. 
+Сохрани полностью все слова, цифры, знаки препинания. 
+Если текст на иностранном языке - оставь как есть. 
+Не добавляй никаких комментариев, просто верни распознанный текст."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_tokens=4000,
+        )
+        return response.choices[0].message.content.strip()
+    
+    try:
+        return await make_groq_request(extract)
+    except Exception as e:
+        logger.error(f"Vision OCR error: {e}")
+        return f"❌ Ошибка распознавания текста с изображения: {str(e)[:100]}"
+
+async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Извлечение текста из PDF"""
+    try:
+        from PyPDF2 import PdfReader
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        reader = PdfReader(pdf_buffer)
+        text = ""
+        
+        for page_num, page in enumerate(reader.pages, 1):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n--- Страница {page_num} ---\n"
+                text += page_text + "\n"
+        
+        return text.strip() if text else "Не удалось извлечь текст из PDF"
+    except ImportError:
+        return "❌ Для работы с PDF требуется установить PyPDF2"
+    except Exception as e:
+        return f"❌ Ошибка обработки PDF: {str(e)}"
+
+async def extract_text_from_docx(docx_bytes: bytes) -> str:
+    """Извлечение текста из DOCX"""
+    try:
+        import docx
+        doc_buffer = io.BytesIO(docx_bytes)
+        doc = docx.Document(doc_buffer)
+        text = ""
+        
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                text += paragraph.text + "\n"
+        
+        return text.strip() if text else "Документ пуст"
+    except ImportError:
+        return "❌ Для работы с DOCX требуется установить python-docx"
+    except Exception as e:
+        return f"❌ Ошибка обработки DOCX: {str(e)}"
+
+async def extract_text_from_txt(txt_bytes: bytes) -> str:
+    """Извлечение текста из TXT"""
+    try:
+        # Пробуем разные кодировки
+        encodings = ['utf-8', 'cp1251', 'koi8-r', 'windows-1251', 'iso-8859-1']
+        
+        for encoding in encodings:
+            try:
+                return txt_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        
+        # Если ни одна кодировка не подошла
+        return txt_bytes.decode('utf-8', errors='ignore')
+    except Exception as e:
+        return f"❌ Ошибка чтения текстового файла: {str(e)}"
+
+async def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Определяем тип файла и извлекаем текст"""
+    
+    # Определяем MIME тип по расширению
+    mime_type, _ = mimetypes.guess_type(filename)
+    
+    if mime_type:
+        if mime_type.startswith('image/'):
+            # Это изображение
+            return await extract_text_from_image_via_groq(file_bytes)
+        
+        elif mime_type == 'application/pdf':
+            # PDF файл
+            return await extract_text_from_pdf(file_bytes)
+        
+        elif mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            # DOCX файл
+            return await extract_text_from_docx(file_bytes)
+        
+        elif mime_type == 'text/plain':
+            # TXT файл
+            return await extract_text_from_txt(file_bytes)
+    
+    # Если MIME тип не определился, пробуем по расширению
+    file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+    
+    if file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
+        return await extract_text_from_image_via_groq(file_bytes)
+    
+    elif file_ext == 'pdf':
+        return await extract_text_from_pdf(file_bytes)
+    
+    elif file_ext == 'docx':
+        return await extract_text_from_docx(file_bytes)
+    
+    elif file_ext == 'txt':
+        return await extract_text_from_txt(file_bytes)
+    
+    elif file_ext == 'doc':
+        return "❌ DOC файлы (старый формат Word) не поддерживаются. Сохраните файл как DOCX."
+    
+    else:
+        return f"❌ Неподдерживаемый формат файла: .{file_ext}\nПоддерживаются: изображения, PDF, DOCX, TXT"
 
 async def correct_text_basic(text: str) -> str:
     """Базовая коррекция: ошибки и пунктуация"""
@@ -367,12 +508,17 @@ async def start_web_server():
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     await message.answer(
-        "👋 <b>Текст-редактор бот</b>\n\n"
-        "Отправьте мне голосовое или текстовое сообщение, и я предложу варианты обработки:\n\n"
-        "• <b>📝 Как есть</b> - исправление ошибок, пунктуация\n"
+        "👋 <b>Текст-редактор бот Грамотей</b>\n\n"
+        "📁 <b>Что я умею:</b>\n"
+        "• Распознавать текст с <b>изображений</b> (JPG, PNG и др.)\n"
+        "• Читать текст из <b>файлов</b> (PDF, DOCX, TXT)\n"
+        "• Транскрибировать <b>голосовые сообщения</b>\n"
+        "• Обрабатывать <b>прямой текст</b>\n\n"
+        "🔧 <b>Варианты обработки:</b>\n"
+        "• <b>📝 Как есть</b> - исправление ошибок и пунктуация\n"
         "• <b>✨ Красиво</b> - уборка слов-паразитов, улучшение стиля\n"
         "• <b>📊 Саммари</b> - краткое содержание (для длинных текстов)\n\n"
-        "После обработки можно переключаться между вариантами и экспортировать текст в файл.",
+        "💾 После обработки можно переключаться между вариантами и экспортировать в файлы.",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -492,6 +638,96 @@ async def text_handler(message: types.Message):
         logger.error(f"Text error: {e}")
         await msg.edit_text("❌ Ошибка обработки текста")
 
+@dp.message(F.photo | F.document)
+async def file_handler(message: types.Message):
+    user_id = message.from_user.id
+    msg = await message.answer("📁 Обрабатываю файл...")
+    
+    try:
+        file_info = None
+        file_bytes = None
+        filename = ""
+        
+        # Получаем информацию о файле
+        if message.photo:
+            # Для фото берем максимальное качество
+            file_info = await bot.get_file(message.photo[-1].file_id)
+            filename = f"photo_{file_info.file_unique_id}.jpg"
+        elif message.document:
+            file_info = await bot.get_file(message.document.file_id)
+            filename = message.document.file_name or f"file_{file_info.file_unique_id}"
+        
+        # Скачиваем файл
+        file_buffer = io.BytesIO()
+        await bot.download_file(file_info.file_path, file_buffer)
+        file_bytes = file_buffer.getvalue()
+        
+        # Проверяем размер файла
+        if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB
+            await msg.edit_text("❌ Файл слишком большой (максимум 10 MB)")
+            return
+        
+        # Извлекаем текст из файла
+        status_msg = await msg.edit_text("🔍 Извлекаю текст...")
+        original_text = await extract_text_from_file(file_bytes, filename)
+        
+        if original_text.startswith("❌"):
+            await status_msg.edit_text(original_text)
+            return
+        
+        # Проверяем, не пустой ли текст
+        if not original_text.strip() or len(original_text.strip()) < 10:
+            await status_msg.edit_text(
+                "❌ Не удалось найти текст в файле.\n"
+                "Попробуйте:\n"
+                "• Более четкое изображение\n"
+                "• Файл с текстовым содержимым\n"
+                "• Прямой текст сообщением"
+            )
+            return
+        
+        # Определяем доступные режимы
+        available_modes = get_available_modes(original_text)
+        
+        # Сохраняем контекст
+        user_context[user_id] = {
+            "type": "file",
+            "original": original_text,
+            "cached_results": {"basic": None, "premium": None, "summary": None},
+            "current_mode": None,
+            "available_modes": available_modes,
+            "message_id": msg.message_id,
+            "chat_id": message.chat.id,
+            "filename": filename
+        }
+        
+        # Предлагаем варианты
+        preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
+        
+        # Формируем сообщение с учетом доступных режимов
+        modes_text = "📝 Как есть, ✨ Красиво"
+        if "summary" in available_modes:
+            modes_text += ", 📊 Саммари"
+        
+        await status_msg.edit_text(
+            f"✅ <b>Извлеченный текст из {filename}:</b>\n\n"
+            f"<i>{preview}</i>\n\n"
+            f"<b>Доступные режимы:</b> {modes_text}\n"
+            f"<b>Выберите вариант обработки:</b>",
+            parse_mode="HTML",
+            reply_markup=create_options_keyboard(user_id)
+        )
+        
+        # Удаляем оригинальное сообщение
+        try:
+            await message.delete()
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"File error: {e}")
+        await msg.edit_text("❌ Ошибка обработки файла")
+
 @dp.callback_query(F.data.startswith("process_"))
 async def process_callback(callback: types.CallbackQuery):
     await callback.answer()
@@ -517,8 +753,8 @@ async def process_callback(callback: types.CallbackQuery):
         
         ctx = user_context[target_user_id]
         available_modes = ctx.get("available_modes", [])
-        
-        # Проверяем доступность режима
+
+ # Проверяем доступность режима
         if process_type not in available_modes:
             await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
             return
@@ -728,3 +964,4 @@ if __name__ == "__main__":
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
+```
