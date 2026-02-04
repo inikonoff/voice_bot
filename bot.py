@@ -275,7 +275,7 @@ async def correct_text_basic(text: str) -> str:
     
     async def correct(client):
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": "Ты редактор русского языка. Только исправляешь ошибки."},
                 {"role": "user", "content": f"{prompt}\n\n{text}"}
