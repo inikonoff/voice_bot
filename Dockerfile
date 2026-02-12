@@ -19,7 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 COPY processors.py .
 COPY config.py .
-COPY .env.example .env
 
 # Создание временной директории для видео
 RUN mkdir -p /tmp && chmod 777 /tmp
