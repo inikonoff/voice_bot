@@ -9,6 +9,7 @@ import io
 import logging
 import asyncio
 import sys
+from typing import Optional, List, Dict
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
