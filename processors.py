@@ -1,13 +1,19 @@
 # processors.py
 """
-Обработчики текста: OCR, транскрибация, коррекция, саммари
+Обработчики текста и видео: OCR, транскрибация, видео, коррекция, саммари
+Версия 3.0 с поддержкой YouTube, TikTok, Rutube, Instagram, Vimeo
 """
 
 import io
+import os
 import logging
 import base64
 import asyncio
-from typing import Optional
+import subprocess
+import mimetypes
+import re
+from typing import Optional, Tuple, List
+from datetime import timedelta
 from openai import AsyncOpenAI
 
 import config
@@ -75,14 +81,328 @@ vision_processor = VisionProcessor()
 
 
 # ============================================================================
-# AUDIO TRANSCRIPTION
+# VIDEO PROCESSING
+# ============================================================================
+
+class VideoProcessor:
+    """Обработка видеофайлов и видеоплатформ"""
+    
+    @staticmethod
+    async def check_video_duration(filepath: str) -> Optional[float]:
+        """Получить длительность видео в секундах"""
+        try:
+            result = subprocess.run(
+                [
+                    'ffprobe', '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1:nokey=1',
+                    filepath
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                logger.debug(f"Video duration: {duration}s ({timedelta(seconds=int(duration))})")
+                return duration
+        except Exception as e:
+            logger.warning(f"Error checking video duration: {e}")
+        
+        return None
+    
+    @staticmethod
+    async def extract_audio_from_video(video_path: str, output_path: str) -> bool:
+        """Извлечение звука из видеофайла"""
+        try:
+            subprocess.run(
+                [
+                    'ffmpeg', '-i', video_path,
+                    '-q:a', '9',  # Качество звука
+                    '-n',  # Не перезаписывать файл
+                    output_path
+                ],
+                capture_output=True,
+                timeout=300  # 5 минут
+            )
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.info(f"Audio extracted successfully: {output_path}")
+                return True
+            
+            logger.error("Audio extraction failed: output file is empty")
+            return False
+            
+        except subprocess.TimeoutExpired:
+            logger.error("Audio extraction timeout")
+            return False
+        except Exception as e:
+            logger.error(f"Audio extraction error: {e}")
+            return False
+    
+    @staticmethod
+    async def normalize_audio(input_path: str, output_path: str) -> bool:
+        """Нормализация громкости аудио"""
+        try:
+            subprocess.run(
+                [
+                    'ffmpeg', '-i', input_path,
+                    '-af', 'loudnorm=I=-20:TP=-1.5:LRA=11',
+                    '-acodec', 'libmp3lame',
+                    '-q:a', '2',
+                    output_path
+                ],
+                capture_output=True,
+                timeout=300
+            )
+            
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            
+        except Exception as e:
+            logger.warning(f"Audio normalization failed: {e}")
+            return False
+
+
+video_processor = VideoProcessor()
+
+
+# ============================================================================
+# YOUTUBE & VIDEO PLATFORMS
+# ============================================================================
+
+class VideoPlatformProcessor:
+    """Обработка видео с YouTube, TikTok, Rutube и т.д."""
+    
+    @staticmethod
+    def _validate_url(url: str) -> Tuple[bool, Optional[str]]:
+        """Проверить и определить тип видеоплатформы"""
+        url = url.strip()
+        
+        platforms = {
+            'youtube': ['youtube.com', 'youtu.be'],
+            'tiktok': ['tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com'],
+            'rutube': ['rutube.ru'],
+            'instagram': ['instagram.com', 'instagr.am'],
+            'vimeo': ['vimeo.com']
+        }
+        
+        for platform, domains in platforms.items():
+            if any(domain in url.lower() for domain in domains):
+                return True, platform
+        
+        return False, None
+    
+    @staticmethod
+    async def extract_youtube_subtitles(video_id: str) -> Optional[str]:
+        """Извлечение субтитров из YouTube видео"""
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            
+            # Пытаемся получить субтитры в порядке: русский → английский
+            for lang in config.YOUTUBE_SUBTITLES_LANGS:
+                try:
+                    transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
+                    text = " ".join([item['text'] for item in transcript])
+                    logger.info(f"YouTube subtitles extracted ({lang}): {len(text)} chars")
+                    return text
+                except Exception as e:
+                    logger.debug(f"Subtitles not found for language {lang}: {e}")
+                    continue
+            
+            logger.info("No subtitles found for video")
+            return None
+            
+        except ImportError:
+            logger.error("youtube-transcript-api not installed")
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting YouTube subtitles: {e}")
+            return None
+    
+    @staticmethod
+    def _extract_youtube_video_id(url: str) -> Optional[str]:
+        """Извлечение video_id из YouTube URL"""
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)',
+            r'youtube\.com\/embed\/([a-zA-Z0-9_-]+)',
+            r'youtube\.com\/v\/([a-zA-Z0-9_-]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    @staticmethod
+    async def download_video_with_ytdlp(url: str, output_path: str) -> Optional[str]:
+        """Скачивание видео с помощью yt-dlp"""
+        try:
+            import yt_dlp
+            
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'quiet': config.YTDLP_QUIET,
+                'no_warnings': config.YTDLP_NO_WARNINGS,
+                'socket_timeout': config.YTDLP_SOCKET_TIMEOUT,
+                'outtmpl': output_path,
+                'max_filesize': config.VIDEO_SIZE_LIMIT,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info(f"Downloading video from: {url}")
+                info = ydl.extract_info(url, download=True)
+                video_path = ydl.prepare_filename(info)
+                logger.info(f"Video downloaded: {video_path}")
+                return video_path
+                
+        except ImportError:
+            logger.error("yt-dlp not installed")
+            return None
+        except Exception as e:
+            logger.error(f"Error downloading video: {e}")
+            return None
+    
+    @staticmethod
+    async def process_video_url(url: str, groq_clients: list) -> str:
+        """Обработка ссылки на видео (YouTube, TikTok и т.д.)"""
+        
+        is_valid, platform = VideoPlatformProcessor._validate_url(url)
+        if not is_valid:
+            logger.warning(f"Invalid video URL: {url}")
+            return config.ERROR_INVALID_URL
+        
+        logger.info(f"Processing {platform} video: {url}")
+        
+        try:
+            # Для YouTube сначала пытаемся получить субтитры
+            if platform == 'youtube' and config.YOUTUBE_PREFER_SUBTITLES:
+                video_id = VideoPlatformProcessor._extract_youtube_video_id(url)
+                if video_id:
+                    subtitles = await VideoPlatformProcessor.extract_youtube_subtitles(video_id)
+                    if subtitles and len(subtitles.strip()) > config.MIN_TEXT_LENGTH:
+                        logger.info(f"Using YouTube subtitles for {video_id}")
+                        return subtitles
+                    else:
+                        logger.info("No subtitles found, will extract audio")
+            
+            # Если нет субтитров или это другая платформа - скачиваем и извлекаем звук
+            temp_video_path = f"{config.TEMP_DIR}/video_{os.getpid()}_{int(asyncio.get_event_loop().time())}.mp4"
+            temp_audio_path = f"{config.TEMP_DIR}/audio_{os.getpid()}_{int(asyncio.get_event_loop().time())}.wav"
+            
+            try:
+                video_path = await VideoPlatformProcessor.download_video_with_ytdlp(url, temp_video_path)
+                
+                if not video_path:
+                    return config.ERROR_VIDEO_NOT_FOUND
+                
+                # Проверяем длительность
+                duration = await video_processor.check_video_duration(video_path)
+                if duration and duration > config.VIDEO_MAX_DURATION:
+                    logger.warning(f"Video too long: {duration}s")
+                    return config.ERROR_VIDEO_TOO_LONG
+                
+                # Извлекаем звук
+                if not await video_processor.extract_audio_from_video(video_path, temp_audio_path):
+                    return "❌ Ошибка извлечения звука из видео"
+                
+                # Транскрибируем
+                with open(temp_audio_path, 'rb') as f:
+                    audio_bytes = f.read()
+                
+                text = await transcribe_voice(audio_bytes, groq_clients)
+                
+                # Чистим временные файлы
+                try:
+                    os.remove(video_path)
+                    os.remove(temp_audio_path)
+                except:
+                    pass
+                
+                return text
+                
+            except Exception as e:
+                logger.error(f"Error processing video platform: {e}")
+                # Чистим временные файлы
+                for fpath in [temp_video_path, temp_audio_path]:
+                    try:
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
+                    except:
+                        pass
+                return f"❌ Ошибка обработки видео: {str(e)[:100]}"
+        
+        except Exception as e:
+            logger.error(f"Error in process_video_url: {e}")
+            return f"❌ Ошибка обработки видеоссылки: {str(e)[:100]}"
+
+
+video_platform_processor = VideoPlatformProcessor()
+
+
+# ============================================================================
+# LOCAL VIDEO FILE PROCESSING
+# ============================================================================
+
+async def process_video_file(video_bytes: bytes, filename: str, groq_clients: list) -> str:
+    """Обработка локального видеофайла"""
+    
+    try:
+        # Сохраняем во временный файл
+        temp_video_path = f"{config.TEMP_DIR}/video_{os.getpid()}_{int(asyncio.get_event_loop().time())}.{filename.split('.')[-1]}"
+        temp_audio_path = f"{config.TEMP_DIR}/audio_{os.getpid()}_{int(asyncio.get_event_loop().time())}.wav"
+        
+        with open(temp_video_path, 'wb') as f:
+            f.write(video_bytes)
+        
+        # Проверяем длительность
+        duration = await video_processor.check_video_duration(temp_video_path)
+        if duration and duration > config.VIDEO_MAX_DURATION:
+            logger.warning(f"Video too long: {duration}s")
+            try:
+                os.remove(temp_video_path)
+            except:
+                pass
+            return config.ERROR_VIDEO_TOO_LONG
+        
+        # Извлекаем звук
+        if not await video_processor.extract_audio_from_video(temp_video_path, temp_audio_path):
+            try:
+                os.remove(temp_video_path)
+            except:
+                pass
+            return "❌ Ошибка извлечения звука из видео"
+        
+        # Транскрибируем
+        with open(temp_audio_path, 'rb') as f:
+            audio_bytes = f.read()
+        
+        text = await transcribe_voice(audio_bytes, groq_clients)
+        
+        # Чистим временные файлы
+        try:
+            os.remove(temp_video_path)
+            os.remove(temp_audio_path)
+        except:
+            pass
+        
+        return text
+        
+    except Exception as e:
+        logger.error(f"Error processing video file: {e}")
+        return f"❌ Ошибка обработки видеофайла: {str(e)[:100]}"
+
+
+# ============================================================================
+# AUDIO TRANSCRIPTION (с поддержкой видео)
 # ============================================================================
 
 async def transcribe_voice(audio_bytes: bytes, groq_clients: list) -> str:
-    """Транскрибация голоса через Whisper v3"""
+    """Транскрибация голоса через Whisper v3 (для видео и аудио)"""
     
     async def transcribe(client):
-        # Используем автоопределение языка (language=None)
         response = await client.audio.transcriptions.create(
             model="whisper-large-v3-turbo",
             file=("audio.ogg", audio_bytes, "audio/ogg"),
@@ -97,7 +417,7 @@ async def transcribe_voice(audio_bytes: bytes, groq_clients: list) -> str:
         if config.LOG_TRANSCRIPTION_LANGUAGE:
             logger.debug(f"Transcription result (first 100 chars): {str(result)[:100]}")
         
-        # Проверка на смешивание языков (кириллица + латиница в одном слове)
+        # Проверка на смешивание языков
         result = _validate_transcription_language(result)
         
         return result
@@ -128,10 +448,8 @@ def _validate_transcription_language(text: str) -> str:
         if has_cyrillic and has_latin:
             mixed_words += 1
     
-    # Если много смешанных слов (больше 20% слов) — это вероятно ошибка смешивания языков
     if mixed_words > len(words) * 0.2:
         logger.warning(f"Possible language mix detected: {mixed_words} mixed words out of {len(words)}")
-        # Логируем, но не пытаемся "чинить" — пусть пользователь решит
     
     return text
 
@@ -225,13 +543,11 @@ async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                 if config.PDF_MAX_PAGES and page_num > config.PDF_MAX_PAGES:
                     break
                 
-                # Извлечение текста
                 page_text = page.extract_text()
                 if page_text:
                     text += f"\n--- Страница {page_num} ---\n"
                     text += page_text + "\n"
                 
-                # Если есть таблицы — попытаемся их парсить
                 if page.tables:
                     for table_idx, table in enumerate(page.tables, 1):
                         text += f"\n[Таблица {table_idx} на странице {page_num}]\n"
@@ -294,7 +610,6 @@ async def extract_text_from_txt(txt_bytes: bytes) -> str:
             except UnicodeDecodeError:
                 continue
         
-        # Fallback с игнорированием ошибок
         logger.warning("TXT decoded with fallback (errors ignored)")
         return txt_bytes.decode('utf-8', errors='ignore')
         
@@ -305,8 +620,6 @@ async def extract_text_from_txt(txt_bytes: bytes) -> str:
 
 async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients: list) -> str:
     """Определяем тип файла и извлекаем текст"""
-    
-    import mimetypes
     
     mime_type, _ = mimetypes.guess_type(filename)
     file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
@@ -321,6 +634,11 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
         logger.info(f"Processing image (by extension): {filename}")
         vision_processor.init_clients(groq_clients)
         return await vision_processor.extract_text(file_bytes)
+    
+    # Видео
+    if file_ext in config.VIDEO_SUPPORTED_FORMATS:
+        logger.info(f"Processing video file: {filename}")
+        return await process_video_file(file_bytes, filename, groq_clients)
     
     # PDF
     if mime_type == 'application/pdf' or file_ext == 'pdf':
@@ -373,10 +691,8 @@ async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
             errors.append(error_msg)
             logger.warning(f"Request error (attempt {attempt + 1}): {error_msg[:100]}")
             
-            # Умная задержка: экспоненциальная на ошибки API
             await asyncio.sleep(1 + (attempt % 3) * 0.5)
     
-    # Все попытки исчерпаны
     error_summary = '; '.join(errors[:3])
     logger.error(f"All Groq clients failed: {error_summary}")
     raise Exception(f"All clients failed: {error_summary}")
@@ -387,10 +703,8 @@ def get_available_modes(text: str) -> list:
     words_count = len(text.split())
     text_length = len(text)
     
-    # Базовые режимы всегда доступны
     available = ["basic", "premium"]
     
-    # Саммари только для достаточно длинных текстов
     if words_count >= config.MIN_WORDS_FOR_SUMMARY and text_length >= config.MIN_CHARS_FOR_SUMMARY:
         available.append("summary")
     

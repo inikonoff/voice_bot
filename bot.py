@@ -1,6 +1,7 @@
-# bot.py
+# bot.py (v3)
 """
-Главный файл бота: хэндлеры, управление контекстом, веб-сервер
+Главный файл бота: хэндлеры, управление контекстом, видео-обработка
+Версия 3.0 с поддержкой YouTube, TikTok, Rutube, Instagram, Vimeo
 """
 
 import os
@@ -48,12 +49,12 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище контекста пользователей
 user_context = {}
-
-# Groq клиенты
 groq_clients = []
 current_client_index = 0
+
+# Счётчик временных файлов
+temp_files_count = 0
 
 
 # ============================================================================
@@ -90,10 +91,7 @@ def init_groq_clients():
 # ============================================================================
 
 async def cleanup_old_contexts():
-    """
-    Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS
-    Запускается каждые CACHE_CHECK_INTERVAL секунд
-    """
+    """Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS"""
     while True:
         try:
             await asyncio.sleep(config.CACHE_CHECK_INTERVAL)
@@ -107,7 +105,6 @@ async def cleanup_old_contexts():
                 if context_age > config.CACHE_TIMEOUT_SECONDS:
                     users_to_delete.append(user_id)
             
-            # Если контекстов слишком много — удаляем самые старые
             if len(user_context) > config.MAX_CONTEXTS:
                 contexts_by_age = sorted(
                     user_context.items(),
@@ -125,6 +122,42 @@ async def cleanup_old_contexts():
                 
         except Exception as e:
             logger.error(f"Cache cleanup error: {e}")
+
+
+async def cleanup_temp_files():
+    """Фоновая задача: удаление старых временных файлов"""
+    while True:
+        try:
+            await asyncio.sleep(config.TEMP_FILE_RETENTION)
+            
+            if not config.CLEANUP_TEMP_FILES:
+                continue
+            
+            current_time = datetime.now().timestamp()
+            temp_dir = config.TEMP_DIR
+            
+            if not os.path.exists(temp_dir):
+                continue
+            
+            deleted_count = 0
+            for filename in os.listdir(temp_dir):
+                if filename.startswith('video_') or filename.startswith('audio_'):
+                    filepath = os.path.join(temp_dir, filename)
+                    
+                    try:
+                        file_age = current_time - os.path.getmtime(filepath)
+                        if file_age > config.TEMP_FILE_RETENTION:
+                            os.remove(filepath)
+                            deleted_count += 1
+                            logger.debug(f"Deleted temp file: {filename}")
+                    except Exception as e:
+                        logger.debug(f"Error deleting temp file {filename}: {e}")
+            
+            if deleted_count > 0:
+                logger.debug(f"Cleaned up {deleted_count} temporary files")
+                
+        except Exception as e:
+            logger.error(f"Temp files cleanup error: {e}")
 
 
 # ============================================================================
@@ -162,7 +195,6 @@ def create_switch_keyboard(user_id: int) -> Optional[InlineKeyboardMarkup]:
     
     builder = InlineKeyboardBuilder()
     
-    # Кнопки переключения режимов
     mode_buttons = []
     if "basic" in available and current != "basic":
         mode_buttons.append(InlineKeyboardButton(text="📝 Как есть", callback_data=f"switch_{user_id}_basic"))
@@ -174,7 +206,6 @@ def create_switch_keyboard(user_id: int) -> Optional[InlineKeyboardMarkup]:
     for i in range(0, len(mode_buttons), 2):
         builder.row(*mode_buttons[i:i+2])
     
-    # Кнопки экспорта
     if current:
         builder.row(
             InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_txt"),
@@ -194,7 +225,7 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
     filename = f"text_{user_id}_{timestamp}"
     
     if format_type == "txt":
-        filepath = f"/tmp/{filename}.txt"
+        filepath = f"{config.TEMP_DIR}/{filename}.txt"
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(text)
@@ -210,7 +241,7 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
             from reportlab.pdfgen import canvas
             from reportlab.lib.utils import simpleSplit
             
-            filepath = f"/tmp/{filename}.pdf"
+            filepath = f"{config.TEMP_DIR}/{filename}.pdf"
             c = canvas.Canvas(filepath, pagesize=A4)
             width, height = A4
             
@@ -250,7 +281,7 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
             
         except ImportError:
             logger.warning("Reportlab not installed, using txt fallback")
-            filepath = f"/tmp/{filename}.txt"
+            filepath = f"{config.TEMP_DIR}/{filename}.txt"
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(text)
             return filepath
@@ -266,7 +297,7 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
 # ============================================================================
 
 async def health_check(request):
-    """Uptime Robot и Render пингуют этот адрес"""
+    """Health check для Uptime Robot и Render"""
     return web.Response(text="Bot is alive!", status=200)
 
 
@@ -322,27 +353,28 @@ async def status_handler(message: types.Message):
     except ImportError:
         docx_status = "❌"
     
+    temp_files = len([f for f in os.listdir(config.TEMP_DIR) 
+                     if f.startswith('video_') or f.startswith('audio_')]) if os.path.exists(config.TEMP_DIR) else 0
+    
     status_text = config.STATUS_MESSAGE.format(
         groq_count=len(groq_clients),
         users_count=len(user_context),
         vision_status="✅" if groq_clients else "❌",
-        docx_status=docx_status
+        docx_status=docx_status,
+        temp_files=temp_files
     )
     
     await message.answer(status_text, parse_mode="HTML")
 
 
-@dp.message(F.voice | F.audio)
+@dp.message(F.voice)
 async def voice_handler(message: types.Message):
-    """Обработка голосовых сообщений"""
+    """Обработка голосовых сообщений и кружочков"""
     user_id = message.from_user.id
-    msg = await message.answer("🎧 Распознаю голосовое сообщение...")
+    msg = await message.answer(config.MSG_PROCESSING_VOICE)
     
     try:
-        if message.voice:
-            file_info = await bot.get_file(message.voice.file_id)
-        else:
-            file_info = await bot.get_file(message.audio.file_id)
+        file_info = await bot.get_file(message.voice.file_id)
         
         voice_buffer = io.BytesIO()
         await bot.download_file(file_info.file_path, voice_buffer)
@@ -355,7 +387,6 @@ async def voice_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        # Сохраняем контекст с timestamp
         user_context[user_id] = {
             "type": "voice",
             "original": original_text,
@@ -394,22 +425,28 @@ async def voice_handler(message: types.Message):
         await msg.edit_text("❌ Ошибка обработки голосового сообщения")
 
 
-@dp.message(F.text)
-async def text_handler(message: types.Message):
-    """Обработка текстовых сообщений"""
+@dp.message(F.audio)
+async def audio_handler(message: types.Message):
+    """Обработка аудиофайлов"""
     user_id = message.from_user.id
-    original_text = message.text.strip()
-    
-    if original_text.startswith("/"):
-        return
-    
-    msg = await message.answer("📝 Анализирую текст...")
+    msg = await message.answer(config.MSG_TRANSCRIBING)
     
     try:
+        file_info = await bot.get_file(message.audio.file_id)
+        
+        audio_buffer = io.BytesIO()
+        await bot.download_file(file_info.file_path, audio_buffer)
+        
+        original_text = await processors.transcribe_voice(audio_buffer.getvalue(), groq_clients)
+        
+        if original_text.startswith("❌"):
+            await msg.edit_text(original_text)
+            return
+        
         available_modes = processors.get_available_modes(original_text)
         
         user_context[user_id] = {
-            "type": "text",
+            "type": "audio",
             "original": original_text,
             "cached_results": {"basic": None, "premium": None, "summary": None},
             "current_mode": None,
@@ -428,7 +465,80 @@ async def text_handler(message: types.Message):
             modes_text += ", 📊 Саммари"
         
         await msg.edit_text(
-            f"📝 <b>Полученный текст:</b>\n\n"
+            f"✅ <b>Распознанный текст:</b>\n\n"
+            f"<i>{preview}</i>\n\n"
+            f"<b>Доступные режимы:</b> {modes_text}\n"
+            f"<b>Выберите вариант обработки:</b>",
+            parse_mode="HTML",
+            reply_markup=create_options_keyboard(user_id)
+        )
+        
+        try:
+            await message.delete()
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Audio handler error: {e}")
+        await msg.edit_text("❌ Ошибка обработки аудиофайла")
+
+
+@dp.message(F.text)
+async def text_handler(message: types.Message):
+    """Обработка текстовых сообщений и ссылок"""
+    user_id = message.from_user.id
+    original_text = message.text.strip()
+    
+    if original_text.startswith("/"):
+        return
+    
+    # Проверяем, не ссылка ли это на видеоплатформу
+    is_valid, platform = processors.video_platform_processor._validate_url(original_text)
+    
+    if is_valid:
+        # Обработка ссылки на видео
+        msg = await message.answer(f"🔗 Обрабатываю {platform} видео...\n{config.MSG_LOOKING_FOR_SUBTITLES}")
+        
+        try:
+            original_text = await processors.video_platform_processor.process_video_url(original_text, groq_clients)
+            
+            if original_text.startswith("❌"):
+                await msg.edit_text(original_text)
+                return
+            
+        except Exception as e:
+            logger.error(f"Video URL handler error: {e}")
+            await msg.edit_text(f"❌ Ошибка обработки видеоссылки: {str(e)[:100]}")
+            return
+    else:
+        msg = await message.answer("📝 Анализирую текст...")
+    
+    try:
+        available_modes = processors.get_available_modes(original_text)
+        
+        user_context[user_id] = {
+            "type": "text" if not is_valid else f"video_{platform}",
+            "original": original_text,
+            "cached_results": {"basic": None, "premium": None, "summary": None},
+            "current_mode": None,
+            "available_modes": available_modes,
+            "message_id": msg.message_id,
+            "chat_id": message.chat.id,
+            "created_at": datetime.now().timestamp()
+        }
+        
+        preview = original_text[:config.PREVIEW_LENGTH]
+        if len(original_text) > config.PREVIEW_LENGTH:
+            preview += "..."
+        
+        modes_text = "📝 Как есть, ✨ Красиво"
+        if "summary" in available_modes:
+            modes_text += ", 📊 Саммари"
+        
+        msg_title = "🔗 <b>Извлеченный текст из видео:</b>" if is_valid else "📝 <b>Полученный текст:</b>"
+        
+        await msg.edit_text(
+            f"{msg_title}\n\n"
             f"<i>{preview}</i>\n\n"
             f"<b>Доступные режимы:</b> {modes_text}\n"
             f"<b>Выберите вариант обработки:</b>",
@@ -472,7 +582,15 @@ async def file_handler(message: types.Message):
             await msg.edit_text(config.ERROR_FILE_TOO_LARGE)
             return
         
-        await msg.edit_text("🔍 Извлекаю текст...")
+        # Определяем тип файла
+        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        
+        # Видеофайлы
+        if file_ext in processors.config.VIDEO_SUPPORTED_FORMATS:
+            await msg.edit_text(config.MSG_EXTRACTING_AUDIO)
+        else:
+            await msg.edit_text("🔍 Извлекаю текст...")
+        
         original_text = await processors.extract_text_from_file(file_bytes, filename, groq_clients)
         
         if original_text.startswith("❌"):
@@ -505,7 +623,8 @@ async def file_handler(message: types.Message):
         if "summary" in available_modes:
             modes_text += ", 📊 Саммари"
         
-        file_type = "изображения" if filename.startswith("photo_") or any(
+        file_type = "видео" if file_ext in processors.config.VIDEO_SUPPORTED_FORMATS else \
+                   "изображения" if filename.startswith("photo_") or any(
             ext in filename.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
         ) else "файла"
         
@@ -534,7 +653,7 @@ async def file_handler(message: types.Message):
 
 @dp.callback_query(F.data.startswith("process_"))
 async def process_callback(callback: types.CallbackQuery):
-    """Начальная обработка текста (выбор режима)"""
+    """Начальная обработка текста"""
     await callback.answer()
     
     try:
@@ -564,7 +683,6 @@ async def process_callback(callback: types.CallbackQuery):
         
         processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({process_type})...")
         
-        # Обработка
         if process_type == "basic":
             result = await processors.correct_text_basic(original_text, groq_clients)
         elif process_type == "premium":
@@ -577,7 +695,6 @@ async def process_callback(callback: types.CallbackQuery):
         user_context[target_user_id]["cached_results"][process_type] = result
         user_context[target_user_id]["current_mode"] = process_type
         
-        # Отправка результата
         if len(result) > 4000:
             await processing_msg.delete()
             
@@ -602,7 +719,7 @@ async def process_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("switch_"))
 async def switch_callback(callback: types.CallbackQuery):
-    """Переключение между режимами обработки"""
+    """Переключение между режимами"""
     await callback.answer()
     
     try:
@@ -624,7 +741,7 @@ async def switch_callback(callback: types.CallbackQuery):
         available_modes = ctx.get("available_modes", [])
         
         if target_mode not in available_modes:
-            await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
+            await callback.answer("⚠️ Этот режим недоступен", show_alert=True)
             return
         
         cached = ctx["cached_results"].get(target_mode)
@@ -649,7 +766,6 @@ async def switch_callback(callback: types.CallbackQuery):
         
         user_context[target_user_id]["current_mode"] = target_mode
         
-        # Отправка результата
         if len(result) > 4000:
             await callback.message.delete()
             
@@ -669,12 +785,12 @@ async def switch_callback(callback: types.CallbackQuery):
             
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка переключения режима")
+        await callback.message.edit_text("❌ Ошибка переключения")
 
 
 @dp.callback_query(F.data.startswith("export_"))
 async def export_callback(callback: types.CallbackQuery):
-    """Экспорт текста в файл"""
+    """Экспорт в файл"""
     await callback.answer()
     
     try:
@@ -690,7 +806,7 @@ async def export_callback(callback: types.CallbackQuery):
             return
         
         if target_user_id not in user_context:
-            await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
+            await callback.message.answer("❌ Текст не найден.")
             return
         
         ctx = user_context[target_user_id]
@@ -708,11 +824,7 @@ async def export_callback(callback: types.CallbackQuery):
             return
         
         filename = os.path.basename(filepath)
-        
-        if export_format == "pdf":
-            caption = "📊 PDF файл с обработанным текстом"
-        else:
-            caption = "📄 Текстовый файл с обработанным текстом"
+        caption = "📊 PDF файл" if export_format == "pdf" else "📄 Текстовый файл"
         
         document = FSInputFile(filepath, filename=filename)
         await callback.message.answer_document(document=document, caption=caption)
@@ -734,16 +846,14 @@ async def export_callback(callback: types.CallbackQuery):
 # ============================================================================
 
 async def main():
-    logger.info("🚀 Bot starting process...")
+    logger.info("🚀 Bot v3.0 starting process...")
     
     init_groq_clients()
     processors.vision_processor.init_clients(groq_clients)
     
-    # Запуск веб-сервера
     asyncio.create_task(start_web_server())
-    
-    # Запуск очистки кэша
     asyncio.create_task(cleanup_old_contexts())
+    asyncio.create_task(cleanup_temp_files())
     
     logger.info("✅ Starting polling...")
     await bot.delete_webhook(drop_pending_updates=True)
