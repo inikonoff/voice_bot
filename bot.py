@@ -1,4 +1,4 @@
-# bot.py
+# voicebot.py
 import os
 import io
 import logging
@@ -66,7 +66,7 @@ def init_groq_clients():
             client = AsyncOpenAI(
                 api_key=key,
                 base_url="https://api.groq.com/openai/v1",
-                timeout=60.0,  # Увеличил таймаут для Vision
+                timeout=60.0,
             )
             groq_clients.append(client)
             logger.info(f"✅ Groq client: {key[:8]}...")
@@ -92,7 +92,7 @@ async def make_groq_request(func, *args, **kwargs):
     
     errors = []
     
-    for _ in range(len(groq_clients) * 2):  # Пробуем каждый ключ 2 раза
+    for _ in range(len(groq_clients) * 2):
         client = get_client()
         if not client:
             break
@@ -102,96 +102,14 @@ async def make_groq_request(func, *args, **kwargs):
         except Exception as e:
             errors.append(str(e))
             logger.warning(f"Request error: {e}")
-            await asyncio.sleep(1 + random.random())  # Увеличил паузу
+            await asyncio.sleep(1 + random.random())
     
     raise Exception(f"All clients failed: {'; '.join(errors[:3])}")
 
-# --- VISION ПРОЦЕССОР (из vision.py) ---
+# --- VISION ПРОЦЕССОР (только OCR, без проверки контента) ---
 class VisionProcessor:
     def __init__(self):
         pass
-    
-    async def check_content(self, image_bytes: bytes) -> tuple[bool, str]:
-        """
-        Проверка изображения на образовательный контент
-        Возвращает: (is_educational, message)
-        """
-        
-        # Базовые проверки
-        if len(image_bytes) > 10 * 1024 * 1024:  # 10MB
-            return False, "Изображение слишком большое. Попробуйте сфотографировать ближе."
-        
-        if not groq_clients:
-            # Если нет клиентов Groq, пропускаем проверку
-            return True, "OK"
-        
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        
-        async def analyze(client):
-            response = await client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": """Analyze this image. Respond ONLY with JSON:
-{
-  "is_educational": true/false,
-  "content_type": "homework/textbook/notes/diagram/inappropriate/unclear/other"
-}
-
-Educational content includes:
-- Textbook pages, homework assignments
-- Math problems, exercises, diagrams
-- Handwritten notes, formulas
-- Educational charts, tables
-- Any text documents, letters, articles
-
-Non-educational (but respond politely):
-- Random photos, memes
-- Screenshots of unrelated content
-- Blurry/unclear images
-- Inappropriate content (handle with care)"""
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                temperature=0.2,
-                max_tokens=150
-            )
-            return response.choices[0].message.content
-        
-        try:
-            result = await make_groq_request(analyze)
-            analysis = json.loads(result)
-            
-            is_educational = analysis.get("is_educational", False)
-            content_type = analysis.get("content_type", "unclear")
-            
-            if not is_educational:
-                # Вежливые ответы для разных случаев
-                messages = {
-                    "inappropriate": "Пожалуйста, отправляйте только текстовые материалы для обработки.",
-                    "unclear": "Изображение нечёткое. Попробуйте сфотографировать ещё раз при хорошем освещении.",
-                    "other": "Я вижу изображение, но не могу найти там текст. Отправьте фото с текстом или текстовый файл."
-                }
-                message = messages.get(content_type, "Отправьте, пожалуйста, фото с текстом.")
-                return False, message
-            
-            return True, "OK"
-            
-        except Exception as e:
-            # При ошибке - пропускаем изображение
-            logger.warning(f"Vision check error: {e}")
-            return True, "OK"
     
     async def extract_text(self, image_bytes: bytes) -> str:
         """OCR через Groq Vision"""
@@ -242,10 +160,9 @@ Non-educational (but respond politely):
             logger.error(f"Vision OCR error: {e}")
             return f"❌ Ошибка распознавания текста: {str(e)[:100]}"
 
-# Создаем экземпляр VisionProcessor
 vision_processor = VisionProcessor()
 
-# --- GROQ СЕРВИСЫ ---
+# --- TRANSCRIBE ---
 async def transcribe_voice(audio_bytes: bytes) -> str:
     """Транскрибация голоса через Whisper v3"""
     async def transcribe(client):
@@ -262,24 +179,29 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
         logger.error(f"Transcription error: {e}")
         return f"❌ Ошибка распознавания: {str(e)[:100]}"
 
+# --- BASIC (Минимальная коррекция) ---
 async def correct_text_basic(text: str) -> str:
-    """Базовая коррекция: ошибки и пунктуация"""
+    """Базовая коррекция: только ошибки и пунктуация"""
     if not text.strip():
         return "❌ Пустой текст"
     
-    prompt = """Ты — профессиональный редактор. Твоя задача отредактировать текст пользователя:
-Исправь орфографические, пунктуационные и грамматические ошибки.        
-Верни ТОЛЬКО готовый исправленный текст без кавычек и вступлений.
+    prompt = f"""
+Ты — лингвистический редактор. Твоя задача — минимальное вмешательство в текст пользователя.
 
-Текст для исправления:"""
+1. Язык: Автоматически определи язык входящего сообщения. Весь ответ должен быть строго на этом языке.
+2. Исправления: Устрани только явные орфографические ошибки, опечатки (слипшиеся слова, пропущенные буквы) и базовую пунктуацию (точка в конце предложения, заглавная буква в начале).
+3. Запрещено: Менять структуру предложения, порядок слов, заменять слова на синонимы или переводить.
+4. Голосовой ввод: Учитывай, что текст мог быть получен через распознавание речи. Если слово звучит похоже на правильное, но записано с ошибкой — исправь.
+5. Формат вывода: ТОЛЬКО исправленный текст. Никаких комментариев, кавычек или пояснений.
+
+Текст для редактирования:
+{text}
+"""
     
     async def correct(client):
         response = await client.chat.completions.create(
             model="openai/gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": "Ты редактор русского языка. Только исправляешь ошибки."},
-                {"role": "user", "content": f"{prompt}\n\n{text}"}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
         return response.choices[0].message.content.strip()
@@ -290,26 +212,37 @@ async def correct_text_basic(text: str) -> str:
         logger.error(f"Basic correction error: {e}")
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
+# --- PREMIUM (Красиво, с сохранением живой речи) ---
 async def correct_text_premium(text: str) -> str:
-    """Премиум коррекция: стиль, паразиты, мат"""
+    """Премиум коррекция: деликатное причесывание"""
     if not text.strip():
         return "❌ Пустой текст"
     
-    prompt = """Ты — профессиональный редактор. Твоя задача отредактировать текст пользователя:
-1. Исправь орфографические, пунктуационные, речевые и грамматические ошибки.        
-2. Удали слова-паразиты (ну, короче, типа, эээ), 'воду' и бессмысленные повторы. Оставь только минимум вводных и соединительных слов с полным сохранением смысла фразы.
-3. Если есть матерные, бранные или грубые выражения — замени их на безобидные литературные аналоги, подходящие по смыслу, или смягчи тон.
-Верни ТОЛЬКО готовый исправленный текст без кавычек и вступлений.
+    prompt = f"""
+Ты — деликатный лингвист-редактор. Твоя задача — минимальная коррекция с сохранением живой речи автора.
 
-Текст для редактирования:"""
+1. Язык: Определи. Работай в нём.
+2. Что исправляешь:
+   — Только явные орфографические и грамматические ошибки.
+   — Пунктуация: только если её отсутствие ломает понимание.
+   — Очевидные опечатки и слипшиеся слова.
+3. Что НЕ трогаешь:
+   — Стиль, порядок слов, разговорные обороты.
+   — Слова-паразиты, если их немного и они создают «живой» ритм.
+   — Неполные предложения, инверсию, авторские паузы.
+4. Нецензурное:
+   — Мат — заменяй на литературные аналоги. Грубости — только если они явно лишние.
+5. Результат: Исправленный текст, звучащий так, как если бы автор сам перечитал и поправил. Без потери личности.
+
+ТОЛЬКО текст. Без комментариев.
+
+{text}
+"""
     
     async def correct(client):
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Ты профессиональный редактор и стилист."},
-                {"role": "user", "content": f"{prompt}\n\n{text}"}
-            ],
+            model="openai/gpt-oss-120b",
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
         return response.choices[0].message.content.strip()
@@ -320,32 +253,41 @@ async def correct_text_premium(text: str) -> str:
         logger.error(f"Premium correction error: {e}")
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
+# --- SUMMARY (Адаптивное саммари) ---
 async def summarize_text(text: str) -> str:
-    """Создание саммари"""
+    """Создание саммари с учетом жанра"""
     if not text.strip():
         return "❌ Пустой текст"
     
-    # Проверяем длину
-    words = text.split()
-    if len(words) < 50:
+    if len(text.split()) < 50:
         return "📝 Текст слишком короткий для саммари. Используйте обычную коррекцию."
     
-    prompt = """Сделай краткое содержательное саммари текста:
-1. Выдели основную мысль и ключевые моменты
-2. Дай только суть, без деталей и примеров
-3. Объем: примерно 10-20% от оригинала
-4. Сохрани важные факты и выводы
-5. Только саммари, без вступлений
+    prompt = f"""
+Ты — адаптивный саммаризатор.
 
-Текст для саммаризации:"""
+Задача: Сожми текст до 25% с учетом жанра:
+
+— Новость / репортаж: кто, что, где, когда, зачем.
+— Мнение / эссе: тезис, аргумент, вывод.
+— Инструкция / гайд: цель, этапы, результат.
+— Диалог / переписка: суть запроса, решение, договоренность.
+— Художественный / нарратив: герой, конфликт, развязка (макс. сжато).
+
+Общие правила:
+— Определи язык. Работай в нем.
+— Никаких «автор говорит», «в тексте рассказывается».
+— Только факты, логика, смысл.
+— Без оценок.
+
+Вывод: чистый сжатый текст.
+
+{text}
+"""
     
     async def summarize(client):
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Ты создаешь краткие содержательные саммари."},
-                {"role": "user", "content": f"{prompt}\n\n{text}"}
-            ],
+            model="openai/gpt-oss-120b",
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
         return response.choices[0].message.content.strip()
@@ -398,7 +340,6 @@ async def extract_text_from_docx(docx_bytes: bytes) -> str:
 async def extract_text_from_txt(txt_bytes: bytes) -> str:
     """Извлечение текста из TXT"""
     try:
-        # Пробуем разные кодировки
         encodings = ['utf-8', 'cp1251', 'koi8-r', 'windows-1251', 'iso-8859-1']
         
         for encoding in encodings:
@@ -407,7 +348,6 @@ async def extract_text_from_txt(txt_bytes: bytes) -> str:
             except UnicodeDecodeError:
                 continue
         
-        # Если ни одна кодировка не подошла
         return txt_bytes.decode('utf-8', errors='ignore')
     except Exception as e:
         return f"❌ Ошибка чтения текстового файла: {str(e)}"
@@ -415,45 +355,26 @@ async def extract_text_from_txt(txt_bytes: bytes) -> str:
 async def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     """Определяем тип файла и извлекаем текст"""
     
-    # Определяем MIME тип по расширению
     mime_type, _ = mimetypes.guess_type(filename)
     
     if mime_type:
         if mime_type.startswith('image/'):
-            # Это изображение - используем VisionProcessor
-            # Сначала проверяем контент
-            is_educational, message = await vision_processor.check_content(file_bytes)
-            if not is_educational:
-                return f"❌ {message}"
-            
-            # Затем распознаем текст
-            status_msg = f"🔍 Распознаю текст с изображения..."
-            logger.info(status_msg)
+            logger.info("🔍 Распознаю текст с изображения...")
             return await vision_processor.extract_text(file_bytes)
         
         elif mime_type == 'application/pdf':
-            # PDF файл
             return await extract_text_from_pdf(file_bytes)
         
         elif mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-            # DOCX файл
             return await extract_text_from_docx(file_bytes)
         
         elif mime_type == 'text/plain':
-            # TXT файл
             return await extract_text_from_txt(file_bytes)
     
-    # Если MIME тип не определился, пробуем по расширению
     file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
     
     if file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
-        # Изображение - используем VisionProcessor
-        is_educational, message = await vision_processor.check_content(file_bytes)
-        if not is_educational:
-            return f"❌ {message}"
-        
-        status_msg = f"🔍 Распознаю текст с изображения..."
-        logger.info(status_msg)
+        logger.info("🔍 Распознаю текст с изображения...")
         return await vision_processor.extract_text(file_bytes)
     
     elif file_ext == 'pdf':
@@ -505,7 +426,6 @@ def create_switch_keyboard(user_id: int) -> InlineKeyboardMarkup:
     
     builder = InlineKeyboardBuilder()
     
-    # Кнопки других режимов
     mode_buttons = []
     if "basic" in available and current != "basic":
         mode_buttons.append(InlineKeyboardButton(text="📝 Как есть", callback_data=f"switch_{user_id}_basic"))
@@ -514,11 +434,9 @@ def create_switch_keyboard(user_id: int) -> InlineKeyboardMarkup:
     if "summary" in available and current != "summary":
         mode_buttons.append(InlineKeyboardButton(text="📊 Саммари", callback_data=f"switch_{user_id}_summary"))
     
-    # Добавляем по 2 кнопки в ряд
     for i in range(0, len(mode_buttons), 2):
         builder.row(*mode_buttons[i:i+2])
     
-    # Кнопки экспорта
     builder.row(
         InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_txt"),
         InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{current}_pdf")
@@ -541,8 +459,6 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> str:
         try:
             from reportlab.lib.pagesizes import A4
             from reportlab.pdfgen import canvas
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
             from reportlab.lib.utils import simpleSplit
             
             filepath = f"/tmp/{filename}.pdf"
@@ -553,17 +469,14 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> str:
             line_height = 14
             y = height - margin
             
-            # Заголовок
             c.setFont("Helvetica-Bold", 14)
             c.drawString(margin, y, "Обработанный текст")
             y -= 30
             
-            # Дата
             c.setFont("Helvetica", 10)
             c.drawString(margin, y, f"Создано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
             y -= 40
             
-            # Текст
             c.setFont("Helvetica", 11)
             max_width = width - 2 * margin
             
@@ -596,11 +509,11 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> str:
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER/UPTIME ROBOT ---
 async def health_check(request):
-    """Uptime Robot и Render пингуют этот адрес, чтобы проверить, жив ли бот"""
+    """Uptime Robot и Render пингуют этот адрес"""
     return web.Response(text="Bot is alive!", status=200)
 
 async def start_web_server():
-    """Запуск фонового веб-сервера для Uptime Robot"""
+    """Запуск фонового веб-сервера"""
     try:
         app = web.Application()
         app.router.add_get('/', health_check)
@@ -629,7 +542,7 @@ async def start_handler(message: types.Message):
         "• Обрабатывать <b>прямой текст</b>\n\n"
         "🔧 <b>Варианты обработки:</b>\n"
         "• <b>📝 Как есть</b> - исправление ошибок и пунктуация\n"
-        "• <b>✨ Красиво</b> - уборка слов-паразитов, улучшение стиля\n"
+        "• <b>✨ Красиво</b> - деликатная коррекция с сохранением стиля\n"
         "• <b>📊 Саммари</b> - краткое содержание (для длинных текстов)\n\n"
         "💾 После обработки можно переключаться между вариантами и экспортировать в файлы.",
         parse_mode="HTML",
@@ -646,7 +559,7 @@ async def help_handler(message: types.Message):
         "   • Фото с текстом\n"
         "   • Файл (PDF, DOCX, TXT)\n\n"
         "2. <b>Выберите вариант обработки:</b>\n"
-        "   • 📝 Как есть - быстрая коррекция\n"
+        "   • 📝 Как есть - быстрая коррекция ошибок\n"
         "   • ✨ Красиво - профессиональное редактирование\n"
         "   • 📊 Саммари - краткое содержание\n\n"
         "3. <b>После обработки можно:</b>\n"
@@ -667,8 +580,8 @@ async def status_handler(message: types.Message):
         f"• Groq клиентов: {len(groq_clients)}\n"
         f"• Пользователей в памяти: {len(user_context)}\n"
         f"• Vision доступен: {'✅' if groq_clients else '❌'}\n"
-        f"• PDF обработка: {'✅' if hasattr(__import__('PyPDF2'), 'PdfReader') else '❌'}\n"
-        f"• DOCX обработка: {'✅' if hasattr(__import__('docx'), 'Document') else '❌'}\n"
+        f"• PDF обработка: {'✅' if 'PyPDF2' in sys.modules else '❌'}\n"
+        f"• DOCX обработка: {'✅' if 'docx' in sys.modules else '❌'}\n"
     )
     await message.answer(status_text, parse_mode="HTML")
 
@@ -678,7 +591,6 @@ async def voice_handler(message: types.Message):
     msg = await message.answer("🎧 Распознаю голосовое сообщение...")
     
     try:
-        # Скачиваем голосовое
         if message.voice:
             file_info = await bot.get_file(message.voice.file_id)
         else:
@@ -687,17 +599,14 @@ async def voice_handler(message: types.Message):
         voice_buffer = io.BytesIO()
         await bot.download_file(file_info.file_path, voice_buffer)
         
-        # Распознаем
         original_text = await transcribe_voice(voice_buffer.getvalue())
         
         if original_text.startswith("❌"):
             await msg.edit_text(original_text)
             return
         
-        # Определяем доступные режимы
         available_modes = get_available_modes(original_text)
         
-        # Сохраняем контекст
         user_context[user_id] = {
             "type": "voice",
             "original": original_text,
@@ -708,10 +617,8 @@ async def voice_handler(message: types.Message):
             "chat_id": message.chat.id
         }
         
-        # Предлагаем варианты
         preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
         
-        # Формируем сообщение с учетом доступных режимов
         modes_text = "📝 Как есть, ✨ Красиво"
         if "summary" in available_modes:
             modes_text += ", 📊 Саммари"
@@ -725,7 +632,6 @@ async def voice_handler(message: types.Message):
             reply_markup=create_options_keyboard(user_id)
         )
         
-        # Удаляем оригинальное сообщение
         try:
             await message.delete()
         except:
@@ -746,10 +652,8 @@ async def text_handler(message: types.Message):
     msg = await message.answer("📝 Анализирую текст...")
     
     try:
-        # Определяем доступные режимы
         available_modes = get_available_modes(original_text)
         
-        # Сохраняем контекст
         user_context[user_id] = {
             "type": "text",
             "original": original_text,
@@ -760,10 +664,8 @@ async def text_handler(message: types.Message):
             "chat_id": message.chat.id
         }
         
-        # Предлагаем варианты
         preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
         
-        # Формируем сообщение с учетом доступных режимов
         modes_text = "📝 Как есть, ✨ Красиво"
         if "summary" in available_modes:
             modes_text += ", 📊 Саммари"
@@ -777,7 +679,6 @@ async def text_handler(message: types.Message):
             reply_markup=create_options_keyboard(user_id)
         )
         
-        # Удаляем оригинальное сообщение
         try:
             await message.delete()
         except:
@@ -797,36 +698,30 @@ async def file_handler(message: types.Message):
         file_bytes = None
         filename = ""
         
-        # Получаем информацию о файле
         if message.photo:
-            # Для фото берем максимальное качество
             file_info = await bot.get_file(message.photo[-1].file_id)
             filename = f"photo_{file_info.file_unique_id}.jpg"
         elif message.document:
             file_info = await bot.get_file(message.document.file_id)
             filename = message.document.file_name or f"file_{file_info.file_unique_id}"
         
-        # Скачиваем файл
         file_buffer = io.BytesIO()
         await bot.download_file(file_info.file_path, file_buffer)
         file_bytes = file_buffer.getvalue()
         
-        # Проверяем размер файла
-        if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB
+        if len(file_bytes) > 10 * 1024 * 1024:
             await msg.edit_text("❌ Файл слишком большой (максимум 10 MB)")
             return
         
-        # Извлекаем текст из файла
-        status_msg = await msg.edit_text("🔍 Извлекаю текст...")
+        await msg.edit_text("🔍 Извлекаю текст...")
         original_text = await extract_text_from_file(file_bytes, filename)
         
         if original_text.startswith("❌"):
-            await status_msg.edit_text(original_text)
+            await msg.edit_text(original_text)
             return
         
-        # Проверяем, не пустой ли текст
         if not original_text.strip() or len(original_text.strip()) < 10:
-            await status_msg.edit_text(
+            await msg.edit_text(
                 "❌ Не удалось найти текст в файле.\n"
                 "Попробуйте:\n"
                 "• Более четкое изображение\n"
@@ -835,10 +730,8 @@ async def file_handler(message: types.Message):
             )
             return
         
-        # Определяем доступные режимы
         available_modes = get_available_modes(original_text)
         
-        # Сохраняем контекст
         user_context[user_id] = {
             "type": "file",
             "original": original_text,
@@ -850,17 +743,15 @@ async def file_handler(message: types.Message):
             "filename": filename
         }
         
-        # Предлагаем варианты
         preview = original_text[:200] + "..." if len(original_text) > 200 else original_text
         
-        # Формируем сообщение с учетом доступных режимов
         modes_text = "📝 Как есть, ✨ Красиво"
         if "summary" in available_modes:
             modes_text += ", 📊 Саммари"
         
         file_type = "изображения" if filename.startswith("photo_") or any(ext in filename.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']) else "файла"
         
-        await status_msg.edit_text(
+        await msg.edit_text(
             f"✅ <b>Извлеченный текст из {file_type}:</b>\n\n"
             f"<i>{preview}</i>\n\n"
             f"<b>Доступные режимы:</b> {modes_text}\n"
@@ -869,7 +760,6 @@ async def file_handler(message: types.Message):
             reply_markup=create_options_keyboard(user_id)
         )
         
-        # Удаляем оригинальное сообщение
         try:
             await message.delete()
         except:
@@ -884,7 +774,6 @@ async def process_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Парсим callback data: process_{user_id}_{type}
         parts = callback.data.split("_")
         if len(parts) < 3:
             return
@@ -892,12 +781,10 @@ async def process_callback(callback: types.CallbackQuery):
         target_user_id = int(parts[1])
         process_type = parts[2]
         
-        # Проверяем права
         if callback.from_user.id != target_user_id:
             await callback.message.answer("⚠️ Это не ваш запрос!")
             return
         
-        # Получаем контекст
         if target_user_id not in user_context:
             await callback.message.edit_text("❌ Время обработки истекло. Отправьте текст заново.")
             return
@@ -905,17 +792,14 @@ async def process_callback(callback: types.CallbackQuery):
         ctx = user_context[target_user_id]
         available_modes = ctx.get("available_modes", [])
         
-        # Проверяем доступность режима
         if process_type not in available_modes:
             await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
             return
         
         original_text = ctx["original"]
         
-        # Обновляем сообщение
         processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({process_type})...")
         
-        # Обрабатываем в зависимости от типа
         if process_type == "basic":
             result = await correct_text_basic(original_text)
         elif process_type == "premium":
@@ -925,11 +809,9 @@ async def process_callback(callback: types.CallbackQuery):
         else:
             result = "Неизвестный тип обработки"
         
-        # Сохраняем результат в кэш
         user_context[target_user_id]["cached_results"][process_type] = result
         user_context[target_user_id]["current_mode"] = process_type
         
-        # Отправляем результат
         if len(result) > 4000:
             await processing_msg.delete()
             
@@ -953,11 +835,9 @@ async def process_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("switch_"))
 async def switch_callback(callback: types.CallbackQuery):
-    """Переключение между режимами обработки"""
     await callback.answer()
     
     try:
-        # Парсим callback data: switch_{user_id}_{target_mode}
         parts = callback.data.split("_")
         if len(parts) < 3:
             return
@@ -965,11 +845,9 @@ async def switch_callback(callback: types.CallbackQuery):
         target_user_id = int(parts[1])
         target_mode = parts[2]
         
-        # Проверяем права
         if callback.from_user.id != target_user_id:
             return
         
-        # Получаем контекст
         if target_user_id not in user_context:
             await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
             return
@@ -977,19 +855,15 @@ async def switch_callback(callback: types.CallbackQuery):
         ctx = user_context[target_user_id]
         available_modes = ctx.get("available_modes", [])
         
-        # Проверяем доступность режима
         if target_mode not in available_modes:
             await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
             return
         
-        # Проверяем кэш
         cached = ctx["cached_results"].get(target_mode)
         
         if cached:
-            # Берем из кэша
             result = cached
         else:
-            # Обрабатываем
             processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({target_mode})...")
             
             original_text = ctx["original"]
@@ -1003,13 +877,10 @@ async def switch_callback(callback: types.CallbackQuery):
             else:
                 result = "Неизвестный режим"
             
-            # Сохраняем в кэш
             user_context[target_user_id]["cached_results"][target_mode] = result
         
-        # Обновляем текущий режим
         user_context[target_user_id]["current_mode"] = target_mode
         
-        # Показываем результат
         if len(result) > 4000:
             await callback.message.delete()
             
@@ -1036,7 +907,6 @@ async def export_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Парсим: export_{user_id}_{mode}_{format}
         parts = callback.data.split("_")
         if len(parts) < 4:
             return
@@ -1045,11 +915,9 @@ async def export_callback(callback: types.CallbackQuery):
         mode = parts[2]
         export_format = parts[3]
         
-        # Проверяем права
         if callback.from_user.id != target_user_id:
             return
         
-        # Получаем контекст
         if target_user_id not in user_context:
             await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
             return
@@ -1061,7 +929,6 @@ async def export_callback(callback: types.CallbackQuery):
             await callback.answer("⚠️ Текст не найден в кэше", show_alert=True)
             return
         
-        # Создаем файл
         status_msg = await callback.message.answer("📁 Создаю файл...")
         filepath = await save_to_file(target_user_id, text, export_format)
         
@@ -1069,7 +936,6 @@ async def export_callback(callback: types.CallbackQuery):
             await status_msg.edit_text("❌ Ошибка создания файла")
             return
         
-        # Отправляем файл
         filename = os.path.basename(filepath)
         
         if export_format == "pdf":
@@ -1080,10 +946,8 @@ async def export_callback(callback: types.CallbackQuery):
         document = FSInputFile(filepath, filename=filename)
         await callback.message.answer_document(document=document, caption=caption)
         
-        # Удаляем сообщение о создании
         await status_msg.delete()
         
-        # Удаляем временный файл
         try:
             os.remove(filepath)
         except:
@@ -1097,13 +961,10 @@ async def export_callback(callback: types.CallbackQuery):
 async def main():
     logger.info("Bot starting process...")
     
-    # Инициализируем Groq клиенты
     init_groq_clients()
     
-    # Запускаем веб-сервер в фоне
     asyncio.create_task(start_web_server())
     
-    # Запускаем бота
     logger.info("🚀 Starting polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
