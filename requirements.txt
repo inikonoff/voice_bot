@@ -1,9 +1,8 @@
 aiogram>=3.0.0
 python-dotenv
 aiohttp
-openai>=1.0.0
+openai
+pdfplumber
+yt-dlp
 reportlab
 python-docx
-youtube-transcript-api
-yt-dlp
-pdfplumber
