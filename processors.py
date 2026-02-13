@@ -16,7 +16,37 @@ from typing import Optional, Tuple, List
 from datetime import timedelta
 from openai import AsyncOpenAI
 
+# Импортируем конфигурацию
 import config
+
+# Попытка импорта дополнительных библиотек с обработкой ошибок
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+    logging.warning("pdfplumber not installed, PDF processing disabled")
+
+try:
+    import yt_dlp
+    YT_DLP_AVAILABLE = True
+except ImportError:
+    YT_DLP_AVAILABLE = False
+    logging.warning("yt-dlp not installed, YouTube processing disabled")
+
+try:
+    import docx
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logging.warning("python-docx not installed, DOCX processing disabled")
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YT_TRANSCRIPT_API_AVAILABLE = True
+except ImportError:
+    YT_TRANSCRIPT_API_AVAILABLE = False
+    logging.warning("youtube-transcript-api not installed, YouTube subtitles disabled")
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +125,7 @@ class VideoProcessor:
                 [
                     'ffprobe', '-v', 'error',
                     '-show_entries', 'format=duration',
-                    '-of', 'default=noprint_wrappers=1:nokey=1:nokey=1',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
                     filepath
                 ],
                 capture_output=True,
@@ -103,7 +133,7 @@ class VideoProcessor:
                 timeout=10
             )
             
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 duration = float(result.stdout.strip())
                 logger.debug(f"Video duration: {duration}s ({timedelta(seconds=int(duration))})")
                 return duration
@@ -196,9 +226,11 @@ class VideoPlatformProcessor:
     @staticmethod
     async def extract_youtube_subtitles(video_id: str) -> Optional[str]:
         """Извлечение субтитров из YouTube видео"""
+        if not YT_TRANSCRIPT_API_AVAILABLE:
+            logger.error("youtube-transcript-api not installed")
+            return None
+        
         try:
-            from youtube_transcript_api import YouTubeTranscriptApi
-            
             # Пытаемся получить субтитры в порядке: русский → английский
             for lang in config.YOUTUBE_SUBTITLES_LANGS:
                 try:
@@ -213,9 +245,6 @@ class VideoPlatformProcessor:
             logger.info("No subtitles found for video")
             return None
             
-        except ImportError:
-            logger.error("youtube-transcript-api not installed")
-            return None
         except Exception as e:
             logger.error(f"Error extracting YouTube subtitles: {e}")
             return None
@@ -238,29 +267,53 @@ class VideoPlatformProcessor:
     
     @staticmethod
     async def download_video_with_ytdlp(url: str, output_path: str) -> Optional[str]:
-        """Скачивание видео с помощью yt-dlp"""
+        """Скачивание видео с помощью yt-dlp с обходом блокировок"""
+        if not YT_DLP_AVAILABLE:
+            logger.error("yt-dlp not installed")
+            return None
+        
         try:
-            import yt_dlp
-            
+            # Заголовки, чтобы имитировать браузер
             ydl_opts = {
                 'format': 'best[ext=mp4]/best',
+                'outtmpl': output_path,
                 'quiet': config.YTDLP_QUIET,
                 'no_warnings': config.YTDLP_NO_WARNINGS,
                 'socket_timeout': config.YTDLP_SOCKET_TIMEOUT,
-                'outtmpl': output_path,
                 'max_filesize': config.VIDEO_SIZE_LIMIT,
+                'noplaylist': True,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                }
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 logger.info(f"Downloading video from: {url}")
-                info = ydl.extract_info(url, download=True)
+                # Используем run_in_executor для синхронного вызова yt-dlp
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: ydl.download([url]))
+                
+                # Определяем путь к скачанному файлу
+                info = ydl.extract_info(url, download=False)
                 video_path = ydl.prepare_filename(info)
+                
+                # Проверяем, что файл существует (может быть с другим расширением)
+                if not os.path.exists(video_path):
+                    # Пробуем найти любой mp4 файл во временной директории
+                    base_path = os.path.splitext(output_path)[0]
+                    for ext in ['.mp4', '.mkv', '.webm']:
+                        test_path = base_path + ext
+                        if os.path.exists(test_path):
+                            video_path = test_path
+                            break
+                
                 logger.info(f"Video downloaded: {video_path}")
                 return video_path
                 
-        except ImportError:
-            logger.error("yt-dlp not installed")
-            return None
         except Exception as e:
             logger.error(f"Error downloading video: {e}")
             return None
@@ -295,7 +348,7 @@ class VideoPlatformProcessor:
             try:
                 video_path = await VideoPlatformProcessor.download_video_with_ytdlp(url, temp_video_path)
                 
-                if not video_path:
+                if not video_path or not os.path.exists(video_path):
                     return config.ERROR_VIDEO_NOT_FOUND
                 
                 # Проверяем длительность
@@ -316,8 +369,10 @@ class VideoPlatformProcessor:
                 
                 # Чистим временные файлы
                 try:
-                    os.remove(video_path)
-                    os.remove(temp_audio_path)
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
                 except:
                     pass
                 
@@ -351,7 +406,8 @@ async def process_video_file(video_bytes: bytes, filename: str, groq_clients: li
     
     try:
         # Сохраняем во временный файл
-        temp_video_path = f"{config.TEMP_DIR}/video_{os.getpid()}_{int(asyncio.get_event_loop().time())}.{filename.split('.')[-1]}"
+        file_ext = filename.split('.')[-1] if '.' in filename else 'mp4'
+        temp_video_path = f"{config.TEMP_DIR}/video_{os.getpid()}_{int(asyncio.get_event_loop().time())}.{file_ext}"
         temp_audio_path = f"{config.TEMP_DIR}/audio_{os.getpid()}_{int(asyncio.get_event_loop().time())}.wav"
         
         with open(temp_video_path, 'wb') as f:
@@ -383,8 +439,10 @@ async def process_video_file(video_bytes: bytes, filename: str, groq_clients: li
         
         # Чистим временные файлы
         try:
-            os.remove(temp_video_path)
-            os.remove(temp_audio_path)
+            if os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
         except:
             pass
         
@@ -531,9 +589,10 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 
 async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """Извлечение текста из PDF с помощью pdfplumber"""
+    if not PDFPLUMBER_AVAILABLE:
+        return "❌ Для работы с PDF требуется установить pdfplumber"
+    
     try:
-        import pdfplumber
-        
         pdf_buffer = io.BytesIO(pdf_bytes)
         text = ""
         page_count = 0
@@ -548,6 +607,7 @@ async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                     text += f"\n--- Страница {page_num} ---\n"
                     text += page_text + "\n"
                 
+                # Извлечение таблиц
                 if page.tables:
                     for table_idx, table in enumerate(page.tables, 1):
                         text += f"\n[Таблица {table_idx} на странице {page_num}]\n"
@@ -562,9 +622,6 @@ async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         logger.info(f"Extracted text from {page_count} PDF pages")
         return text.strip()
         
-    except ImportError:
-        logger.error("pdfplumber not installed")
-        return "❌ Для работы с PDF требуется установить pdfplumber"
     except Exception as e:
         logger.error(f"PDF extraction error: {e}")
         return f"❌ Ошибка обработки PDF: {str(e)}"
@@ -572,9 +629,10 @@ async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 async def extract_text_from_docx(docx_bytes: bytes) -> str:
     """Извлечение текста из DOCX"""
+    if not DOCX_AVAILABLE:
+        return "❌ Для работы с DOCX требуется установить python-docx"
+    
     try:
-        import docx
-        
         doc_buffer = io.BytesIO(docx_bytes)
         doc = docx.Document(doc_buffer)
         text = ""
@@ -589,9 +647,6 @@ async def extract_text_from_docx(docx_bytes: bytes) -> str:
         logger.info("Extracted text from DOCX")
         return text.strip()
         
-    except ImportError:
-        logger.error("python-docx not installed")
-        return "❌ Для работы с DOCX требуется установить python-docx"
     except Exception as e:
         logger.error(f"DOCX extraction error: {e}")
         return f"❌ Ошибка обработки DOCX: {str(e)}"
@@ -662,6 +717,43 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
     # Неподдерживаемый формат
     logger.warning(f"Unsupported file format: {file_ext}")
     return f"{config.ERROR_UNSUPPORTED_FORMAT}"
+
+
+# ============================================================================
+# YOUTUBE AUDIO DOWNLOAD (специализированная функция)
+# ============================================================================
+
+async def download_youtube_audio(url: str, output_path: str) -> bool:
+    """Попытка загрузки аудио с YouTube с обходом блокировок"""
+    if not YT_DLP_AVAILABLE:
+        logger.error("yt-dlp not installed")
+        return False
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_path,
+        'noplaylist': True,
+        'quiet': config.YTDLP_QUIET,
+        'no_warnings': config.YTDLP_NO_WARNINGS,
+        'socket_timeout': config.YTDLP_SOCKET_TIMEOUT,
+        # Заголовки, чтобы имитировать браузер
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        }
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Используем run_in_executor для синхронного вызова yt-dlp
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: ydl.download([url]))
+        return os.path.exists(output_path)
+    except Exception as e:
+        logger.error(f"YouTube download error: {e}")
+        return False
 
 
 # ============================================================================
