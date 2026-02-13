@@ -1,4 +1,4 @@
-# bot.py (v3)
+# bot.py
 """
 Главный файл бота: хэндлеры, управление контекстом, видео-обработка
 Версия 3.0 с поддержкой YouTube, TikTok, Rutube, Instagram, Vimeo
@@ -9,8 +9,8 @@ import io
 import logging
 import asyncio
 import sys
-from typing import Optional, List, Dict
-from datetime import datetime
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiohttp import web
 from openai import AsyncOpenAI
@@ -50,7 +50,9 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-user_context = {}
+# Глобальное хранилище: user_id -> { message_id: {"text": "...", "mode": "...", "time": ...} }
+user_context: Dict[int, Dict[int, Any]] = {}
+
 groq_clients = []
 current_client_index = 0
 
@@ -91,35 +93,57 @@ def init_groq_clients():
 # УПРАВЛЕНИЕ КЭШЕМ И КОНТЕКСТОМ
 # ============================================================================
 
+def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", available_modes: list = None):
+    """Сохраняем текст, привязывая его к ID сообщения"""
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    
+    # Очистка старых записей, если их слишком много
+    if len(user_context[user_id]) > config.MAX_CONTEXTS_PER_USER:
+        oldest_msg = min(user_context[user_id].keys(), key=lambda k: user_context[user_id][k]['time'])
+        user_context[user_id].pop(oldest_msg)
+    
+    # Создаем запись с расширенной информацией
+    user_context[user_id][msg_id] = {
+        "text": text,
+        "mode": mode,
+        "time": datetime.now(),
+        "available_modes": available_modes or ["basic"],
+        "original": text,
+        "cached_results": {"basic": None, "premium": None, "summary": None},
+        "type": "text",  # по умолчанию
+        "chat_id": None,
+        "filename": None
+    }
+
+
 async def cleanup_old_contexts():
     """Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS"""
     while True:
         try:
             await asyncio.sleep(config.CACHE_CHECK_INTERVAL)
             
-            current_time = datetime.now().timestamp()
-            users_to_delete = []
+            current_time = datetime.now()
+            users_to_clean = []
             
-            for user_id, ctx in user_context.items():
-                context_age = current_time - ctx.get("created_at", current_time)
+            for user_id, messages in user_context.items():
+                for msg_id, ctx in list(messages.items()):
+                    context_age = (current_time - ctx.get("time", current_time)).total_seconds()
+                    
+                    if context_age > config.CACHE_TIMEOUT_SECONDS:
+                        messages.pop(msg_id, None)
+                        logger.debug(f"Cleaned up message {msg_id} for user {user_id}")
                 
-                if context_age > config.CACHE_TIMEOUT_SECONDS:
-                    users_to_delete.append(user_id)
+                if not messages:
+                    users_to_clean.append(user_id)
             
-            if len(user_context) > config.MAX_CONTEXTS:
-                contexts_by_age = sorted(
-                    user_context.items(),
-                    key=lambda x: x[1].get("created_at", 0)
-                )
-                users_to_delete.extend([uid for uid, _ in contexts_by_age[:len(user_context) - config.MAX_CONTEXTS]])
-            
-            for user_id in users_to_delete:
+            for user_id in users_to_clean:
                 if user_id in user_context:
                     del user_context[user_id]
-                    logger.debug(f"Cleaned up context for user {user_id}")
+                    logger.debug(f"Cleaned up empty user context for user {user_id}")
             
-            if users_to_delete:
-                logger.info(f"Cache cleanup: removed {len(set(users_to_delete))} contexts. Current users: {len(user_context)}")
+            if users_to_clean:
+                logger.info(f"Cache cleanup: removed {len(users_to_clean)} contexts. Current users: {len(user_context)}")
                 
         except Exception as e:
             logger.error(f"Cache cleanup error: {e}")
@@ -142,7 +166,7 @@ async def cleanup_temp_files():
             
             deleted_count = 0
             for filename in os.listdir(temp_dir):
-                if filename.startswith('video_') or filename.startswith('audio_'):
+                if filename.startswith('video_') or filename.startswith('audio_') or filename.startswith('text_'):
                     filepath = os.path.join(temp_dir, filename)
                     
                     try:
@@ -165,52 +189,128 @@ async def cleanup_temp_files():
 # СОЗДАНИЕ КЛАВИАТУР
 # ============================================================================
 
-def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура с вариантами обработки"""
+def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None) -> InlineKeyboardMarkup:
+    """Создаем клавиатуру, где в callback_data зашит ID сообщения"""
     builder = InlineKeyboardBuilder()
     
-    builder.row(
-        InlineKeyboardButton(text="📝 Как есть", callback_data=f"process_{user_id}_basic"),
-        InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium"),
-    )
+    if available_modes is None:
+        available_modes = ["basic", "premium"]
     
-    ctx = user_context.get(user_id)
-    available_modes = ctx.get("available_modes", []) if ctx else []
+    mode_buttons = []
     
-    if "summary" in available_modes:
+    # Определяем соответствие между названиями в коде и отображаемыми текстами
+    mode_display = {
+        "basic": "📝 Как есть",
+        "premium": "✨ Красиво", 
+        "summary": "📊 Саммари"
+    }
+    
+    mode_codes = {
+        "basic": "basic",
+        "premium": "premium",
+        "summary": "summary"
+    }
+    
+    # Добавляем кнопки для доступных режимов
+    for mode_code in available_modes:
+        if mode_code in mode_display:
+            prefix = "✅ " if mode_code == current_mode else ""
+            # Формат: mode_{тип}_{ID сообщения}
+            mode_buttons.append(
+                InlineKeyboardButton(
+                    text=f"{prefix}{mode_display[mode_code]}", 
+                    callback_data=f"mode_{mode_codes.get(mode_code, mode_code)}_{msg_id}"
+                )
+            )
+    
+    # Располагаем кнопки по 2 в ряд
+    for i in range(0, len(mode_buttons), 2):
+        if i + 1 < len(mode_buttons):
+            builder.row(mode_buttons[i], mode_buttons[i + 1])
+        else:
+            builder.row(mode_buttons[i])
+    
+    # Добавляем кнопки экспорта, если есть текущий режим
+    if current_mode:
         builder.row(
-            InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary"),
+            InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{current_mode}_{msg_id}_txt"),
+            InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{current_mode}_{msg_id}_pdf")
         )
     
     return builder.as_markup()
 
 
-def create_switch_keyboard(user_id: int) -> Optional[InlineKeyboardMarkup]:
+def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура с вариантами обработки для первого выбора"""
+    builder = InlineKeyboardBuilder()
+    
+    # Используем msg_id в callback_data для идентификации
+    builder.row(
+        InlineKeyboardButton(text="📝 Как есть", callback_data=f"process_{user_id}_basic_{msg_id}"),
+        InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium_{msg_id}"),
+    )
+    
+    # Проверяем доступность саммари
+    ctx_data = None
+    if user_id in user_context:
+        for m_id, ctx in user_context[user_id].items():
+            if m_id == msg_id:
+                ctx_data = ctx
+                break
+    
+    available_modes = ctx_data.get("available_modes", []) if ctx_data else []
+    
+    if "summary" in available_modes:
+        builder.row(
+            InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary_{msg_id}"),
+        )
+    
+    return builder.as_markup()
+
+
+def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboardMarkup]:
     """Клавиатура для переключения между режимами"""
-    ctx = user_context.get(user_id)
-    if not ctx:
+    ctx_data = None
+    if user_id in user_context:
+        for m_id, ctx in user_context[user_id].items():
+            if m_id == msg_id:
+                ctx_data = ctx
+                break
+    
+    if not ctx_data:
         return None
     
-    current = ctx.get("current_mode")
-    available = ctx.get("available_modes", [])
+    current = ctx_data.get("mode", "basic")
+    available = ctx_data.get("available_modes", ["basic", "premium"])
     
     builder = InlineKeyboardBuilder()
     
     mode_buttons = []
-    if "basic" in available and current != "basic":
-        mode_buttons.append(InlineKeyboardButton(text="📝 Как есть", callback_data=f"switch_{user_id}_basic"))
-    if "premium" in available and current != "premium":
-        mode_buttons.append(InlineKeyboardButton(text="✨ Красиво", callback_data=f"switch_{user_id}_premium"))
-    if "summary" in available and current != "summary":
-        mode_buttons.append(InlineKeyboardButton(text="📊 Саммари", callback_data=f"switch_{user_id}_summary"))
+    mode_display = {
+        "basic": "📝 Как есть",
+        "premium": "✨ Красиво",
+        "summary": "📊 Саммари"
+    }
+    
+    for mode in available:
+        if mode != current:
+            mode_buttons.append(
+                InlineKeyboardButton(
+                    text=mode_display.get(mode, mode), 
+                    callback_data=f"switch_{user_id}_{mode}_{msg_id}"
+                )
+            )
     
     for i in range(0, len(mode_buttons), 2):
-        builder.row(*mode_buttons[i:i+2])
+        if i + 1 < len(mode_buttons):
+            builder.row(mode_buttons[i], mode_buttons[i + 1])
+        else:
+            builder.row(mode_buttons[i])
     
     if current:
         builder.row(
-            InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_txt"),
-            InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{current}_pdf")
+            InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_{msg_id}_txt"),
+            InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{current}_{msg_id}_pdf")
         )
     
     return builder.as_markup()
@@ -355,7 +455,7 @@ async def status_handler(message: types.Message):
         docx_status = "❌"
     
     temp_files = len([f for f in os.listdir(config.TEMP_DIR) 
-                     if f.startswith('video_') or f.startswith('audio_')]) if os.path.exists(config.TEMP_DIR) else 0
+                     if f.startswith('video_') or f.startswith('audio_') or f.startswith('text_')]) if os.path.exists(config.TEMP_DIR) else 0
     
     status_text = config.STATUS_MESSAGE.format(
         groq_count=len(groq_clients),
@@ -388,16 +488,20 @@ async def voice_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        user_context[user_id] = {
-            "type": "voice",
-            "original": original_text,
-            "cached_results": {"basic": None, "premium": None, "summary": None},
-            "current_mode": None,
-            "available_modes": available_modes,
-            "message_id": msg.message_id,
-            "chat_id": message.chat.id,
-            "created_at": datetime.now().timestamp()
-        }
+        # Сохраняем с ID сообщения бота
+        save_to_history(
+            user_id, 
+            msg.message_id, 
+            original_text, 
+            mode="basic", 
+            available_modes=available_modes
+        )
+        
+        # Добавляем дополнительную информацию
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "voice"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
         
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
@@ -413,7 +517,7 @@ async def voice_handler(message: types.Message):
             f"<b>Доступные режимы:</b> {modes_text}\n"
             f"<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
-            reply_markup=create_options_keyboard(user_id)
+            reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
         try:
@@ -446,16 +550,20 @@ async def audio_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        user_context[user_id] = {
-            "type": "audio",
-            "original": original_text,
-            "cached_results": {"basic": None, "premium": None, "summary": None},
-            "current_mode": None,
-            "available_modes": available_modes,
-            "message_id": msg.message_id,
-            "chat_id": message.chat.id,
-            "created_at": datetime.now().timestamp()
-        }
+        # Сохраняем с ID сообщения бота
+        save_to_history(
+            user_id, 
+            msg.message_id, 
+            original_text, 
+            mode="basic", 
+            available_modes=available_modes
+        )
+        
+        # Добавляем дополнительную информацию
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "audio"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
         
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
@@ -471,7 +579,7 @@ async def audio_handler(message: types.Message):
             f"<b>Доступные режимы:</b> {modes_text}\n"
             f"<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
-            reply_markup=create_options_keyboard(user_id)
+            reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
         try:
@@ -517,16 +625,21 @@ async def text_handler(message: types.Message):
     try:
         available_modes = processors.get_available_modes(original_text)
         
-        user_context[user_id] = {
-            "type": "text" if not is_valid else f"video_{platform}",
-            "original": original_text,
-            "cached_results": {"basic": None, "premium": None, "summary": None},
-            "current_mode": None,
-            "available_modes": available_modes,
-            "message_id": msg.message_id,
-            "chat_id": message.chat.id,
-            "created_at": datetime.now().timestamp()
-        }
+        # Сохраняем с ID сообщения бота
+        save_to_history(
+            user_id, 
+            msg.message_id, 
+            original_text, 
+            mode="basic", 
+            available_modes=available_modes
+        )
+        
+        # Добавляем дополнительную информацию
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "text" if not is_valid else f"video_{platform}"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
+            user_context[user_id][msg.message_id]["original"] = original_text
         
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
@@ -544,7 +657,7 @@ async def text_handler(message: types.Message):
             f"<b>Доступные режимы:</b> {modes_text}\n"
             f"<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
-            reply_markup=create_options_keyboard(user_id)
+            reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
         try:
@@ -587,7 +700,7 @@ async def file_handler(message: types.Message):
         file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
         
         # Видеофайлы
-        if file_ext in processors.config.VIDEO_SUPPORTED_FORMATS:
+        if file_ext in config.VIDEO_SUPPORTED_FORMATS:
             await msg.edit_text(config.MSG_EXTRACTING_AUDIO)
         else:
             await msg.edit_text("🔍 Извлекаю текст...")
@@ -604,17 +717,22 @@ async def file_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        user_context[user_id] = {
-            "type": "file",
-            "original": original_text,
-            "cached_results": {"basic": None, "premium": None, "summary": None},
-            "current_mode": None,
-            "available_modes": available_modes,
-            "message_id": msg.message_id,
-            "chat_id": message.chat.id,
-            "filename": filename,
-            "created_at": datetime.now().timestamp()
-        }
+        # Сохраняем с ID сообщения бота
+        save_to_history(
+            user_id, 
+            msg.message_id, 
+            original_text, 
+            mode="basic", 
+            available_modes=available_modes
+        )
+        
+        # Добавляем дополнительную информацию
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "file"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["filename"] = filename
+            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
+            user_context[user_id][msg.message_id]["original"] = original_text
         
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
@@ -624,7 +742,7 @@ async def file_handler(message: types.Message):
         if "summary" in available_modes:
             modes_text += ", 📊 Саммари"
         
-        file_type = "видео" if file_ext in processors.config.VIDEO_SUPPORTED_FORMATS else \
+        file_type = "видео" if file_ext in config.VIDEO_SUPPORTED_FORMATS else \
                    "изображения" if filename.startswith("photo_") or any(
             ext in filename.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
         ) else "файла"
@@ -635,7 +753,7 @@ async def file_handler(message: types.Message):
             f"<b>Доступные режимы:</b> {modes_text}\n"
             f"<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
-            reply_markup=create_options_keyboard(user_id)
+            reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
         try:
@@ -658,29 +776,35 @@ async def process_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
+        # Формат: process_userId_mode_msgId
         parts = callback.data.split("_")
-        if len(parts) < 3:
+        if len(parts) < 4:
             return
         
         target_user_id = int(parts[1])
         process_type = parts[2]
+        msg_id = int(parts[3])
         
         if callback.from_user.id != target_user_id:
             await callback.message.answer("⚠️ Это не ваш запрос!")
             return
         
-        if target_user_id not in user_context:
+        # Ищем данные для этого сообщения
+        ctx_data = None
+        if target_user_id in user_context and msg_id in user_context[target_user_id]:
+            ctx_data = user_context[target_user_id][msg_id]
+        
+        if not ctx_data:
             await callback.message.edit_text("❌ Время обработки истекло. Отправьте текст заново.")
             return
         
-        ctx = user_context[target_user_id]
-        available_modes = ctx.get("available_modes", [])
+        available_modes = ctx_data.get("available_modes", ["basic", "premium"])
         
         if process_type not in available_modes:
             await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
             return
         
-        original_text = ctx["original"]
+        original_text = ctx_data.get("original", ctx_data.get("text", ""))
         
         processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({process_type})...")
         
@@ -693,8 +817,9 @@ async def process_callback(callback: types.CallbackQuery):
         else:
             result = "❌ Неизвестный тип обработки"
         
-        user_context[target_user_id]["cached_results"][process_type] = result
-        user_context[target_user_id]["current_mode"] = process_type
+        # Обновляем кэш и режим
+        user_context[target_user_id][msg_id]["cached_results"][process_type] = result
+        user_context[target_user_id][msg_id]["mode"] = process_type
         
         if len(result) > 4000:
             await processing_msg.delete()
@@ -705,17 +830,72 @@ async def process_callback(callback: types.CallbackQuery):
             await callback.message.answer(
                 "💾 <b>Переключение и экспорт:</b>",
                 parse_mode="HTML",
-                reply_markup=create_switch_keyboard(target_user_id)
+                reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
         else:
             await processing_msg.edit_text(
                 result,
-                reply_markup=create_switch_keyboard(target_user_id)
+                reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
             
     except Exception as e:
         logger.error(f"Process callback error: {e}")
         await callback.message.edit_text("❌ Ошибка обработки")
+
+
+@dp.callback_query(F.data.startswith("mode_"))
+async def mode_callback(callback: types.CallbackQuery):
+    """Обработка переключения режимов (альтернативный формат)"""
+    await callback.answer()
+    
+    try:
+        # Формат: mode_{тип}_{ID сообщения}
+        parts = callback.data.split("_")
+        if len(parts) < 3:
+            return
+        
+        new_mode = parts[1]
+        msg_id = int(parts[2])
+        user_id = callback.from_user.id
+        
+        # Ищем данные для этого сообщения
+        ctx_data = None
+        if user_id in user_context and msg_id in user_context[user_id]:
+            ctx_data = user_context[user_id][msg_id]
+        
+        if not ctx_data:
+            await callback.answer("❌ Данные устарели. Перешлите сообщение еще раз.", show_alert=True)
+            return
+        
+        if ctx_data["mode"] == new_mode:
+            await callback.answer()
+            return
+        
+        await callback.answer("Обрабатываю...")
+        original_text = ctx_data.get("original", ctx_data.get("text", ""))
+        
+        # Обработка
+        if new_mode == "basic":
+            processed = await processors.correct_text_basic(original_text, groq_clients)
+        elif new_mode == "premium" or new_mode == "clean":
+            processed = await processors.correct_text_premium(original_text, groq_clients)
+        elif new_mode == "summary":
+            processed = await processors.summarize_text(original_text, groq_clients)
+        else:
+            processed = original_text
+        
+        # Обновляем режим и кэш в памяти
+        user_context[user_id][msg_id]["mode"] = new_mode
+        user_context[user_id][msg_id]["cached_results"][new_mode] = processed
+        
+        await callback.message.edit_text(
+            processed,
+            reply_markup=create_keyboard(msg_id, new_mode, ctx_data.get("available_modes", ["basic", "premium", "summary"]))
+        )
+        
+    except Exception as e:
+        logger.error(f"Mode callback error: {e}")
+        await callback.message.edit_text("❌ Ошибка переключения")
 
 
 @dp.callback_query(F.data.startswith("switch_"))
@@ -724,35 +904,41 @@ async def switch_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
+        # Формат: switch_userId_mode_msgId
         parts = callback.data.split("_")
-        if len(parts) < 3:
+        if len(parts) < 4:
             return
         
         target_user_id = int(parts[1])
         target_mode = parts[2]
+        msg_id = int(parts[3])
         
         if callback.from_user.id != target_user_id:
             return
         
-        if target_user_id not in user_context:
+        # Ищем данные для этого сообщения
+        ctx_data = None
+        if target_user_id in user_context and msg_id in user_context[target_user_id]:
+            ctx_data = user_context[target_user_id][msg_id]
+        
+        if not ctx_data:
             await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
             return
         
-        ctx = user_context[target_user_id]
-        available_modes = ctx.get("available_modes", [])
+        available_modes = ctx_data.get("available_modes", ["basic", "premium"])
         
         if target_mode not in available_modes:
             await callback.answer("⚠️ Этот режим недоступен", show_alert=True)
             return
         
-        cached = ctx["cached_results"].get(target_mode)
+        cached = ctx_data["cached_results"].get(target_mode)
         
         if cached:
             result = cached
         else:
             processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({target_mode})...")
             
-            original_text = ctx["original"]
+            original_text = ctx_data.get("original", ctx_data.get("text", ""))
             
             if target_mode == "basic":
                 result = await processors.correct_text_basic(original_text, groq_clients)
@@ -763,9 +949,9 @@ async def switch_callback(callback: types.CallbackQuery):
             else:
                 result = "❌ Неизвестный режим"
             
-            user_context[target_user_id]["cached_results"][target_mode] = result
+            user_context[target_user_id][msg_id]["cached_results"][target_mode] = result
         
-        user_context[target_user_id]["current_mode"] = target_mode
+        user_context[target_user_id][msg_id]["mode"] = target_mode
         
         if len(result) > 4000:
             await callback.message.delete()
@@ -776,12 +962,12 @@ async def switch_callback(callback: types.CallbackQuery):
             await callback.message.answer(
                 "💾 <b>Переключение и экспорт:</b>",
                 parse_mode="HTML",
-                reply_markup=create_switch_keyboard(target_user_id)
+                reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
         else:
             await callback.message.edit_text(
                 result,
-                reply_markup=create_switch_keyboard(target_user_id)
+                reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
             
     except Exception as e:
@@ -795,26 +981,42 @@ async def export_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
+        # Определяем формат вызова: export_userId_mode_msgId_format или export_mode_msgId_format
         parts = callback.data.split("_")
-        if len(parts) < 4:
-            return
         
-        target_user_id = int(parts[1])
-        mode = parts[2]
-        export_format = parts[3]
+        if len(parts) == 4:
+            # Формат: export_mode_msgId_format
+            mode = parts[1]
+            msg_id = int(parts[2])
+            export_format = parts[3]
+            target_user_id = callback.from_user.id
+        elif len(parts) == 5:
+            # Формат: export_userId_mode_msgId_format
+            target_user_id = int(parts[1])
+            mode = parts[2]
+            msg_id = int(parts[3])
+            export_format = parts[4]
+        else:
+            return
         
         if callback.from_user.id != target_user_id:
             return
         
-        if target_user_id not in user_context:
+        # Ищем данные для этого сообщения
+        ctx_data = None
+        if target_user_id in user_context and msg_id in user_context[target_user_id]:
+            ctx_data = user_context[target_user_id][msg_id]
+        
+        if not ctx_data:
             await callback.message.answer("❌ Текст не найден.")
             return
         
-        ctx = user_context[target_user_id]
-        text = ctx["cached_results"].get(mode)
+        text = ctx_data["cached_results"].get(mode)
+        if not text:
+            text = ctx_data.get("original", ctx_data.get("text", ""))
         
         if not text:
-            await callback.answer("⚠️ Текст не найден в кэше", show_alert=True)
+            await callback.answer("⚠️ Текст не найден", show_alert=True)
             return
         
         status_msg = await callback.message.answer("📁 Создаю файл...")
