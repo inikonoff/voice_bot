@@ -1,14 +1,15 @@
 # bot.py
 """
 Главный файл бота: хэндлеры, управление контекстом, видео-обработка
-Версия 3.0 с поддержкой YouTube, TikTok, Rutube, Instagram, Vimeo
+Версия 3.1 с поддержкой graceful shutdown и SIGTERM
 """
 
 import os
 import io
+import sys
+import signal
 import logging
 import asyncio
-import sys
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -38,7 +39,8 @@ GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
 logging.basicConfig(
     level=config.LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
+    stream=sys.stdout,
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -56,8 +58,41 @@ user_context: Dict[int, Dict[int, Any]] = {}
 groq_clients = []
 current_client_index = 0
 
-# Счётчик временных файлов
-temp_files_count = 0
+# Флаг для graceful shutdown
+shutdown_event = asyncio.Event()
+
+
+# ============================================================================
+# ОБРАБОТКА СИГНАЛОВ (РЕШЕНИЕ ПРОБЛЕМЫ SIGTERM)
+# ============================================================================
+
+def handle_sigterm(signum, frame):
+    """Обработчик сигнала SIGTERM от Render"""
+    logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
+    asyncio.create_task(shutdown())
+
+
+async def shutdown():
+    """Graceful shutdown"""
+    logger.info("🛑 Starting graceful shutdown...")
+    
+    # Устанавливаем событие завершения
+    shutdown_event.set()
+    
+    # Даём время на завершение текущих обработок (30 секунд)
+    logger.info("⏳ Waiting for ongoing tasks to complete (up to 30 seconds)...")
+    await asyncio.sleep(30)
+    
+    # Сохраняем контекст (опционально, если нужно)
+    logger.info(f"📝 Saving context for {len(user_context)} users...")
+    # Здесь можно сохранить контекст в Redis/файл, если нужно
+    
+    # Закрываем сессию бота
+    await bot.session.close()
+    logger.info("✅ Bot session closed")
+    
+    logger.info("✅ Graceful shutdown complete")
+    sys.exit(0)
 
 
 # ============================================================================
@@ -111,7 +146,7 @@ def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", a
         "available_modes": available_modes or ["basic"],
         "original": text,
         "cached_results": {"basic": None, "premium": None, "summary": None},
-        "type": "text",  # по умолчанию
+        "type": "text",
         "chat_id": None,
         "filename": None
     }
@@ -119,9 +154,12 @@ def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", a
 
 async def cleanup_old_contexts():
     """Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS"""
-    while True:
+    while not shutdown_event.is_set():
         try:
             await asyncio.sleep(config.CACHE_CHECK_INTERVAL)
+            
+            if shutdown_event.is_set():
+                break
             
             current_time = datetime.now()
             users_to_clean = []
@@ -145,17 +183,19 @@ async def cleanup_old_contexts():
             if users_to_clean:
                 logger.info(f"Cache cleanup: removed {len(users_to_clean)} contexts. Current users: {len(user_context)}")
                 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Cache cleanup error: {e}")
 
 
 async def cleanup_temp_files():
     """Фоновая задача: удаление старых временных файлов"""
-    while True:
+    while not shutdown_event.is_set():
         try:
             await asyncio.sleep(config.TEMP_FILE_RETENTION)
             
-            if not config.CLEANUP_TEMP_FILES:
+            if shutdown_event.is_set() or not config.CLEANUP_TEMP_FILES:
                 continue
             
             current_time = datetime.now().timestamp()
@@ -181,6 +221,8 @@ async def cleanup_temp_files():
             if deleted_count > 0:
                 logger.debug(f"Cleaned up {deleted_count} temporary files")
                 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Temp files cleanup error: {e}")
 
@@ -198,7 +240,6 @@ def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None
     
     mode_buttons = []
     
-    # Определяем соответствие между названиями в коде и отображаемыми текстами
     mode_display = {
         "basic": "📝 Как есть",
         "premium": "✨ Красиво", 
@@ -211,11 +252,9 @@ def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None
         "summary": "summary"
     }
     
-    # Добавляем кнопки для доступных режимов
     for mode_code in available_modes:
         if mode_code in mode_display:
             prefix = "✅ " if mode_code == current_mode else ""
-            # Формат: mode_{тип}_{ID сообщения}
             mode_buttons.append(
                 InlineKeyboardButton(
                     text=f"{prefix}{mode_display[mode_code]}", 
@@ -223,14 +262,12 @@ def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None
                 )
             )
     
-    # Располагаем кнопки по 2 в ряд
     for i in range(0, len(mode_buttons), 2):
         if i + 1 < len(mode_buttons):
             builder.row(mode_buttons[i], mode_buttons[i + 1])
         else:
             builder.row(mode_buttons[i])
     
-    # Добавляем кнопки экспорта, если есть текущий режим
     if current_mode:
         builder.row(
             InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{current_mode}_{msg_id}_txt"),
@@ -244,13 +281,11 @@ def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
     """Клавиатура с вариантами обработки для первого выбора"""
     builder = InlineKeyboardBuilder()
     
-    # Используем msg_id в callback_data для идентификации
     builder.row(
         InlineKeyboardButton(text="📝 Как есть", callback_data=f"process_{user_id}_basic_{msg_id}"),
         InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium_{msg_id}"),
     )
     
-    # Проверяем доступность саммари
     ctx_data = None
     if user_id in user_context:
         for m_id, ctx in user_context[user_id].items():
@@ -399,13 +434,26 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
 
 async def health_check(request):
     """Health check для Uptime Robot и Render"""
-    return web.Response(text="Bot is alive!", status=200)
+    return web.Response(
+        text='{"status": "healthy", "service": "speech-flow-bot"}',
+        content_type="application/json",
+        status=200
+    )
 
 
 async def start_web_server():
     """Запуск фонового веб-сервера"""
     try:
         app = web.Application()
+        
+        async def log_middleware(app, handler):
+            async def middleware(request):
+                logger.debug(f"🌐 Web request: {request.method} {request.path}")
+                return await handler(request)
+            return middleware
+        
+        app.middlewares.append(log_middleware)
+        
         app.router.add_get('/', health_check)
         app.router.add_get('/health', health_check)
         app.router.add_get('/ping', health_check)
@@ -413,12 +461,31 @@ async def start_web_server():
         runner = web.AppRunner(app)
         await runner.setup()
         
+        # БЕРЁМ ПОРТ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
         port = int(os.environ.get("PORT", 8080))
+        
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        logger.info(f"✅ WEB SERVER STARTED ON PORT {port}")
+        
+        logger.info("=" * 50)
+        logger.info(f"✅ WEB SERVER STARTED")
+        logger.info(f"📌 PORT from env: {os.environ.get('PORT', 'not set')}")
+        logger.info(f"🔌 Listening on port: {port}")
+        logger.info(f"🌐 Health check: http://0.0.0.0:{port}/health")
+        logger.info("=" * 50)
+        
+        # Ждём сигнала завершения
+        await shutdown_event.wait()
+        
+        # Останавливаем сервер при завершении
+        logger.info("🛑 Stopping web server...")
+        await runner.cleanup()
+        logger.info("✅ Web server stopped")
+        
+    except asyncio.CancelledError:
+        logger.info("Web server task cancelled")
     except Exception as e:
-        logger.error(f"❌ Error starting web server: {e}")
+        logger.error(f"❌ Error in web server: {e}")
 
 
 # ============================================================================
@@ -488,7 +555,6 @@ async def voice_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        # Сохраняем с ID сообщения бота
         save_to_history(
             user_id, 
             msg.message_id, 
@@ -497,7 +563,6 @@ async def voice_handler(message: types.Message):
             available_modes=available_modes
         )
         
-        # Добавляем дополнительную информацию
         if user_id in user_context and msg.message_id in user_context[user_id]:
             user_context[user_id][msg.message_id]["type"] = "voice"
             user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
@@ -550,7 +615,6 @@ async def audio_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        # Сохраняем с ID сообщения бота
         save_to_history(
             user_id, 
             msg.message_id, 
@@ -559,7 +623,6 @@ async def audio_handler(message: types.Message):
             available_modes=available_modes
         )
         
-        # Добавляем дополнительную информацию
         if user_id in user_context and msg.message_id in user_context[user_id]:
             user_context[user_id][msg.message_id]["type"] = "audio"
             user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
@@ -601,11 +664,9 @@ async def text_handler(message: types.Message):
     if original_text.startswith("/"):
         return
     
-    # Проверяем, не ссылка ли это на видеоплатформу
     is_valid, platform = processors.video_platform_processor._validate_url(original_text)
     
     if is_valid:
-        # Обработка ссылки на видео
         msg = await message.answer(f"🔗 Обрабатываю {platform} видео...\n{config.MSG_LOOKING_FOR_SUBTITLES}")
         
         try:
@@ -625,7 +686,6 @@ async def text_handler(message: types.Message):
     try:
         available_modes = processors.get_available_modes(original_text)
         
-        # Сохраняем с ID сообщения бота
         save_to_history(
             user_id, 
             msg.message_id, 
@@ -634,7 +694,6 @@ async def text_handler(message: types.Message):
             available_modes=available_modes
         )
         
-        # Добавляем дополнительную информацию
         if user_id in user_context and msg.message_id in user_context[user_id]:
             user_context[user_id][msg.message_id]["type"] = "text" if not is_valid else f"video_{platform}"
             user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
@@ -678,7 +737,6 @@ async def file_handler(message: types.Message):
     
     try:
         file_info = None
-        file_bytes = None
         filename = ""
         
         if message.photo:
@@ -696,10 +754,8 @@ async def file_handler(message: types.Message):
             await msg.edit_text(config.ERROR_FILE_TOO_LARGE)
             return
         
-        # Определяем тип файла
         file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
         
-        # Видеофайлы
         if file_ext in config.VIDEO_SUPPORTED_FORMATS:
             await msg.edit_text(config.MSG_EXTRACTING_AUDIO)
         else:
@@ -717,7 +773,6 @@ async def file_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        # Сохраняем с ID сообщения бота
         save_to_history(
             user_id, 
             msg.message_id, 
@@ -726,7 +781,6 @@ async def file_handler(message: types.Message):
             available_modes=available_modes
         )
         
-        # Добавляем дополнительную информацию
         if user_id in user_context and msg.message_id in user_context[user_id]:
             user_context[user_id][msg.message_id]["type"] = "file"
             user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
@@ -776,7 +830,6 @@ async def process_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Формат: process_userId_mode_msgId
         parts = callback.data.split("_")
         if len(parts) < 4:
             return
@@ -789,7 +842,6 @@ async def process_callback(callback: types.CallbackQuery):
             await callback.message.answer("⚠️ Это не ваш запрос!")
             return
         
-        # Ищем данные для этого сообщения
         ctx_data = None
         if target_user_id in user_context and msg_id in user_context[target_user_id]:
             ctx_data = user_context[target_user_id][msg_id]
@@ -817,7 +869,6 @@ async def process_callback(callback: types.CallbackQuery):
         else:
             result = "❌ Неизвестный тип обработки"
         
-        # Обновляем кэш и режим
         user_context[target_user_id][msg_id]["cached_results"][process_type] = result
         user_context[target_user_id][msg_id]["mode"] = process_type
         
@@ -849,7 +900,6 @@ async def mode_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Формат: mode_{тип}_{ID сообщения}
         parts = callback.data.split("_")
         if len(parts) < 3:
             return
@@ -858,7 +908,6 @@ async def mode_callback(callback: types.CallbackQuery):
         msg_id = int(parts[2])
         user_id = callback.from_user.id
         
-        # Ищем данные для этого сообщения
         ctx_data = None
         if user_id in user_context and msg_id in user_context[user_id]:
             ctx_data = user_context[user_id][msg_id]
@@ -874,17 +923,15 @@ async def mode_callback(callback: types.CallbackQuery):
         await callback.answer("Обрабатываю...")
         original_text = ctx_data.get("original", ctx_data.get("text", ""))
         
-        # Обработка
         if new_mode == "basic":
             processed = await processors.correct_text_basic(original_text, groq_clients)
-        elif new_mode == "premium" or new_mode == "clean":
+        elif new_mode == "premium":
             processed = await processors.correct_text_premium(original_text, groq_clients)
         elif new_mode == "summary":
             processed = await processors.summarize_text(original_text, groq_clients)
         else:
             processed = original_text
         
-        # Обновляем режим и кэш в памяти
         user_context[user_id][msg_id]["mode"] = new_mode
         user_context[user_id][msg_id]["cached_results"][new_mode] = processed
         
@@ -904,7 +951,6 @@ async def switch_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Формат: switch_userId_mode_msgId
         parts = callback.data.split("_")
         if len(parts) < 4:
             return
@@ -916,7 +962,6 @@ async def switch_callback(callback: types.CallbackQuery):
         if callback.from_user.id != target_user_id:
             return
         
-        # Ищем данные для этого сообщения
         ctx_data = None
         if target_user_id in user_context and msg_id in user_context[target_user_id]:
             ctx_data = user_context[target_user_id][msg_id]
@@ -981,17 +1026,14 @@ async def export_callback(callback: types.CallbackQuery):
     await callback.answer()
     
     try:
-        # Определяем формат вызова: export_userId_mode_msgId_format или export_mode_msgId_format
         parts = callback.data.split("_")
         
         if len(parts) == 4:
-            # Формат: export_mode_msgId_format
             mode = parts[1]
             msg_id = int(parts[2])
             export_format = parts[3]
             target_user_id = callback.from_user.id
         elif len(parts) == 5:
-            # Формат: export_userId_mode_msgId_format
             target_user_id = int(parts[1])
             mode = parts[2]
             msg_id = int(parts[3])
@@ -1002,7 +1044,6 @@ async def export_callback(callback: types.CallbackQuery):
         if callback.from_user.id != target_user_id:
             return
         
-        # Ищем данные для этого сообщения
         ctx_data = None
         if target_user_id in user_context and msg_id in user_context[target_user_id]:
             ctx_data = user_context[target_user_id][msg_id]
@@ -1049,24 +1090,51 @@ async def export_callback(callback: types.CallbackQuery):
 # ============================================================================
 
 async def main():
-    logger.info("🚀 Bot v3.0 starting process...")
+    logger.info("🚀 Bot v3.1 starting process...")
     
+    # Регистрируем обработчик SIGTERM
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    logger.info("✅ SIGTERM handler registered")
+    
+    # Инициализация клиентов
     init_groq_clients()
     processors.vision_processor.init_clients(groq_clients)
     
-    asyncio.create_task(start_web_server())
-    asyncio.create_task(cleanup_old_contexts())
-    asyncio.create_task(cleanup_temp_files())
+    # Запускаем фоновые задачи
+    web_server_task = asyncio.create_task(start_web_server())
+    cleanup_task = asyncio.create_task(cleanup_old_contexts())
+    temp_cleanup_task = asyncio.create_task(cleanup_temp_files())
     
     logger.info("✅ Starting polling...")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    try:
+        # Запускаем polling
+        await dp.start_polling(bot)
+    except asyncio.CancelledError:
+        logger.info("Polling cancelled")
+    finally:
+        # Отменяем фоновые задачи
+        web_server_task.cancel()
+        cleanup_task.cancel()
+        temp_cleanup_task.cancel()
+        
+        # Ждём завершения задач
+        await asyncio.gather(
+            web_server_task, 
+            cleanup_task, 
+            temp_cleanup_task,
+            return_exceptions=True
+        )
+        
+        logger.info("✅ Bot stopped gracefully")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        logger.critical(f"❌ Fatal error: {e}", exc_info=True)
+        sys.exit(1)
