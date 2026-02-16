@@ -701,10 +701,18 @@ async def switch_callback(callback: types.CallbackQuery):
                 reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
         else:
-            await callback.message.edit_text(
-                result,
-                reply_markup=create_switch_keyboard(target_user_id, msg_id)
-            )
+            # ИСПРАВЛЕНО: проверяем, изменился ли текст
+            current_text = callback.message.text
+            if current_text != result:
+                await callback.message.edit_text(
+                    result,
+                    reply_markup=create_switch_keyboard(target_user_id, msg_id)
+                )
+            else:
+                # Текст не изменился, просто обновляем клавиатуру
+                await callback.message.edit_reply_markup(
+                    reply_markup=create_switch_keyboard(target_user_id, msg_id)
+                )
             
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
