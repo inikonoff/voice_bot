@@ -761,7 +761,63 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
 
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================================
+# ==========================================================================
+
+async def stream_document_answer(
+    user_id: int,
+    msg_id: int,
+    question: str,
+    groq_clients: list
+):
+    if user_id not in document_dialogues:
+        yield "Документ не найден."
+        return
+
+    if msg_id not in document_dialogues[user_id]:
+        yield "Документ не найден."
+        return
+
+    doc_data = document_dialogues[user_id][msg_id]
+    full_text = doc_data["full_text"]
+    history = doc_data["history"]
+
+    context = ""
+    for turn in history[-5:]:
+        context += f"Вопрос: {turn['q']}\nОтвет: {turn['a']}\n\n"
+
+    prompt = f"""
+Документ:
+{full_text[:20000]}
+
+{context}
+
+Вопрос:
+{question}
+
+Ответь строго по документу.
+"""
+
+    client = groq_clients[0]
+
+    stream = await client.chat.completions.create(
+        model=config.GROQ_MODELS["reasoning"],
+        messages=[
+            {"role": "system", "content": "Ты отвечаешь строго по документу."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        stream=True,
+    )
+
+    full_answer = ""
+
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            piece = chunk.choices[0].delta.content
+            full_answer += piece
+            yield piece
+
+    history.append({"q": question, "a": full_answer})
 
 async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
     """Делаем запрос с перебором ключей"""
