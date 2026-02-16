@@ -314,3 +314,25 @@ MSG_LOOKING_FOR_SUBTITLES = "🔎 Ищу субтитры в YouTube видео.
 MSG_DOWNLOADING_VIDEO = "⬇️ Скачиваю видео..."
 MSG_TRANSCRIBING = "🎧 Транскрибирую звук..."
 MSG_PROCESSING_VOICE = "🎙️ Обрабатываю голосовое сообщение..."
+
+# ============================================================================
+# МОДЕЛИ GROQ (добавьте, если нет)
+# ============================================================================
+
+GROQ_MODELS = {
+    "transcription": "whisper-large-v3-turbo",
+    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "basic": "openai/gpt-oss-20b",
+    "premium": "llama-3.3-70b-versatile",
+    "reasoning": "openai/gpt-oss-120b",
+}
+
+MODEL_TEMPERATURES = {
+    "transcription": 0.0,
+    "vision": 0.0,
+    "basic": 0.1,
+    "premium": 0.3,
+    "reasoning": 0.2,
+}
+
+MAX_DIALOG_HISTORY = 20
