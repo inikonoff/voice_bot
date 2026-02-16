@@ -321,18 +321,8 @@ MSG_PROCESSING_VOICE = "🎙️ Обрабатываю голосовое соо
 
 GROQ_MODELS = {
     "transcription": "whisper-large-v3-turbo",
-    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "basic": "openai/gpt-oss-20b",
-    "premium": "llama-3.3-70b-versatile",
-    "reasoning": "openai/gpt-oss-120b",
+    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",  # 30K TPM
+    "basic": "llama-3.1-8b-instant",                        # 6K TPM
+    "premium": "llama-3.3-70b-versatile",                   # 12K TPM
+    "reasoning": "meta-llama/llama-4-scout-17b-16e-instruct", # 30K TPM !!!
 }
-
-MODEL_TEMPERATURES = {
-    "transcription": 0.0,
-    "vision": 0.0,
-    "basic": 0.1,
-    "premium": 0.3,
-    "reasoning": 0.2,
-}
-
-MAX_DIALOG_HISTORY = 20
