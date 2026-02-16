@@ -1,7 +1,7 @@
 # processors.py
 """
 Обработчики текста и видео: OCR, транскрибация, видео, коррекция, саммари, диалог
-Версия 4.1 с исправлениями для PDF и YouTube
+Версия 4.2 - исправлены лимиты токенов, PDF и YouTube
 """
 
 import io
@@ -244,7 +244,7 @@ class VideoPlatformProcessor:
             return None
         
         try:
-            # Усиленные опции для обхода блокировок
+            # Обновленная конфигурация для обхода блокировок YouTube
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': output_path,
@@ -261,27 +261,21 @@ class VideoPlatformProcessor:
                     'preferredquality': '64',
                 }],
                 
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-                    'Sec-Ch-Ua-Mobile': '?0',
-                    'Sec-Ch-Ua-Platform': '"Windows"',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-User': '?1',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Connection': 'keep-alive',
-                },
-                
+                # Используем только мобильные клиенты (они стабильнее)
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['android', 'web', 'ios'],
+                        'player_client': ['android', 'ios'],
                         'skip': ['hls', 'dash'],
                     }
+                },
+                
+                # Заголовки как у мобильного приложения
+                'http_headers': {
+                    'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US',
+                    'X-YouTube-Client-Name': '3',
+                    'X-YouTube-Client-Version': '19.09.37',
                 },
                 
                 'extractor_retries': 5,
@@ -292,22 +286,15 @@ class VideoPlatformProcessor:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 logger.info(f"Downloading audio from: {url}")
                 
-                try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, lambda: ydl.download([url]))
-                except Exception as e:
-                    logger.error(f"First download attempt failed: {e}")
-                    # Пробуем с запасными опциями
-                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
-                    ydl_opts['format'] = 'worstaudio/worst'
-                    logger.info("Trying fallback with android client...")
-                    await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: ydl.download([url]))
                 
                 mp3_path = output_path + '.mp3'
                 if os.path.exists(mp3_path):
                     logger.info(f"Audio downloaded: {mp3_path}")
                     return mp3_path
                 
+                # Проверяем другие возможные расширения
                 for ext in ['.m4a', '.webm', '.opus']:
                     test_path = output_path + ext
                     if os.path.exists(test_path):
@@ -392,14 +379,34 @@ async def transcribe_voice(audio_bytes: bytes, groq_clients: list) -> str:
 
 
 # ============================================================================
-# TEXT PROCESSING - CORRECTION
+# TEXT PROCESSING - CORRECTION (с обрезкой для лимитов)
 # ============================================================================
 
+def _truncate_text_for_model(text: str, model_type: str) -> str:
+    """Обрезает текст в зависимости от лимитов модели"""
+    # Лимиты из документации Groq
+    model_limits = {
+        "basic": 5000,      # llama-3.1-8b-instant - 6K TPM, оставляем запас
+        "premium": 10000,    # llama-3.3-70b-versatile - 12K TPM
+        "reasoning": 25000,  # llama-4-scout - 30K TPM
+    }
+    
+    limit = model_limits.get(model_type, 5000)
+    
+    if len(text) > limit:
+        logger.warning(f"Text truncated from {len(text)} to {limit} chars for {model_type}")
+        return text[:limit] + "... [текст обрезан из-за лимитов API]"
+    return text
+
+
 async def correct_text_basic(text: str, groq_clients: list) -> str:
-    """Базовая коррекция: openai/gpt-oss-20b"""
+    """Базовая коррекция: llama-3.1-8b-instant"""
     
     if not text.strip():
         return config.ERROR_EMPTY_TEXT
+    
+    # Обрезаем для Basic модели
+    text = _truncate_text_for_model(text, "basic")
     
     async def correct(client):
         response = await client.chat.completions.create(
@@ -413,6 +420,18 @@ async def correct_text_basic(text: str, groq_clients: list) -> str:
         return await _make_groq_request(groq_clients, correct)
     except Exception as e:
         logger.error(f"Basic correction error: {e}")
+        # Если ошибка 413 (лимит), пробуем еще сильнее обрезать
+        if "413" in str(e) or "rate_limit_exceeded" in str(e):
+            logger.warning("Rate limit exceeded, trying with shorter text")
+            shorter_text = text[:3000] + "... [сильно обрезано]"
+            async def retry_correct(client):
+                response = await client.chat.completions.create(
+                    model=config.GROQ_MODELS["basic"],
+                    messages=[{"role": "user", "content": config.BASIC_CORRECTION_PROMPT + f"\n\nТекст:\n{shorter_text}"}],
+                    temperature=config.MODEL_TEMPERATURES["basic"],
+                )
+                return response.choices[0].message.content.strip()
+            return await _make_groq_request(groq_clients, retry_correct)
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
 
@@ -421,6 +440,9 @@ async def correct_text_premium(text: str, groq_clients: list) -> str:
     
     if not text.strip():
         return config.ERROR_EMPTY_TEXT
+    
+    # Обрезаем для Premium модели
+    text = _truncate_text_for_model(text, "premium")
     
     async def correct(client):
         response = await client.chat.completions.create(
@@ -434,15 +456,26 @@ async def correct_text_premium(text: str, groq_clients: list) -> str:
         return await _make_groq_request(groq_clients, correct)
     except Exception as e:
         logger.error(f"Premium correction error: {e}")
+        if "413" in str(e) or "rate_limit_exceeded" in str(e):
+            logger.warning("Rate limit exceeded, trying with shorter text")
+            shorter_text = text[:5000] + "... [сильно обрезано]"
+            async def retry_correct(client):
+                response = await client.chat.completions.create(
+                    model=config.GROQ_MODELS["premium"],
+                    messages=[{"role": "user", "content": config.PREMIUM_CORRECTION_PROMPT + f"\n\nТекст:\n{shorter_text}"}],
+                    temperature=config.MODEL_TEMPERATURES["premium"],
+                )
+                return response.choices[0].message.content.strip()
+            return await _make_groq_request(groq_clients, retry_correct)
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
 
 # ============================================================================
-# TEXT PROCESSING - SUMMARIZATION & DIALOG
+# TEXT PROCESSING - SUMMARIZATION & DIALOG (с обрезкой)
 # ============================================================================
 
 async def summarize_text(text: str, groq_clients: list) -> str:
-    """Создание саммари через OSS 120B"""
+    """Создание саммари через Llama-4-Scout (30K TPM)"""
     
     if not text.strip():
         return config.ERROR_EMPTY_TEXT
@@ -450,6 +483,9 @@ async def summarize_text(text: str, groq_clients: list) -> str:
     words_count = len(text.split())
     if words_count < config.MIN_WORDS_FOR_SUMMARY or len(text) < config.MIN_CHARS_FOR_SUMMARY:
         return config.ERROR_TEXT_TOO_SHORT_FOR_SUMMARY
+    
+    # Обрезаем для Reasoning модели (Scout имеет 30K лимит)
+    text = _truncate_text_for_model(text, "reasoning")
     
     async def summarize(client):
         response = await client.chat.completions.create(
@@ -463,6 +499,17 @@ async def summarize_text(text: str, groq_clients: list) -> str:
         return await _make_groq_request(groq_clients, summarize)
     except Exception as e:
         logger.error(f"Summarization error: {e}")
+        if "413" in str(e) or "rate_limit_exceeded" in str(e):
+            logger.warning("Rate limit exceeded for summarization, trying with shorter text")
+            shorter_text = text[:10000] + "... [сильно обрезано]"
+            async def retry_summarize(client):
+                response = await client.chat.completions.create(
+                    model=config.GROQ_MODELS["reasoning"],
+                    messages=[{"role": "user", "content": config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{shorter_text}"}],
+                    temperature=config.MODEL_TEMPERATURES["reasoning"],
+                )
+                return response.choices[0].message.content.strip()
+            return await _make_groq_request(groq_clients, retry_summarize)
         return f"❌ Ошибка создания саммари: {str(e)[:100]}"
 
 
@@ -494,6 +541,13 @@ async def answer_document_question(
     full_text = doc_data["full_text"]
     history = doc_data.get("history", [])
     
+    # Обрезаем документ для запроса (Scout имеет 30K лимит, но оставим запас)
+    if len(full_text) > 20000:
+        doc_preview = full_text[:20000] + "... [документ обрезан для обработки]"
+        logger.warning(f"Document truncated from {len(full_text)} to 20000 chars for dialog")
+    else:
+        doc_preview = full_text
+    
     dialog_context = ""
     if history:
         dialog_context = "Предыдущий диалог:\n"
@@ -504,7 +558,7 @@ async def answer_document_question(
     qa_prompt = f"""Ты - ассистент, который отвечает на вопросы по содержанию документа.
 
 Документ:
-{full_text[:10000]}
+{doc_preview}
 
 {dialog_context}
 
