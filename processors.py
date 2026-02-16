@@ -261,22 +261,23 @@ class VideoPlatformProcessor:
                     'preferredquality': '64',
                 }],
                 
-                # Используем только мобильные клиенты (они стабильнее)
+                # Используем современные методы обхода (PoToken и мобильные клиенты)
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['android', 'ios'],
+                        'player_client': ['web_creator', 'ios', 'android'],
                         'skip': ['hls', 'dash'],
                     }
                 },
                 
-                # Заголовки как у мобильного приложения
+                # Заголовки
                 'http_headers': {
-                    'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                     'Accept': '*/*',
-                    'Accept-Language': 'en-US',
-                    'X-YouTube-Client-Name': '3',
-                    'X-YouTube-Client-Version': '19.09.37',
+                    'Accept-Language': 'en-US,en;q=0.9',
                 },
+                
+                # Добавляем куки, если файл существует
+                'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
                 
                 'extractor_retries': 5,
                 'file_access_retries': 5,
