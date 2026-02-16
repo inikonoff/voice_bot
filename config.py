@@ -1,10 +1,11 @@
 # config.py
 """
 Конфигурация бота: промпты, константы, параметры
-Версия 3.0 с поддержкой видео, кружочков и видеоплатформ
+Версия 3.2 с поддержкой диалога о документах и PoT токенов
 """
 
 import logging
+import os
 
 # === ТАЙМАУТЫ И ЛИМИТЫ ===
 CACHE_TIMEOUT_SECONDS = 3600          # Храним контекст 1 час
@@ -16,14 +17,31 @@ VIDEO_SIZE_LIMIT = 500 * 1024 * 1024     # 500 MB (YouTube/TikTok через yt-
 GROQ_TIMEOUT = 120.0                      # Таймаут для Groq API (увеличен для видео)
 GROQ_RETRY_COUNT = 3                      # Количество повторов на клиент
 
+# === МОДЕЛИ GROQ ===
+GROQ_MODELS = {
+    "transcription": "whisper-large-v3-turbo",
+    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "basic": "openai/gpt-oss-20b",
+    "premium": "llama-3.3-70b-versatile",
+    "reasoning": "openai/gpt-oss-120b",  # Для саммари и диалога
+}
+
+# === ТЕМПЕРАТУРЫ ===
+MODEL_TEMPERATURES = {
+    "transcription": 0.0,
+    "vision": 0.0,
+    "basic": 0.1,
+    "premium": 0.3,
+    "reasoning": 0.2,
+}
+
 # === AUDIO ===
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_LANGUAGE = None                      # None для автоопределения
-TRANSCRIPTION_TEMPERATURE = 0.0            # Максимум детерминизма
+TRANSCRIPTION_TEMPERATURE = 0.0
 
 # === VIDEO ===
-VIDEO_MAX_DURATION = 3600                   # 60 минут максимально
-VIDEO_EXTRACT_AUDIO_FORMAT = "wav"          # Формат для сохранения звука
+VIDEO_MAX_DURATION = 3600                   # 60 минут
 VIDEO_SUPPORTED_FORMATS = ['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'webm', 'm4v']
 
 # === ВИДЕОПЛАТФОРМЫ ===
@@ -34,21 +52,26 @@ INSTAGRAM_ENABLED = True
 VIMEO_ENABLED = True
 
 # YouTube - сначала ищем субтитры
-YOUTUBE_PREFER_SUBTITLES = True               # True = сначала субтитры, потом звук
-YOUTUBE_EXTRACT_AUDIO = True                   # Если субтитров нет - извлекаем звук
-YOUTUBE_SUBTITLES_LANGS = ['ru', 'en', 'a.ru', 'a.en']  # Порядок поиска
+YOUTUBE_PREFER_SUBTITLES = True
+YOUTUBE_SUBTITLES_LANGS = ['ru', 'en', 'a.ru', 'a.en']
 
-# yt-dlp параметры
+# yt-dlp параметры с PoT поддержкой
 YTDLP_QUIET = True
 YTDLP_NO_WARNINGS = True
 YTDLP_SOCKET_TIMEOUT = 30
+YTDLP_RETRIES = 10
+YTDLP_FRAGMENT_RETRIES = 10
+
+# PoT токены (можно задать через переменные окружения)
+PO_TOKEN = os.environ.get("PO_TOKEN", None)  # Опционально
+VISITOR_DATA = os.environ.get("VISITOR_DATA", None)  # Опционально
 
 # === VOICE MESSAGES (КРУЖОЧКИ) ===
-VOICE_MESSAGE_ENABLED = True                   # Поддержка голосовых кружочков из Telegram
-VOICE_MESSAGE_MAX_DURATION = 600                 # 10 минут
+VOICE_MESSAGE_ENABLED = True
+VOICE_MESSAGE_MAX_DURATION = 600
 
 # === VISION ===
-VISION_TEMPERATURE = 0.0                         # Максимум детерминизма для OCR
+VISION_TEMPERATURE = 0.0
 VISION_MAX_TOKENS = 4000
 
 # === TEXT PROCESSING ===
@@ -61,19 +84,20 @@ MIN_TEXT_LENGTH = 10
 MIN_WORDS_FOR_SUMMARY = 50
 MIN_CHARS_FOR_SUMMARY = 300
 PREVIEW_LENGTH = 200
+MAX_DIALOG_HISTORY = 20  # Сколько сообщений диалога хранить
 
 # === PDF ===
-PDF_MAX_PAGES = None                              # None = без ограничений
+PDF_MAX_PAGES = None
 
 # === ЛОГИРОВАНИЕ ===
 LOG_LEVEL = logging.INFO
-LOG_TRANSCRIPTION_LANGUAGE = True                  # Логировать определённый язык
-LOG_VIDEO_PROCESSING = True                         # Логировать обработку видео
+LOG_TRANSCRIPTION_LANGUAGE = True
+LOG_VIDEO_PROCESSING = True
 
 # === ВРЕМЕННЫЕ ФАЙЛЫ ===
-TEMP_DIR = "/tmp"                                   # Директория для временных файлов
-CLEANUP_TEMP_FILES = True                           # Удалять временные файлы после использования
-TEMP_FILE_RETENTION = 300                            # Сколько секунд хранить временные файлы (если не удалены)
+TEMP_DIR = "/tmp"
+CLEANUP_TEMP_FILES = True
+TEMP_FILE_RETENTION = 300
 
 # ============================================================================
 # ПРОМПТЫ
