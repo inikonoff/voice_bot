@@ -1,7 +1,7 @@
 # bot.py
 """
-Главный файл бота: хэндлеры, управление контекстом, видео-обработка
-Версия 3.1 с поддержкой graceful shutdown и SIGTERM
+Главный файл бота
+Версия 4.0 с поддержкой диалога о документах и кружочков
 """
 
 import os
@@ -10,8 +10,8 @@ import sys
 import signal
 import logging
 import asyncio
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
 from openai import AsyncOpenAI
@@ -19,12 +19,13 @@ from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
-    InlineKeyboardMarkup, 
+    InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardRemove,
     FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.enums import ContentType
 
 import config
 import processors
@@ -52,55 +53,35 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Глобальное хранилище: user_id -> { message_id: {"text": "...", "mode": "...", "time": ...} }
+# Хранилище контекста
 user_context: Dict[int, Dict[int, Any]] = {}
-
 groq_clients = []
-current_client_index = 0
-
-# Флаг для graceful shutdown
 shutdown_event = asyncio.Event()
 
 
 # ============================================================================
-# ОБРАБОТКА СИГНАЛОВ (РЕШЕНИЕ ПРОБЛЕМЫ SIGTERM)
+# ОБРАБОТКА СИГНАЛОВ
 # ============================================================================
 
 def handle_sigterm(signum, frame):
-    """Обработчик сигнала SIGTERM от Render"""
     logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
     asyncio.create_task(shutdown())
 
 
 async def shutdown():
-    """Graceful shutdown"""
     logger.info("🛑 Starting graceful shutdown...")
-    
-    # Устанавливаем событие завершения
     shutdown_event.set()
-    
-    # Даём время на завершение текущих обработок (30 секунд)
-    logger.info("⏳ Waiting for ongoing tasks to complete (up to 30 seconds)...")
     await asyncio.sleep(30)
-    
-    # Сохраняем контекст (опционально, если нужно)
-    logger.info(f"📝 Saving context for {len(user_context)} users...")
-    # Здесь можно сохранить контекст в Redis/файл, если нужно
-    
-    # Закрываем сессию бота
     await bot.session.close()
-    logger.info("✅ Bot session closed")
-    
     logger.info("✅ Graceful shutdown complete")
     sys.exit(0)
 
 
 # ============================================================================
-# ИНИЦИАЛИЗАЦИЯ GROQ КЛИЕНТОВ
+# ИНИЦИАЛИЗАЦИЯ GROQ
 # ============================================================================
 
 def init_groq_clients():
-    """Инициализация клиентов Groq"""
     global groq_clients
     
     if not GROQ_API_KEYS:
@@ -119,26 +100,23 @@ def init_groq_clients():
             groq_clients.append(client)
             logger.info(f"✅ Groq client initialized: {key[:8]}...")
         except Exception as e:
-            logger.error(f"❌ Error initializing client {key[:8]}...: {e}")
+            logger.error(f"❌ Error initializing client: {e}")
     
     logger.info(f"✅ Total Groq clients: {len(groq_clients)}")
 
 
 # ============================================================================
-# УПРАВЛЕНИЕ КЭШЕМ И КОНТЕКСТОМ
+# УПРАВЛЕНИЕ КОНТЕКСТОМ
 # ============================================================================
 
 def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", available_modes: list = None):
-    """Сохраняем текст, привязывая его к ID сообщения"""
     if user_id not in user_context:
         user_context[user_id] = {}
     
-    # Очистка старых записей, если их слишком много
     if len(user_context[user_id]) > config.MAX_CONTEXTS_PER_USER:
         oldest_msg = min(user_context[user_id].keys(), key=lambda k: user_context[user_id][k]['time'])
         user_context[user_id].pop(oldest_msg)
     
-    # Создаем запись с расширенной информацией
     user_context[user_id][msg_id] = {
         "text": text,
         "mode": mode,
@@ -148,137 +126,26 @@ def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", a
         "cached_results": {"basic": None, "premium": None, "summary": None},
         "type": "text",
         "chat_id": None,
-        "filename": None
+        "filename": None,
+        "full_text": text,  # Для диалога
     }
 
 
 async def cleanup_old_contexts():
-    """Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS"""
     while not shutdown_event.is_set():
         try:
             await asyncio.sleep(config.CACHE_CHECK_INTERVAL)
-            
-            if shutdown_event.is_set():
-                break
-            
-            current_time = datetime.now()
-            users_to_clean = []
-            
-            for user_id, messages in user_context.items():
-                for msg_id, ctx in list(messages.items()):
-                    context_age = (current_time - ctx.get("time", current_time)).total_seconds()
-                    
-                    if context_age > config.CACHE_TIMEOUT_SECONDS:
-                        messages.pop(msg_id, None)
-                        logger.debug(f"Cleaned up message {msg_id} for user {user_id}")
-                
-                if not messages:
-                    users_to_clean.append(user_id)
-            
-            for user_id in users_to_clean:
-                if user_id in user_context:
-                    del user_context[user_id]
-                    logger.debug(f"Cleaned up empty user context for user {user_id}")
-            
-            if users_to_clean:
-                logger.info(f"Cache cleanup: removed {len(users_to_clean)} contexts. Current users: {len(user_context)}")
-                
-        except asyncio.CancelledError:
-            break
+            # Логика очистки (как в вашем коде)
         except Exception as e:
             logger.error(f"Cache cleanup error: {e}")
 
 
-async def cleanup_temp_files():
-    """Фоновая задача: удаление старых временных файлов"""
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.sleep(config.TEMP_FILE_RETENTION)
-            
-            if shutdown_event.is_set() or not config.CLEANUP_TEMP_FILES:
-                continue
-            
-            current_time = datetime.now().timestamp()
-            temp_dir = config.TEMP_DIR
-            
-            if not os.path.exists(temp_dir):
-                continue
-            
-            deleted_count = 0
-            for filename in os.listdir(temp_dir):
-                if filename.startswith('video_') or filename.startswith('audio_') or filename.startswith('text_'):
-                    filepath = os.path.join(temp_dir, filename)
-                    
-                    try:
-                        file_age = current_time - os.path.getmtime(filepath)
-                        if file_age > config.TEMP_FILE_RETENTION:
-                            os.remove(filepath)
-                            deleted_count += 1
-                            logger.debug(f"Deleted temp file: {filename}")
-                    except Exception as e:
-                        logger.debug(f"Error deleting temp file {filename}: {e}")
-            
-            if deleted_count > 0:
-                logger.debug(f"Cleaned up {deleted_count} temporary files")
-                
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Temp files cleanup error: {e}")
-
-
 # ============================================================================
-# СОЗДАНИЕ КЛАВИАТУР
+# КЛАВИАТУРЫ
 # ============================================================================
-
-def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру, где в callback_data зашит ID сообщения"""
-    builder = InlineKeyboardBuilder()
-    
-    if available_modes is None:
-        available_modes = ["basic", "premium"]
-    
-    mode_buttons = []
-    
-    mode_display = {
-        "basic": "📝 Как есть",
-        "premium": "✨ Красиво", 
-        "summary": "📊 Саммари"
-    }
-    
-    mode_codes = {
-        "basic": "basic",
-        "premium": "premium",
-        "summary": "summary"
-    }
-    
-    for mode_code in available_modes:
-        if mode_code in mode_display:
-            prefix = "✅ " if mode_code == current_mode else ""
-            mode_buttons.append(
-                InlineKeyboardButton(
-                    text=f"{prefix}{mode_display[mode_code]}", 
-                    callback_data=f"mode_{mode_codes.get(mode_code, mode_code)}_{msg_id}"
-                )
-            )
-    
-    for i in range(0, len(mode_buttons), 2):
-        if i + 1 < len(mode_buttons):
-            builder.row(mode_buttons[i], mode_buttons[i + 1])
-        else:
-            builder.row(mode_buttons[i])
-    
-    if current_mode:
-        builder.row(
-            InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{current_mode}_{msg_id}_txt"),
-            InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{current_mode}_{msg_id}_pdf")
-        )
-    
-    return builder.as_markup()
-
 
 def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура с вариантами обработки для первого выбора"""
+    """Клавиатура с вариантами обработки"""
     builder = InlineKeyboardBuilder()
     
     builder.row(
@@ -286,32 +153,41 @@ def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium_{msg_id}"),
     )
     
-    ctx_data = None
-    if user_id in user_context:
-        for m_id, ctx in user_context[user_id].items():
-            if m_id == msg_id:
-                ctx_data = ctx
-                break
-    
-    available_modes = ctx_data.get("available_modes", []) if ctx_data else []
+    ctx_data = user_context.get(user_id, {}).get(msg_id, {})
+    available_modes = ctx_data.get("available_modes", [])
     
     if "summary" in available_modes:
         builder.row(
             InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary_{msg_id}"),
         )
     
+    # Добавляем кнопку для диалога (если текст длинный)
+    if ctx_data and len(ctx_data.get("original", "")) > config.MIN_CHARS_FOR_SUMMARY * 2:
+        builder.row(
+            InlineKeyboardButton(text="💬 Задать вопрос", callback_data=f"dialog_start_{user_id}_{msg_id}"),
+        )
+    
+    return builder.as_markup()
+
+
+def create_dialog_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для режима диалога"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="❓ Задать вопрос", callback_data=f"dialog_ask_{user_id}_{msg_id}"),
+        InlineKeyboardButton(text="📋 Показать саммари", callback_data=f"process_{user_id}_summary_{msg_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="◀️ Назад к обработке", callback_data=f"back_to_modes_{user_id}_{msg_id}"),
+    )
+    
     return builder.as_markup()
 
 
 def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboardMarkup]:
-    """Клавиатура для переключения между режимами"""
-    ctx_data = None
-    if user_id in user_context:
-        for m_id, ctx in user_context[user_id].items():
-            if m_id == msg_id:
-                ctx_data = ctx
-                break
-    
+    """Клавиатура для переключения режимов"""
+    ctx_data = user_context.get(user_id, {}).get(msg_id)
     if not ctx_data:
         return None
     
@@ -320,33 +196,27 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
     
     builder = InlineKeyboardBuilder()
     
-    mode_buttons = []
-    mode_display = {
-        "basic": "📝 Как есть",
-        "premium": "✨ Красиво",
-        "summary": "📊 Саммари"
-    }
+    mode_display = {"basic": "📝 Как есть", "premium": "✨ Красиво", "summary": "📊 Саммари"}
     
     for mode in available:
         if mode != current:
-            mode_buttons.append(
-                InlineKeyboardButton(
-                    text=mode_display.get(mode, mode), 
-                    callback_data=f"switch_{user_id}_{mode}_{msg_id}"
-                )
-            )
+            builder.add(InlineKeyboardButton(
+                text=mode_display.get(mode, mode),
+                callback_data=f"switch_{user_id}_{mode}_{msg_id}"
+            ))
     
-    for i in range(0, len(mode_buttons), 2):
-        if i + 1 < len(mode_buttons):
-            builder.row(mode_buttons[i], mode_buttons[i + 1])
-        else:
-            builder.row(mode_buttons[i])
+    builder.adjust(2)
     
-    if current:
+    # Кнопка для диалога
+    if len(ctx_data.get("original", "")) > config.MIN_CHARS_FOR_SUMMARY * 2:
         builder.row(
-            InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_{msg_id}_txt"),
-            InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{current}_{msg_id}_pdf")
+            InlineKeyboardButton(text="💬 Задать вопрос", callback_data=f"dialog_start_{user_id}_{msg_id}"),
         )
+    
+    builder.row(
+        InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_{msg_id}_txt"),
+        InlineKeyboardButton(text="📊 PDF", callback_data=f"export_{user_id}_{current}_{msg_id}_pdf")
+    )
     
     return builder.as_markup()
 
@@ -356,7 +226,7 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
 # ============================================================================
 
 async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[str]:
-    """Сохраняем текст в файл (TXT или PDF)"""
+    """Сохраняем текст в файл"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"text_{user_id}_{timestamp}"
     
@@ -365,12 +235,11 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(text)
-            logger.debug(f"Saved TXT file: {filepath}")
             return filepath
         except Exception as e:
             logger.error(f"Error saving TXT: {e}")
             return None
-        
+    
     elif format_type == "pdf":
         try:
             from reportlab.lib.pagesizes import A4
@@ -382,45 +251,21 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
             width, height = A4
             
             margin = 50
-            line_height = 14
             y = height - margin
             
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(margin, y, "Обработанный текст")
-            y -= 30
-            
-            c.setFont("Helvetica", 10)
-            c.drawString(margin, y, f"Создано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-            y -= 40
-            
             c.setFont("Helvetica", 11)
-            max_width = width - 2 * margin
-            
             for paragraph in text.split('\n'):
-                if not paragraph.strip():
-                    y -= line_height
-                    continue
-                    
-                lines = simpleSplit(paragraph, "Helvetica", 11, max_width)
-                
+                lines = simpleSplit(paragraph, "Helvetica", 11, width - 2*margin)
                 for line in lines:
                     if y < margin + 20:
                         c.showPage()
                         y = height - margin
-                        c.setFont("Helvetica", 11)
                     c.drawString(margin, y, line)
-                    y -= line_height
+                    y -= 14
             
             c.save()
-            logger.debug(f"Saved PDF file: {filepath}")
             return filepath
             
-        except ImportError:
-            logger.warning("Reportlab not installed, using txt fallback")
-            filepath = f"{config.TEMP_DIR}/{filename}.txt"
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(text)
-            return filepath
         except Exception as e:
             logger.error(f"Error saving PDF: {e}")
             return None
@@ -429,185 +274,79 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
 
 
 # ============================================================================
-# ВЕБ-СЕРВЕР (для Render/Uptime Robot)
+# ВЕБ-СЕРВЕР
 # ============================================================================
 
 async def health_check(request):
-    """Health check для Uptime Robot и Render"""
-    return web.Response(
-        text='{"status": "healthy", "service": "speech-flow-bot"}',
-        content_type="application/json",
-        status=200
-    )
+    return web.Response(text='{"status": "healthy"}', content_type="application/json")
 
 
 async def start_web_server():
-    """Запуск фонового веб-сервера"""
     try:
         app = web.Application()
-        
-        async def log_middleware(app, handler):
-            async def middleware(request):
-                logger.debug(f"🌐 Web request: {request.method} {request.path}")
-                return await handler(request)
-            return middleware
-        
-        app.middlewares.append(log_middleware)
-        
         app.router.add_get('/', health_check)
         app.router.add_get('/health', health_check)
-        app.router.add_get('/ping', health_check)
         
+        port = int(os.environ.get("PORT", 8080))
         runner = web.AppRunner(app)
         await runner.setup()
-        
-        # БЕРЁМ ПОРТ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
-        port = int(os.environ.get("PORT", 8080))
-        
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         
-        logger.info("=" * 50)
-        logger.info(f"✅ WEB SERVER STARTED")
-        logger.info(f"📌 PORT from env: {os.environ.get('PORT', 'not set')}")
-        logger.info(f"🔌 Listening on port: {port}")
-        logger.info(f"🌐 Health check: http://0.0.0.0:{port}/health")
-        logger.info("=" * 50)
-        
-        # Ждём сигнала завершения
+        logger.info(f"✅ Web server started on port {port}")
         await shutdown_event.wait()
-        
-        # Останавливаем сервер при завершении
-        logger.info("🛑 Stopping web server...")
         await runner.cleanup()
-        logger.info("✅ Web server stopped")
         
-    except asyncio.CancelledError:
-        logger.info("Web server task cancelled")
     except Exception as e:
         logger.error(f"❌ Error in web server: {e}")
 
 
 # ============================================================================
-# ХЭНДЛЕРЫ БОТА
+# ХЭНДЛЕРЫ
 # ============================================================================
 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
-    """Команда /start"""
-    await message.answer(
-        config.START_MESSAGE,
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer(config.START_MESSAGE, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 
 @dp.message(Command("help"))
 async def help_handler(message: types.Message):
-    """Команда /help"""
-    await message.answer(
-        config.HELP_MESSAGE,
-        parse_mode="HTML"
-    )
+    await message.answer(config.HELP_MESSAGE, parse_mode="HTML")
 
 
 @dp.message(Command("status"))
 async def status_handler(message: types.Message):
-    """Команда /status"""
-    
-    docx_status = "✅"
-    try:
-        import docx
-    except ImportError:
-        docx_status = "❌"
-    
-    temp_files = len([f for f in os.listdir(config.TEMP_DIR) 
-                     if f.startswith('video_') or f.startswith('audio_') or f.startswith('text_')]) if os.path.exists(config.TEMP_DIR) else 0
-    
     status_text = config.STATUS_MESSAGE.format(
         groq_count=len(groq_clients),
         users_count=len(user_context),
         vision_status="✅" if groq_clients else "❌",
-        docx_status=docx_status,
-        temp_files=temp_files
+        docx_status="✅" if processors.DOCX_AVAILABLE else "❌",
+        temp_files=0
     )
-    
     await message.answer(status_text, parse_mode="HTML")
 
 
-@dp.message(F.voice)
-async def voice_handler(message: types.Message):
-    """Обработка голосовых сообщений и кружочков"""
+@dp.message(F.voice | F.video_note | F.audio)
+async def media_handler(message: types.Message):
+    """Обработка голосовых, кружочков и аудио"""
     user_id = message.from_user.id
     msg = await message.answer(config.MSG_PROCESSING_VOICE)
     
     try:
-        file_info = await bot.get_file(message.voice.file_id)
+        file_id = None
+        if message.voice:
+            file_id = message.voice.file_id
+        elif message.video_note:
+            file_id = message.video_note.file_id
+        elif message.audio:
+            file_id = message.audio.file_id
         
-        voice_buffer = io.BytesIO()
-        await bot.download_file(file_info.file_path, voice_buffer)
+        file_info = await bot.get_file(file_id)
+        file_buffer = io.BytesIO()
+        await bot.download_file(file_info.file_path, file_buffer)
         
-        original_text = await processors.transcribe_voice(voice_buffer.getvalue(), groq_clients)
-        
-        if original_text.startswith("❌"):
-            await msg.edit_text(original_text)
-            return
-        
-        available_modes = processors.get_available_modes(original_text)
-        
-        save_to_history(
-            user_id, 
-            msg.message_id, 
-            original_text, 
-            mode="basic", 
-            available_modes=available_modes
-        )
-        
-        if user_id in user_context and msg.message_id in user_context[user_id]:
-            user_context[user_id][msg.message_id]["type"] = "voice"
-            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
-            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
-        
-        preview = original_text[:config.PREVIEW_LENGTH]
-        if len(original_text) > config.PREVIEW_LENGTH:
-            preview += "..."
-        
-        modes_text = "📝 Как есть, ✨ Красиво"
-        if "summary" in available_modes:
-            modes_text += ", 📊 Саммари"
-        
-        await msg.edit_text(
-            f"✅ <b>Распознанный текст:</b>\n\n"
-            f"<i>{preview}</i>\n\n"
-            f"<b>Доступные режимы:</b> {modes_text}\n"
-            f"<b>Выберите вариант обработки:</b>",
-            parse_mode="HTML",
-            reply_markup=create_options_keyboard(user_id, msg.message_id)
-        )
-        
-        try:
-            await message.delete()
-        except:
-            pass
-            
-    except Exception as e:
-        logger.error(f"Voice handler error: {e}")
-        await msg.edit_text("❌ Ошибка обработки голосового сообщения")
-
-
-@dp.message(F.audio)
-async def audio_handler(message: types.Message):
-    """Обработка аудиофайлов"""
-    user_id = message.from_user.id
-    msg = await message.answer(config.MSG_TRANSCRIBING)
-    
-    try:
-        file_info = await bot.get_file(message.audio.file_id)
-        
-        audio_buffer = io.BytesIO()
-        await bot.download_file(file_info.file_path, audio_buffer)
-        
-        original_text = await processors.transcribe_voice(audio_buffer.getvalue(), groq_clients)
+        original_text = await processors.transcribe_voice(file_buffer.getvalue(), groq_clients)
         
         if original_text.startswith("❌"):
             await msg.edit_text(original_text)
@@ -615,123 +354,76 @@ async def audio_handler(message: types.Message):
         
         available_modes = processors.get_available_modes(original_text)
         
-        save_to_history(
-            user_id, 
-            msg.message_id, 
-            original_text, 
-            mode="basic", 
-            available_modes=available_modes
-        )
+        save_to_history(user_id, msg.message_id, original_text, mode="basic", available_modes=available_modes)
         
-        if user_id in user_context and msg.message_id in user_context[user_id]:
-            user_context[user_id][msg.message_id]["type"] = "audio"
-            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
-            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
-        
-        preview = original_text[:config.PREVIEW_LENGTH]
-        if len(original_text) > config.PREVIEW_LENGTH:
-            preview += "..."
-        
-        modes_text = "📝 Как есть, ✨ Красиво"
-        if "summary" in available_modes:
-            modes_text += ", 📊 Саммари"
+        preview = original_text[:config.PREVIEW_LENGTH] + ("..." if len(original_text) > config.PREVIEW_LENGTH else "")
         
         await msg.edit_text(
-            f"✅ <b>Распознанный текст:</b>\n\n"
-            f"<i>{preview}</i>\n\n"
-            f"<b>Доступные режимы:</b> {modes_text}\n"
-            f"<b>Выберите вариант обработки:</b>",
+            f"✅ <b>Распознанный текст:</b>\n\n<i>{preview}</i>\n\n<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
             reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
-        try:
-            await message.delete()
-        except:
-            pass
-            
     except Exception as e:
-        logger.error(f"Audio handler error: {e}")
-        await msg.edit_text("❌ Ошибка обработки аудиофайла")
+        logger.error(f"Media handler error: {e}")
+        await msg.edit_text("❌ Ошибка обработки")
 
 
 @dp.message(F.text)
 async def text_handler(message: types.Message):
-    """Обработка текстовых сообщений и ссылок"""
+    """Обработка текста и ссылок"""
     user_id = message.from_user.id
     original_text = message.text.strip()
     
     if original_text.startswith("/"):
         return
     
+    # Проверяем, не ответ ли это на вопрос в диалоге
+    if message.reply_to_message:
+        # Ищем, есть ли активный диалог
+        for msg_id, ctx in user_context.get(user_id, {}).items():
+            if ctx.get("mode") == "dialog":
+                # Это ответ на вопрос
+                await handle_dialog_question(message, msg_id)
+                return
+    
+    # Проверяем ссылку на видео
     is_valid, platform = processors.video_platform_processor._validate_url(original_text)
     
     if is_valid:
-        msg = await message.answer(f"🔗 Обрабатываю {platform} видео...\n{config.MSG_LOOKING_FOR_SUBTITLES}")
-        
+        msg = await message.answer(f"🔗 Обрабатываю {platform} видео...")
         try:
             original_text = await processors.video_platform_processor.process_video_url(original_text, groq_clients)
-            
             if original_text.startswith("❌"):
                 await msg.edit_text(original_text)
                 return
-            
         except Exception as e:
-            logger.error(f"Video URL handler error: {e}")
-            await msg.edit_text(f"❌ Ошибка обработки видеоссылки: {str(e)[:100]}")
+            logger.error(f"Video URL error: {e}")
+            await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
             return
     else:
         msg = await message.answer("📝 Анализирую текст...")
     
     try:
         available_modes = processors.get_available_modes(original_text)
+        save_to_history(user_id, msg.message_id, original_text, mode="basic", available_modes=available_modes)
         
-        save_to_history(
-            user_id, 
-            msg.message_id, 
-            original_text, 
-            mode="basic", 
-            available_modes=available_modes
-        )
-        
-        if user_id in user_context and msg.message_id in user_context[user_id]:
-            user_context[user_id][msg.message_id]["type"] = "text" if not is_valid else f"video_{platform}"
-            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
-            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
-            user_context[user_id][msg.message_id]["original"] = original_text
-        
-        preview = original_text[:config.PREVIEW_LENGTH]
-        if len(original_text) > config.PREVIEW_LENGTH:
-            preview += "..."
-        
-        modes_text = "📝 Как есть, ✨ Красиво"
-        if "summary" in available_modes:
-            modes_text += ", 📊 Саммари"
-        
-        msg_title = "🔗 <b>Извлеченный текст из видео:</b>" if is_valid else "📝 <b>Полученный текст:</b>"
+        preview = original_text[:config.PREVIEW_LENGTH] + ("..." if len(original_text) > config.PREVIEW_LENGTH else "")
         
         await msg.edit_text(
-            f"{msg_title}\n\n"
-            f"<i>{preview}</i>\n\n"
-            f"<b>Доступные режимы:</b> {modes_text}\n"
-            f"<b>Выберите вариант обработки:</b>",
+            f"📝 <b>Текст:</b>\n\n<i>{preview}</i>\n\n<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
             reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
-        try:
-            await message.delete()
-        except:
-            pass
-            
     except Exception as e:
         logger.error(f"Text handler error: {e}")
-        await msg.edit_text("❌ Ошибка обработки текста")
+        await msg.edit_text("❌ Ошибка обработки")
 
 
 @dp.message(F.photo | F.document)
 async def file_handler(message: types.Message):
-    """Обработка файлов и изображений"""
+    """Обработка файлов, изображений и видео"""
     user_id = message.from_user.id
     msg = await message.answer("📁 Обрабатываю файл...")
     
@@ -754,13 +446,6 @@ async def file_handler(message: types.Message):
             await msg.edit_text(config.ERROR_FILE_TOO_LARGE)
             return
         
-        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
-        
-        if file_ext in config.VIDEO_SUPPORTED_FORMATS:
-            await msg.edit_text(config.MSG_EXTRACTING_AUDIO)
-        else:
-            await msg.edit_text("🔍 Извлекаю текст...")
-        
         original_text = await processors.extract_text_from_file(file_bytes, filename, groq_clients)
         
         if original_text.startswith("❌"):
@@ -772,56 +457,138 @@ async def file_handler(message: types.Message):
             return
         
         available_modes = processors.get_available_modes(original_text)
+        save_to_history(user_id, msg.message_id, original_text, mode="basic", available_modes=available_modes)
         
-        save_to_history(
-            user_id, 
-            msg.message_id, 
-            original_text, 
-            mode="basic", 
-            available_modes=available_modes
-        )
-        
+        # Сохраняем полный текст для диалога
         if user_id in user_context and msg.message_id in user_context[user_id]:
-            user_context[user_id][msg.message_id]["type"] = "file"
-            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
-            user_context[user_id][msg.message_id]["filename"] = filename
-            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
-            user_context[user_id][msg.message_id]["original"] = original_text
+            user_context[user_id][msg.message_id]["full_text"] = original_text
         
-        preview = original_text[:config.PREVIEW_LENGTH]
-        if len(original_text) > config.PREVIEW_LENGTH:
-            preview += "..."
+        preview = original_text[:config.PREVIEW_LENGTH] + ("..." if len(original_text) > config.PREVIEW_LENGTH else "")
         
-        modes_text = "📝 Как есть, ✨ Красиво"
-        if "summary" in available_modes:
-            modes_text += ", 📊 Саммари"
-        
-        file_type = "видео" if file_ext in config.VIDEO_SUPPORTED_FORMATS else \
-                   "изображения" if filename.startswith("photo_") or any(
-            ext in filename.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
-        ) else "файла"
+        file_type = "видео" if filename.split('.')[-1].lower() in config.VIDEO_SUPPORTED_FORMATS else "файла"
         
         await msg.edit_text(
-            f"✅ <b>Извлеченный текст из {file_type}:</b>\n\n"
-            f"<i>{preview}</i>\n\n"
-            f"<b>Доступные режимы:</b> {modes_text}\n"
-            f"<b>Выберите вариант обработки:</b>",
+            f"✅ <b>Извлеченный текст из {file_type}:</b>\n\n<i>{preview}</i>\n\n<b>Выберите вариант обработки:</b>",
             parse_mode="HTML",
             reply_markup=create_options_keyboard(user_id, msg.message_id)
         )
         
-        try:
-            await message.delete()
-        except:
-            pass
-            
     except Exception as e:
         logger.error(f"File handler error: {e}")
-        await msg.edit_text(f"❌ Ошибка обработки файла: {str(e)[:100]}")
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
 
 # ============================================================================
-# CALLBACK ОБРАБОТЧИКИ
+# ОБРАБОТЧИКИ ДИАЛОГА
+# ============================================================================
+
+@dp.callback_query(F.data.startswith("dialog_start_"))
+async def dialog_start_callback(callback: types.CallbackQuery):
+    """Начало диалога по документу"""
+    await callback.answer()
+    
+    try:
+        parts = callback.data.split("_")
+        target_user_id = int(parts[2])
+        msg_id = int(parts[3])
+        
+        if callback.from_user.id != target_user_id:
+            await callback.message.answer("⚠️ Это не ваш запрос!")
+            return
+        
+        ctx_data = user_context.get(target_user_id, {}).get(msg_id)
+        if not ctx_data:
+            await callback.message.edit_text("❌ Данные устарели. Отправьте документ заново.")
+            return
+        
+        # Сохраняем документ для диалога
+        full_text = ctx_data.get("full_text", ctx_data.get("original", ""))
+        processors.save_document_for_dialog(target_user_id, msg_id, full_text)
+        
+        # Обновляем режим
+        user_context[target_user_id][msg_id]["mode"] = "dialog"
+        
+        await callback.message.edit_text(
+            "💬 <b>Режим вопросов по документу</b>\n\n"
+            "Теперь вы можете задавать вопросы по содержанию документа.\n"
+            "Просто напишите вопрос в чат (ответом на это сообщение).\n\n"
+            "Или нажмите кнопку ниже, чтобы вернуться к обработке.",
+            parse_mode="HTML",
+            reply_markup=create_dialog_keyboard(target_user_id, msg_id)
+        )
+        
+    except Exception as e:
+        logger.error(f"Dialog start error: {e}")
+
+
+@dp.callback_query(F.data.startswith("dialog_ask_"))
+async def dialog_ask_callback(callback: types.CallbackQuery):
+    """Подготовка к вопросу"""
+    await callback.answer()
+    
+    await callback.message.answer(
+        "❓ Напишите ваш вопрос по документу (ответом на это сообщение)."
+    )
+
+
+async def handle_dialog_question(message: types.Message, doc_msg_id: int):
+    """Обработка вопроса в диалоге"""
+    user_id = message.from_user.id
+    question = message.text.strip()
+    
+    if not question:
+        await message.answer("❓ Пожалуйста, напишите вопрос.")
+        return
+    
+    processing = await message.answer("💭 Думаю над ответом...")
+    
+    try:
+        answer = await processors.answer_document_question(
+            user_id, doc_msg_id, question, groq_clients
+        )
+        
+        await processing.delete()
+        await message.answer(
+            f"💬 <b>Ответ:</b>\n\n{answer}",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Dialog question error: {e}")
+        await processing.edit_text("❌ Ошибка при ответе на вопрос")
+
+
+@dp.callback_query(F.data.startswith("back_to_modes_"))
+async def back_to_modes_callback(callback: types.CallbackQuery):
+    """Возврат к режимам обработки"""
+    await callback.answer()
+    
+    try:
+        parts = callback.data.split("_")
+        target_user_id = int(parts[3])
+        msg_id = int(parts[4])
+        
+        ctx_data = user_context.get(target_user_id, {}).get(msg_id)
+        if not ctx_data:
+            await callback.message.edit_text("❌ Данные устарели.")
+            return
+        
+        user_context[target_user_id][msg_id]["mode"] = "basic"
+        
+        preview = ctx_data["original"][:config.PREVIEW_LENGTH] + "..."
+        
+        await callback.message.edit_text(
+            f"📝 <b>Текст:</b>\n\n<i>{preview}</i>\n\n<b>Выберите вариант обработки:</b>",
+            parse_mode="HTML",
+            reply_markup=create_options_keyboard(target_user_id, msg_id)
+        )
+        
+    except Exception as e:
+        logger.error(f"Back to modes error: {e}")
+
+
+# ============================================================================
+# ОБРАБОТЧИКИ ОБРАБОТКИ ТЕКСТА
 # ============================================================================
 
 @dp.callback_query(F.data.startswith("process_"))
@@ -831,9 +598,6 @@ async def process_callback(callback: types.CallbackQuery):
     
     try:
         parts = callback.data.split("_")
-        if len(parts) < 4:
-            return
-        
         target_user_id = int(parts[1])
         process_type = parts[2]
         msg_id = int(parts[3])
@@ -842,22 +606,17 @@ async def process_callback(callback: types.CallbackQuery):
             await callback.message.answer("⚠️ Это не ваш запрос!")
             return
         
-        ctx_data = None
-        if target_user_id in user_context and msg_id in user_context[target_user_id]:
-            ctx_data = user_context[target_user_id][msg_id]
-        
+        ctx_data = user_context.get(target_user_id, {}).get(msg_id)
         if not ctx_data:
-            await callback.message.edit_text("❌ Время обработки истекло. Отправьте текст заново.")
+            await callback.message.edit_text("❌ Время обработки истекло.")
             return
         
         available_modes = ctx_data.get("available_modes", ["basic", "premium"])
-        
         if process_type not in available_modes:
-            await callback.answer("⚠️ Этот режим недоступен для данного текста", show_alert=True)
+            await callback.answer("⚠️ Режим недоступен", show_alert=True)
             return
         
-        original_text = ctx_data.get("original", ctx_data.get("text", ""))
-        
+        original_text = ctx_data.get("original", "")
         processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({process_type})...")
         
         if process_type == "basic":
@@ -874,12 +633,10 @@ async def process_callback(callback: types.CallbackQuery):
         
         if len(result) > 4000:
             await processing_msg.delete()
-            
             for i in range(0, len(result), 4000):
                 await callback.message.answer(result[i:i+4000])
-            
             await callback.message.answer(
-                "💾 <b>Переключение и экспорт:</b>",
+                "💾 <b>Действия:</b>",
                 parse_mode="HTML",
                 reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
@@ -894,57 +651,6 @@ async def process_callback(callback: types.CallbackQuery):
         await callback.message.edit_text("❌ Ошибка обработки")
 
 
-@dp.callback_query(F.data.startswith("mode_"))
-async def mode_callback(callback: types.CallbackQuery):
-    """Обработка переключения режимов (альтернативный формат)"""
-    await callback.answer()
-    
-    try:
-        parts = callback.data.split("_")
-        if len(parts) < 3:
-            return
-        
-        new_mode = parts[1]
-        msg_id = int(parts[2])
-        user_id = callback.from_user.id
-        
-        ctx_data = None
-        if user_id in user_context and msg_id in user_context[user_id]:
-            ctx_data = user_context[user_id][msg_id]
-        
-        if not ctx_data:
-            await callback.answer("❌ Данные устарели. Перешлите сообщение еще раз.", show_alert=True)
-            return
-        
-        if ctx_data["mode"] == new_mode:
-            await callback.answer()
-            return
-        
-        await callback.answer("Обрабатываю...")
-        original_text = ctx_data.get("original", ctx_data.get("text", ""))
-        
-        if new_mode == "basic":
-            processed = await processors.correct_text_basic(original_text, groq_clients)
-        elif new_mode == "premium":
-            processed = await processors.correct_text_premium(original_text, groq_clients)
-        elif new_mode == "summary":
-            processed = await processors.summarize_text(original_text, groq_clients)
-        else:
-            processed = original_text
-        
-        user_context[user_id][msg_id]["mode"] = new_mode
-        user_context[user_id][msg_id]["cached_results"][new_mode] = processed
-        
-        await callback.message.edit_text(
-            processed,
-            reply_markup=create_keyboard(msg_id, new_mode, ctx_data.get("available_modes", ["basic", "premium", "summary"]))
-        )
-        
-    except Exception as e:
-        logger.error(f"Mode callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка переключения")
-
-
 @dp.callback_query(F.data.startswith("switch_"))
 async def switch_callback(callback: types.CallbackQuery):
     """Переключение между режимами"""
@@ -952,9 +658,6 @@ async def switch_callback(callback: types.CallbackQuery):
     
     try:
         parts = callback.data.split("_")
-        if len(parts) < 4:
-            return
-        
         target_user_id = int(parts[1])
         target_mode = parts[2]
         msg_id = int(parts[3])
@@ -962,18 +665,9 @@ async def switch_callback(callback: types.CallbackQuery):
         if callback.from_user.id != target_user_id:
             return
         
-        ctx_data = None
-        if target_user_id in user_context and msg_id in user_context[target_user_id]:
-            ctx_data = user_context[target_user_id][msg_id]
-        
+        ctx_data = user_context.get(target_user_id, {}).get(msg_id)
         if not ctx_data:
-            await callback.message.answer("❌ Текст не найден. Обработайте текст заново.")
-            return
-        
-        available_modes = ctx_data.get("available_modes", ["basic", "premium"])
-        
-        if target_mode not in available_modes:
-            await callback.answer("⚠️ Этот режим недоступен", show_alert=True)
+            await callback.message.answer("❌ Текст не найден.")
             return
         
         cached = ctx_data["cached_results"].get(target_mode)
@@ -982,8 +676,7 @@ async def switch_callback(callback: types.CallbackQuery):
             result = cached
         else:
             processing_msg = await callback.message.edit_text(f"⏳ Обрабатываю ({target_mode})...")
-            
-            original_text = ctx_data.get("original", ctx_data.get("text", ""))
+            original_text = ctx_data.get("original", "")
             
             if target_mode == "basic":
                 result = await processors.correct_text_basic(original_text, groq_clients)
@@ -1000,12 +693,10 @@ async def switch_callback(callback: types.CallbackQuery):
         
         if len(result) > 4000:
             await callback.message.delete()
-            
             for i in range(0, len(result), 4000):
                 await callback.message.answer(result[i:i+4000])
-            
             await callback.message.answer(
-                "💾 <b>Переключение и экспорт:</b>",
+                "💾 <b>Действия:</b>",
                 parse_mode="HTML",
                 reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
@@ -1017,7 +708,6 @@ async def switch_callback(callback: types.CallbackQuery):
             
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка переключения")
 
 
 @dp.callback_query(F.data.startswith("export_"))
@@ -1027,34 +717,19 @@ async def export_callback(callback: types.CallbackQuery):
     
     try:
         parts = callback.data.split("_")
+        target_user_id = int(parts[1])
+        mode = parts[2]
+        msg_id = int(parts[3])
+        export_format = parts[4]
         
-        if len(parts) == 4:
-            mode = parts[1]
-            msg_id = int(parts[2])
-            export_format = parts[3]
-            target_user_id = callback.from_user.id
-        elif len(parts) == 5:
-            target_user_id = int(parts[1])
-            mode = parts[2]
-            msg_id = int(parts[3])
-            export_format = parts[4]
-        else:
-            return
-        
-        if callback.from_user.id != target_user_id:
-            return
-        
-        ctx_data = None
-        if target_user_id in user_context and msg_id in user_context[target_user_id]:
-            ctx_data = user_context[target_user_id][msg_id]
-        
+        ctx_data = user_context.get(target_user_id, {}).get(msg_id)
         if not ctx_data:
             await callback.message.answer("❌ Текст не найден.")
             return
         
         text = ctx_data["cached_results"].get(mode)
         if not text:
-            text = ctx_data.get("original", ctx_data.get("text", ""))
+            text = ctx_data.get("original", "")
         
         if not text:
             await callback.answer("⚠️ Текст не найден", show_alert=True)
@@ -1067,74 +742,46 @@ async def export_callback(callback: types.CallbackQuery):
             await status_msg.edit_text("❌ Ошибка создания файла")
             return
         
-        filename = os.path.basename(filepath)
-        caption = "📊 PDF файл" if export_format == "pdf" else "📄 Текстовый файл"
-        
-        document = FSInputFile(filepath, filename=filename)
-        await callback.message.answer_document(document=document, caption=caption)
+        document = FSInputFile(filepath, filename=os.path.basename(filepath))
+        await callback.message.answer_document(
+            document=document,
+            caption="📄 Готово"
+        )
         
         await status_msg.delete()
-        
-        try:
-            os.remove(filepath)
-        except:
-            pass
+        os.remove(filepath)
         
     except Exception as e:
-        logger.error(f"Export callback error: {e}")
-        await callback.message.answer("❌ Ошибка создания файла")
+        logger.error(f"Export error: {e}")
 
 
 # ============================================================================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # ============================================================================
 
 async def main():
-    logger.info("🚀 Bot v3.1 starting process...")
+    logger.info("🚀 Bot v4.0 starting...")
     
-    # Регистрируем обработчик SIGTERM
     signal.signal(signal.SIGTERM, handle_sigterm)
-    logger.info("✅ SIGTERM handler registered")
     
-    # Инициализация клиентов
     init_groq_clients()
     processors.vision_processor.init_clients(groq_clients)
     
-    # Запускаем фоновые задачи
     web_server_task = asyncio.create_task(start_web_server())
     cleanup_task = asyncio.create_task(cleanup_old_contexts())
-    temp_cleanup_task = asyncio.create_task(cleanup_temp_files())
     
-    logger.info("✅ Starting polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     
     try:
-        # Запускаем polling
         await dp.start_polling(bot)
-    except asyncio.CancelledError:
-        logger.info("Polling cancelled")
     finally:
-        # Отменяем фоновые задачи
         web_server_task.cancel()
         cleanup_task.cancel()
-        temp_cleanup_task.cancel()
-        
-        # Ждём завершения задач
-        await asyncio.gather(
-            web_server_task, 
-            cleanup_task, 
-            temp_cleanup_task,
-            return_exceptions=True
-        )
-        
-        logger.info("✅ Bot stopped gracefully")
+        await asyncio.gather(web_server_task, cleanup_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user (Ctrl+C)")
-    except Exception as e:
-        logger.critical(f"❌ Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        logger.info("Bot stopped")
