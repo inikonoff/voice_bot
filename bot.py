@@ -1,26 +1,29 @@
 # bot.py
 """
-Production Bot v6.1
+Production Bot v6.2
 + Кнопка выхода из режима вопросов
 + Стриминг ответов
-+ Исправлены ошибки авторизации и обработки истории
++ Автоматический сброс вебхука при запуске
++ Middleware для обработки ошибок
 """
 
 import os
 import sys
 import logging
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Awaitable
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    TelegramObject,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
 
 import config
 import processors
@@ -55,7 +58,7 @@ if ":" not in BOT_TOKEN:
 logger.info(f"✅ Токен загружен: {BOT_TOKEN[:10]}...{BOT_TOKEN[-5:]}")
 logger.info(f"✅ Groq ключей: {len(GROQ_API_KEYS.split(',')) if GROQ_API_KEYS else 0}")
 
-# Инициализация бота и диспетчера
+# Инициализация бота и диспетчера (ИСПРАВЛЕНО!)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -66,6 +69,47 @@ dp = Dispatcher()
 user_context: Dict[int, Dict[int, Any]] = {}
 active_dialogs: Dict[int, int] = {}
 groq_clients = []
+
+
+# ==========================
+# MIDDLEWARE
+# ==========================
+
+class ErrorHandlingMiddleware(BaseMiddleware):
+    """
+    Middleware для обработки ошибок и автоматического восстановления
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        try:
+            return await handler(event, data)
+        except TelegramUnauthorizedError as e:
+            logger.error(f"❌ Ошибка авторизации в middleware: {e}")
+            # Пробуем сбросить вебхук при ошибке авторизации
+            try:
+                bot_instance = data.get('bot')
+                if bot_instance:
+                    await bot_instance.delete_webhook(drop_pending_updates=True)
+                    logger.info("✅ Вебхук сброшен после ошибки авторизации")
+            except Exception as reset_error:
+                logger.error(f"❌ Не удалось сбросить вебхук: {reset_error}")
+            raise
+        except TelegramNetworkError as e:
+            logger.error(f"❌ Сетевая ошибка в middleware: {e}")
+            # Здесь можно добавить логику повторных попыток
+            raise
+        except Exception as e:
+            logger.error(f"❌ Необработанная ошибка в middleware: {e}", exc_info=True)
+            raise
+
+
+# Регистрируем middleware
+dp.message.middleware(ErrorHandlingMiddleware())
+dp.callback_query.middleware(ErrorHandlingMiddleware())
 
 
 # ==========================
@@ -116,6 +160,93 @@ def create_dialog_keyboard(user_id: int):
 
 
 # ==========================
+# STARTUP & SHUTDOWN
+# ==========================
+
+async def on_startup(bot: Bot):
+    """Действия при запуске бота"""
+    logger.info("=" * 50)
+    logger.info("🚀 ЗАПУСК БОТА")
+    logger.info("=" * 50)
+    
+    # Шаг 1: Проверяем и сбрасываем вебхук
+    logger.info("📡 ШАГ 1: Проверка вебхука...")
+    try:
+        webhook_info = await bot.get_webhook_info()
+        logger.info(f"   Текущий вебхук: {webhook_info.url or 'не установлен'}")
+        logger.info(f"   Ожидающих обновлений: {webhook_info.pending_update_count}")
+        
+        if webhook_info.url:
+            logger.info("   🗑️ Удаление вебхука...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await asyncio.sleep(1)  # Даем время на удаление
+            
+            # Проверяем результат
+            webhook_info = await bot.get_webhook_info()
+            if not webhook_info.url:
+                logger.info("   ✅ Вебхук успешно удален")
+            else:
+                logger.warning("   ⚠️ Вебхук не удалился, пробуем еще раз...")
+                await bot.delete_webhook(drop_pending_updates=True)
+                await asyncio.sleep(2)
+        else:
+            logger.info("   ✅ Вебхук уже сброшен")
+            
+    except Exception as e:
+        logger.error(f"   ❌ Ошибка при сбросе вебхука: {e}")
+    
+    # Шаг 2: Проверяем подключение к Telegram
+    logger.info("🤖 ШАГ 2: Проверка подключения к Telegram...")
+    try:
+        me = await bot.get_me()
+        logger.info(f"   ✅ Бот @{me.username} (ID: {me.id}) успешно подключен")
+    except Exception as e:
+        logger.error(f"   ❌ Не удалось подключиться к Telegram: {e}")
+        raise
+    
+    # Шаг 3: Проверяем Groq клиенты
+    logger.info("🔧 ШАГ 3: Проверка Groq клиентов...")
+    if groq_clients:
+        logger.info(f"   ✅ Доступно Groq клиентов: {len(groq_clients)}")
+    else:
+        logger.warning("   ⚠️ Groq клиенты не доступны")
+    
+    logger.info("=" * 50)
+    logger.info("✅ БОТ ГОТОВ К РАБОТЕ")
+    logger.info("=" * 50)
+
+
+async def on_shutdown(bot: Bot):
+    """Действия при остановке бота"""
+    logger.info("=" * 50)
+    logger.info("👋 ОСТАНОВКА БОТА")
+    logger.info("=" * 50)
+    
+    # Шаг 1: Закрываем сессии
+    logger.info("📡 Закрытие сессий...")
+    try:
+        await bot.session.close()
+        logger.info("   ✅ Сессия бота закрыта")
+    except Exception as e:
+        logger.error(f"   ❌ Ошибка при закрытии сессии: {e}")
+    
+    # Шаг 2: Очищаем временные данные
+    logger.info("🧹 Очистка временных данных...")
+    try:
+        # Очищаем хранилища
+        user_context.clear()
+        active_dialogs.clear()
+        processors.document_dialogues.clear()
+        logger.info("   ✅ Хранилища очищены")
+    except Exception as e:
+        logger.error(f"   ❌ Ошибка при очистке: {e}")
+    
+    logger.info("=" * 50)
+    logger.info("✅ БОТ ОСТАНОВЛЕН")
+    logger.info("=" * 50)
+
+
+# ==========================
 # TEXT HANDLER
 # ==========================
 
@@ -162,6 +293,35 @@ async def text_handler(message: types.Message):
             ]
         )
     )
+
+
+# ==========================
+# COMMAND HANDLERS
+# ==========================
+
+@dp.message(F.text == "/start")
+async def start_command(message: types.Message):
+    """Обработка команды /start"""
+    await message.answer(config.START_MESSAGE, parse_mode="HTML")
+
+
+@dp.message(F.text == "/help")
+async def help_command(message: types.Message):
+    """Обработка команды /help"""
+    await message.answer(config.HELP_MESSAGE, parse_mode="HTML")
+
+
+@dp.message(F.text == "/status")
+async def status_command(message: types.Message):
+    """Обработка команды /status"""
+    status_text = config.STATUS_MESSAGE.format(
+        groq_count=len(groq_clients),
+        users_count=len(user_context),
+        vision_status="✅" if groq_clients else "❌",
+        docx_status="✅" if processors.DOCX_AVAILABLE else "❌",
+        temp_files=0
+    )
+    await message.answer(status_text, parse_mode="HTML")
 
 
 # ==========================
@@ -284,35 +444,6 @@ async def handle_streaming_answer(message, user_id, msg_id, question):
 
 
 # ==========================
-# COMMAND HANDLERS
-# ==========================
-
-@dp.message(F.text == "/start")
-async def start_command(message: types.Message):
-    """Обработка команды /start"""
-    await message.answer(config.START_MESSAGE, parse_mode="HTML")
-
-
-@dp.message(F.text == "/help")
-async def help_command(message: types.Message):
-    """Обработка команды /help"""
-    await message.answer(config.HELP_MESSAGE, parse_mode="HTML")
-
-
-@dp.message(F.text == "/status")
-async def status_command(message: types.Message):
-    """Обработка команды /status"""
-    status_text = config.STATUS_MESSAGE.format(
-        groq_count=len(groq_clients),
-        users_count=len(user_context),
-        vision_status="✅" if groq_clients else "❌",
-        docx_status="✅" if processors.DOCX_AVAILABLE else "❌",
-        temp_files=0
-    )
-    await message.answer(status_text, parse_mode="HTML")
-
-
-# ==========================
 # FILE HANDLERS
 # ==========================
 
@@ -406,32 +537,27 @@ async def file_handler(message: types.Message):
 
 async def main():
     """Главная функция запуска бота"""
-    logger.info("🚀 Запуск бота...")
     
     # Инициализация Groq клиентов
     init_groq_clients()
-    if not groq_clients:
-        logger.warning("⚠️ Бот работает без Groq клиентов! Некоторые функции будут недоступны.")
     
     # Инициализация Vision процессора
     processors.vision_processor.init_clients(groq_clients)
     
-    # Проверка и удаление вебхука
-    try:
-        webhook_info = await bot.get_webhook_info()
-        logger.info(f"Текущий вебхук: {webhook_info.url}")
-        
-        if webhook_info.url:
-            logger.info("Удаление вебхука...")
-            await bot.delete_webhook(drop_pending_updates=True)
-            await asyncio.sleep(1)
-            logger.info("✅ Вебхук удален")
-    except Exception as e:
-        logger.error(f"Ошибка при работе с вебхуком: {e}")
+    # Регистрируем обработчики запуска и остановки
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     
     # Запуск поллинга
-    logger.info("✅ Бот запущен и готов к работе")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"💥 Критическая ошибка в main: {e}", exc_info=True)
+    finally:
+        # Гарантированное закрытие сессии
+        await bot.session.close()
 
 
 if __name__ == "__main__":
