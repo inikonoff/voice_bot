@@ -796,6 +796,9 @@ async def stream_document_answer(
 
 Ответь строго по документу.
 """
+    if not groq_clients:
+    yield "Ошибка: нет доступных Groq клиентов"
+    return
 
     client = groq_clients[0]
 
