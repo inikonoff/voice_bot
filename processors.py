@@ -1,7 +1,7 @@
 # processors.py
 """
 Обработчики текста и видео: OCR, транскрибация, видео, коррекция, саммари, диалог
-Версия 4.2 - исправлены лимиты токенов, PDF и YouTube
+Версия 4.3 - исправлены ошибки стриминга, истории и обработки ключей
 """
 
 import io
@@ -14,7 +14,7 @@ import subprocess
 import mimetypes
 import re
 import time
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, AsyncGenerator
 from datetime import timedelta
 from openai import AsyncOpenAI
 
@@ -52,6 +52,63 @@ document_dialogues: Dict[int, Dict[int, Dict[str, Any]]] = {}
 
 
 # ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ GROQ
+# ============================================================================
+
+async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
+    """Делаем запрос с перебором ключей и улучшенной обработкой ошибок"""
+    
+    if not groq_clients:
+        error_msg = "Нет доступных Groq клиентов"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    errors = []
+    client_count = len(groq_clients)
+    
+    for attempt in range(client_count * config.GROQ_RETRY_COUNT):
+        client_index = attempt % client_count
+        client = groq_clients[client_index]
+        
+        try:
+            logger.debug(f"Попытка {attempt + 1} с клиентом {client_index}")
+            return await func(client, *args, **kwargs)
+        except Exception as e:
+            error_msg = str(e)
+            errors.append(f"Клиент {client_index}: {error_msg[:100]}")
+            logger.warning(f"Ошибка запроса (попытка {attempt + 1}): {error_msg[:100]}")
+            
+            # Если ошибка 429 (слишком много запросов) - ждем дольше
+            if "429" in error_msg or "rate_limit" in error_msg.lower():
+                wait_time = 5 + (attempt * 2)
+                logger.info(f"Rate limit, ждем {wait_time}с...")
+                await asyncio.sleep(wait_time)
+            else:
+                await asyncio.sleep(1 + (attempt % 3))
+    
+    error_text = f"Все клиенты недоступны: {'; '.join(errors[:3])}"
+    logger.error(error_text)
+    raise Exception(error_text)
+
+
+def _truncate_text_for_model(text: str, model_type: str) -> str:
+    """Обрезает текст в зависимости от лимитов модели"""
+    # Лимиты из документации Groq
+    model_limits = {
+        "basic": 5000,      # llama-3.1-8b-instant - 6K TPM, оставляем запас
+        "premium": 10000,    # llama-3.3-70b-versatile - 12K TPM
+        "reasoning": 25000,  # llama-4-scout - 30K TPM
+    }
+    
+    limit = model_limits.get(model_type, 5000)
+    
+    if len(text) > limit:
+        logger.warning(f"Текст обрезан с {len(text)} до {limit} символов для {model_type}")
+        return text[:limit] + "... [текст обрезан из-за лимитов API]"
+    return text
+
+
+# ============================================================================
 # VISION PROCESSOR (OCR)
 # ============================================================================
 
@@ -64,6 +121,7 @@ class VisionProcessor:
     
     def init_clients(self, groq_clients: list):
         self.groq_clients = groq_clients
+        logger.info(f"VisionProcessor инициализирован с {len(groq_clients)} клиентами")
     
     async def extract_text(self, image_bytes: bytes) -> str:
         if not self.groq_clients:
@@ -380,25 +438,8 @@ async def transcribe_voice(audio_bytes: bytes, groq_clients: list) -> str:
 
 
 # ============================================================================
-# TEXT PROCESSING - CORRECTION (с обрезкой для лимитов)
+# TEXT PROCESSING - CORRECTION
 # ============================================================================
-
-def _truncate_text_for_model(text: str, model_type: str) -> str:
-    """Обрезает текст в зависимости от лимитов модели"""
-    # Лимиты из документации Groq
-    model_limits = {
-        "basic": 5000,      # llama-3.1-8b-instant - 6K TPM, оставляем запас
-        "premium": 10000,    # llama-3.3-70b-versatile - 12K TPM
-        "reasoning": 25000,  # llama-4-scout - 30K TPM
-    }
-    
-    limit = model_limits.get(model_type, 5000)
-    
-    if len(text) > limit:
-        logger.warning(f"Text truncated from {len(text)} to {limit} chars for {model_type}")
-        return text[:limit] + "... [текст обрезан из-за лимитов API]"
-    return text
-
 
 async def correct_text_basic(text: str, groq_clients: list) -> str:
     """Базовая коррекция: llama-3.1-8b-instant"""
@@ -472,7 +513,7 @@ async def correct_text_premium(text: str, groq_clients: list) -> str:
 
 
 # ============================================================================
-# TEXT PROCESSING - SUMMARIZATION & DIALOG (с обрезкой)
+# TEXT PROCESSING - SUMMARIZATION & DIALOG
 # ============================================================================
 
 async def summarize_text(text: str, groq_clients: list) -> str:
@@ -524,7 +565,7 @@ def save_document_for_dialog(user_id: int, msg_id: int, full_text: str):
         "history": [],
         "timestamp": time.time()
     }
-    logger.info(f"Saved document for dialog: user={user_id}, msg={msg_id}")
+    logger.info(f"Сохранен документ для диалога: user={user_id}, msg={msg_id}")
 
 
 async def answer_document_question(
@@ -542,7 +583,7 @@ async def answer_document_question(
     full_text = doc_data["full_text"]
     history = doc_data.get("history", [])
     
-    # Обрезаем документ для запроса (Scout имеет 30K лимит, но оставим запас)
+    # Обрезаем документ для запроса
     if len(full_text) > 20000:
         doc_preview = full_text[:20000] + "... [документ обрезан для обработки]"
         logger.warning(f"Document truncated from {len(full_text)} to 20000 chars for dialog")
@@ -553,8 +594,11 @@ async def answer_document_question(
     if history:
         dialog_context = "Предыдущий диалог:\n"
         for turn in history[-config.MAX_DIALOG_HISTORY:]:
-            dialog_context += f"Пользователь: {turn['question']}\n"
-            dialog_context += f"Ассистент: {turn['answer']}\n\n"
+            # Поддержка обоих форматов истории
+            q = turn.get('question') or turn.get('q', '')
+            a = turn.get('answer') or turn.get('a', '')
+            dialog_context += f"Пользователь: {q}\n"
+            dialog_context += f"Ассистент: {a}\n\n"
     
     qa_prompt = f"""Ты - ассистент, который отвечает на вопросы по содержанию документа.
 
@@ -579,9 +623,12 @@ async def answer_document_question(
     try:
         answer_text = await _make_groq_request(groq_clients, answer)
         
+        # Сохраняем в едином формате
         history.append({
             "question": question,
             "answer": answer_text,
+            "q": question,  # Для обратной совместимости
+            "a": answer_text,
             "timestamp": time.time()
         })
         doc_data["history"] = history[-config.MAX_DIALOG_HISTORY:]
@@ -591,6 +638,94 @@ async def answer_document_question(
     except Exception as e:
         logger.error(f"QA error: {e}")
         return f"❌ Ошибка при ответе на вопрос: {str(e)[:100]}"
+
+
+async def stream_document_answer(
+    user_id: int,
+    msg_id: int,
+    question: str,
+    groq_clients: list
+) -> AsyncGenerator[str, None]:
+    """Стриминг ответа на вопрос по документу"""
+    
+    # Проверка наличия документа
+    if user_id not in document_dialogues:
+        yield "❌ Документ не найден."
+        return
+
+    if msg_id not in document_dialogues[user_id]:
+        yield "❌ Документ не найден."
+        return
+
+    # Проверка наличия Groq клиентов
+    if not groq_clients:
+        yield "❌ Ошибка: нет доступных Groq клиентов"
+        return
+
+    doc_data = document_dialogues[user_id][msg_id]
+    full_text = doc_data["full_text"]
+    history = doc_data.get("history", [])
+
+    # Формируем контекст из истории
+    context = ""
+    for turn in history[-5:]:
+        # Поддержка обоих форматов ключей
+        q = turn.get('question') or turn.get('q', '')
+        a = turn.get('answer') or turn.get('a', '')
+        context += f"Вопрос: {q}\nОтвет: {a}\n\n"
+
+    # Обрезаем документ
+    if len(full_text) > 20000:
+        doc_preview = full_text[:20000] + "... [документ обрезан]"
+    else:
+        doc_preview = full_text
+
+    prompt = f"""
+Документ:
+{doc_preview}
+
+{context}
+
+Вопрос:
+{question}
+
+Ответь строго по документу.
+"""
+
+    client = groq_clients[0]
+    
+    try:
+        stream = await client.chat.completions.create(
+            model=config.GROQ_MODELS["reasoning"],
+            messages=[
+                {"role": "system", "content": "Ты отвечаешь строго по документу."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+
+        full_answer = ""
+
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                piece = chunk.choices[0].delta.content
+                full_answer += piece
+                yield piece
+
+        # Сохраняем в историю в обоих форматах
+        history.append({
+            "question": question,
+            "answer": full_answer,
+            "q": question,
+            "a": full_answer,
+            "timestamp": time.time()
+        })
+        doc_data["history"] = history[-config.MAX_DIALOG_HISTORY:]
+        
+    except Exception as e:
+        logger.error(f"Ошибка в stream_document_answer: {e}", exc_info=True)
+        yield f"❌ Ошибка при генерации ответа: {str(e)[:100]}"
 
 
 # ============================================================================
@@ -726,6 +861,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
     mime_type, _ = mimetypes.guess_type(filename)
     file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
     
+    # Изображения
     if mime_type and mime_type.startswith('image/'):
         logger.info(f"Processing image: {filename}")
         vision_processor.init_clients(groq_clients)
@@ -736,22 +872,27 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
         vision_processor.init_clients(groq_clients)
         return await vision_processor.extract_text(file_bytes)
     
+    # Видео
     if file_ext in config.VIDEO_SUPPORTED_FORMATS:
         logger.info(f"Processing video file: {filename}")
         return await process_video_file(file_bytes, filename, groq_clients)
     
+    # PDF
     if mime_type == 'application/pdf' or file_ext == 'pdf':
         logger.info(f"Processing PDF: {filename}")
         return await extract_text_from_pdf(file_bytes)
     
+    # DOCX
     if mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or file_ext == 'docx':
         logger.info(f"Processing DOCX: {filename}")
         return await extract_text_from_docx(file_bytes)
     
+    # TXT
     if mime_type == 'text/plain' or file_ext == 'txt':
         logger.info(f"Processing TXT: {filename}")
         return await extract_text_from_txt(file_bytes)
     
+    # Старый DOC
     if file_ext == 'doc':
         return config.ERROR_DOC_NOT_SUPPORTED
     
@@ -761,89 +902,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
 
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==========================================================================
-
-async def stream_document_answer(
-    user_id: int,
-    msg_id: int,
-    question: str,
-    groq_clients: list
-):
-    if user_id not in document_dialogues:
-        yield "Документ не найден."
-        return
-
-    if msg_id not in document_dialogues[user_id]:
-        yield "Документ не найден."
-        return
-
-    doc_data = document_dialogues[user_id][msg_id]
-    full_text = doc_data["full_text"]
-    history = doc_data["history"]
-
-    context = ""
-    for turn in history[-5:]:
-        context += f"Вопрос: {turn['q']}\nОтвет: {turn['a']}\n\n"
-
-    prompt = f"""
-Документ:
-{full_text[:20000]}
-
-{context}
-
-Вопрос:
-{question}
-
-Ответь строго по документу.
-"""
-    if not groq_clients:
-    yield "Ошибка: нет доступных Groq клиентов"
-    return
-
-    client = groq_clients[0]
-
-    stream = await client.chat.completions.create(
-        model=config.GROQ_MODELS["reasoning"],
-        messages=[
-            {"role": "system", "content": "Ты отвечаешь строго по документу."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        stream=True,
-    )
-
-    full_answer = ""
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            piece = chunk.choices[0].delta.content
-            full_answer += piece
-            yield piece
-
-    history.append({"q": question, "a": full_answer})
-
-async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
-    """Делаем запрос с перебором ключей"""
-    
-    if not groq_clients:
-        raise Exception("No Groq clients available")
-    
-    errors = []
-    client_count = len(groq_clients)
-    
-    for attempt in range(client_count * config.GROQ_RETRY_COUNT):
-        client = groq_clients[attempt % client_count]
-        
-        try:
-            return await func(client, *args, **kwargs)
-        except Exception as e:
-            error_msg = str(e)
-            errors.append(error_msg)
-            logger.warning(f"Request error (attempt {attempt + 1}): {error_msg[:100]}")
-            await asyncio.sleep(1 + (attempt % 3))
-    
-    raise Exception(f"All clients failed: {'; '.join(errors[:3])}")
-
+# ============================================================================
 
 def get_available_modes(text: str) -> list:
     """Определяем доступные режимы обработки"""
@@ -873,5 +932,9 @@ __all__ = [
     'video_platform_processor',
     'save_document_for_dialog',
     'answer_document_question',
+    'stream_document_answer',
     'document_dialogues',
+    'PDFPLUMBER_AVAILABLE',
+    'DOCX_AVAILABLE',
+    'YT_DLP_AVAILABLE',
 ]
