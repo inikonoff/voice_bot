@@ -1,9 +1,9 @@
 # bot.py
 """
-Production Bot v6.3
-+ Кнопка выхода из режима вопросов
-+ Стриминг ответов
-+ Автоматический сброс вебхука при запуске
+Production Bot v6.4
++ Исправлена ошибка авторизации
++ Правильная обработка вебхука
++ Безопасное завершение
 + Middleware для обработки ошибок
 + Health check сервер для Render.com
 """
@@ -39,7 +39,7 @@ GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,  # Временно DEBUG для отладки
+    level=logging.INFO,  # Изменено на INFO для продакшена
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     stream=sys.stdout,
 )
@@ -91,18 +91,10 @@ class ErrorHandlingMiddleware(BaseMiddleware):
             return await handler(event, data)
         except TelegramUnauthorizedError as e:
             logger.error(f"❌ Ошибка авторизации в middleware: {e}")
-            # Пробуем сбросить вебхук при ошибке авторизации
-            try:
-                bot_instance = data.get('bot')
-                if bot_instance:
-                    await bot_instance.delete_webhook(drop_pending_updates=True)
-                    logger.info("✅ Вебхук сброшен после ошибки авторизации")
-            except Exception as reset_error:
-                logger.error(f"❌ Не удалось сбросить вебхук: {reset_error}")
+            # НЕ пробуем сбросить вебхук здесь - это может вызвать рекурсию
             raise
         except TelegramNetworkError as e:
             logger.error(f"❌ Сетевая ошибка в middleware: {e}")
-            # Здесь можно добавить логику повторных попыток
             raise
         except Exception as e:
             logger.error(f"❌ Необработанная ошибка в middleware: {e}", exc_info=True)
@@ -171,8 +163,21 @@ async def on_startup(bot: Bot):
     logger.info("🚀 ЗАПУСК БОТА")
     logger.info("=" * 50)
     
-    # Шаг 1: Проверяем и сбрасываем вебхук
-    logger.info("📡 ШАГ 1: Проверка вебхука...")
+    # Шаг 1: Проверяем подключение к Telegram
+    logger.info("🤖 ШАГ 1: Проверка подключения к Telegram...")
+    try:
+        me = await bot.get_me()
+        logger.info(f"   ✅ Бот @{me.username} (ID: {me.id}) успешно подключен")
+    except TelegramUnauthorizedError as e:
+        logger.error(f"   ❌ ОШИБКА АВТОРИЗАЦИИ: Проверьте BOT_TOKEN!")
+        logger.error(f"   Детали: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"   ❌ Не удалось подключиться к Telegram: {e}")
+        raise
+    
+    # Шаг 2: Проверяем и сбрасываем вебхук (только после успешной авторизации!)
+    logger.info("📡 ШАГ 2: Проверка вебхука...")
     try:
         webhook_info = await bot.get_webhook_info()
         logger.info(f"   Текущий вебхук: {webhook_info.url or 'не установлен'}")
@@ -181,7 +186,7 @@ async def on_startup(bot: Bot):
         if webhook_info.url:
             logger.info("   🗑️ Удаление вебхука...")
             await bot.delete_webhook(drop_pending_updates=True)
-            await asyncio.sleep(1)  # Даем время на удаление
+            await asyncio.sleep(1)
             
             # Проверяем результат
             webhook_info = await bot.get_webhook_info()
@@ -196,15 +201,6 @@ async def on_startup(bot: Bot):
             
     except Exception as e:
         logger.error(f"   ❌ Ошибка при сбросе вебхука: {e}")
-    
-    # Шаг 2: Проверяем подключение к Telegram
-    logger.info("🤖 ШАГ 2: Проверка подключения к Telegram...")
-    try:
-        me = await bot.get_me()
-        logger.info(f"   ✅ Бот @{me.username} (ID: {me.id}) успешно подключен")
-    except Exception as e:
-        logger.error(f"   ❌ Не удалось подключиться к Telegram: {e}")
-        raise
     
     # Шаг 3: Проверяем Groq клиенты
     logger.info("🔧 ШАГ 3: Проверка Groq клиентов...")
@@ -235,7 +231,6 @@ async def on_shutdown(bot: Bot):
     # Шаг 2: Очищаем временные данные
     logger.info("🧹 Очистка временных данных...")
     try:
-        # Очищаем хранилища
         user_context.clear()
         active_dialogs.clear()
         processors.document_dialogues.clear()
@@ -256,105 +251,52 @@ async def on_shutdown(bot: Bot):
 async def text_handler(message: types.Message):
     """Обработка текстовых сообщений"""
     user_id = message.from_user.id
-    text = message.text.strip()
     
-    logger.debug(f"Text message from user {user_id}: {text[:50]}...")
-
-    if text.startswith("/"):
-        return
-
-    # === ЕСЛИ АКТИВЕН ДИАЛОГ → ВОПРОС ===
-    if user_id in active_dialogs:
-        doc_msg_id = active_dialogs[user_id]
-        await handle_streaming_answer(message, user_id, doc_msg_id, text)
-        return
-
-    msg = await message.answer("📝 Анализирую текст...")
-
-    available_modes = processors.get_available_modes(text)
-
-    if user_id not in user_context:
-        user_context[user_id] = {}
-
-    user_context[user_id][msg.message_id] = {
-        "original": text,
-        "available_modes": available_modes,
-        "time": datetime.now(),
-    }
-
-    await msg.edit_text(
-        "Текст получен.\n\nНажмите 'Задать вопрос' для перехода в режим диалога.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="💬 Задать вопрос",
-                        callback_data=f"dialog_start_{user_id}_{msg.message_id}"
-                    )
-                ]
-            ]
+    # Проверяем, находится ли пользователь в режиме диалога
+    if user_id not in active_dialogs:
+        await message.answer(
+            "📤 Пожалуйста, загрузите документ.\n\n"
+            "Поддерживаемые форматы: PDF, TXT, изображения, видео, аудио"
         )
-    )
+        return
+    
+    # Получаем ID сообщения с документом
+    msg_id = active_dialogs[user_id]
+    question = message.text
+    
+    # Обработка стримингового ответа
+    await handle_streaming_answer(message, user_id, msg_id, question)
 
 
 # ==========================
-# COMMAND HANDLERS
-# ==========================
-
-@dp.message(F.text == "/start")
-async def start_command(message: types.Message):
-    """Обработка команды /start"""
-    await message.answer(config.START_MESSAGE, parse_mode="HTML")
-
-
-@dp.message(F.text == "/help")
-async def help_command(message: types.Message):
-    """Обработка команды /help"""
-    await message.answer(config.HELP_MESSAGE, parse_mode="HTML")
-
-
-@dp.message(F.text == "/status")
-async def status_command(message: types.Message):
-    """Обработка команды /status"""
-    status_text = config.STATUS_MESSAGE.format(
-        groq_count=len(groq_clients),
-        users_count=len(user_context),
-        vision_status="✅" if groq_clients else "❌",
-        docx_status="✅" if processors.DOCX_AVAILABLE else "❌",
-        temp_files=0
-    )
-    await message.answer(status_text, parse_mode="HTML")
-
-
-# ==========================
-# DIALOG START
+# CALLBACK HANDLERS
 # ==========================
 
 @dp.callback_query(F.data.startswith("dialog_start_"))
 async def dialog_start_callback(callback: types.CallbackQuery):
-    """Начало диалога по документу"""
+    """Начало диалога с документом"""
     await callback.answer()
-
+    
     parts = callback.data.split("_")
     user_id = int(parts[2])
     msg_id = int(parts[3])
-
+    
     if callback.from_user.id != user_id:
         return
-
+    
     # Проверяем наличие контекста
     if user_id not in user_context or msg_id not in user_context[user_id]:
         await callback.message.edit_text("❌ Документ не найден. Попробуйте заново.")
         return
-
+    
     processors.save_document_for_dialog(
         user_id,
         msg_id,
         user_context[user_id][msg_id]["original"]
     )
-
+    
     active_dialogs[user_id] = msg_id
-
+    
     await callback.message.edit_text(
         "💬 Режим вопросов активирован.\n\n"
         "Напишите ваш вопрос.",
@@ -370,13 +312,13 @@ async def dialog_start_callback(callback: types.CallbackQuery):
 async def dialog_exit_callback(callback: types.CallbackQuery):
     """Выход из режима диалога"""
     await callback.answer()
-
+    
     parts = callback.data.split("_")
     user_id = int(parts[2])
-
+    
     if user_id in active_dialogs:
         del active_dialogs[user_id]
-
+    
     await callback.message.edit_text("✅ Вы вышли из режима вопросов.")
 
 
@@ -551,20 +493,16 @@ async def main():
     dp.shutdown.register(on_shutdown)
     
     # === ЗАПУСК WEB-СЕРВЕРА ДЛЯ RENDER.COM ===
-    # Создаем простое aiohttp приложение
     app = web.Application()
     
-    # Обработчик для корневого пути (нужен Render для проверки)
     async def handle_health(request):
         return web.Response(text="Bot is running")
     
     app.router.add_get('/', handle_health)
-    app.router.add_get('/health', handle_health)  # На всякий случай
+    app.router.add_get('/health', handle_health)
     
-    # Получаем порт из переменной окружения Render (по умолчанию 10000)
     port = int(os.environ.get('PORT', 10000))
     
-    # Запускаем веб-сервер
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
@@ -583,9 +521,15 @@ async def main():
         logger.error(f"💥 Критическая ошибка в main: {e}", exc_info=True)
     finally:
         # Гарантированное закрытие сессии
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        except:
+            pass
         # Останавливаем веб-сервер
-        await runner.cleanup()
+        try:
+            await runner.cleanup()
+        except:
+            pass
 
 
 if __name__ == "__main__":
