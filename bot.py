@@ -1,10 +1,11 @@
 # bot.py
 """
-Production Bot v6.2
+Production Bot v6.3
 + Кнопка выхода из режима вопросов
 + Стриминг ответов
 + Автоматический сброс вебхука при запуске
 + Middleware для обработки ошибок
++ Health check сервер для Render.com
 """
 
 import os
@@ -15,6 +16,7 @@ from typing import Dict, Any, Callable, Awaitable
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.types import (
@@ -58,7 +60,7 @@ if ":" not in BOT_TOKEN:
 logger.info(f"✅ Токен загружен: {BOT_TOKEN[:10]}...{BOT_TOKEN[-5:]}")
 logger.info(f"✅ Groq ключей: {len(GROQ_API_KEYS.split(',')) if GROQ_API_KEYS else 0}")
 
-# Инициализация бота и диспетчера (ИСПРАВЛЕНО!)
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -548,8 +550,32 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
     
+    # === ЗАПУСК WEB-СЕРВЕРА ДЛЯ RENDER.COM ===
+    # Создаем простое aiohttp приложение
+    app = web.Application()
+    
+    # Обработчик для корневого пути (нужен Render для проверки)
+    async def handle_health(request):
+        return web.Response(text="Bot is running")
+    
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/health', handle_health)  # На всякий случай
+    
+    # Получаем порт из переменной окружения Render (по умолчанию 10000)
+    port = int(os.environ.get('PORT', 10000))
+    
+    # Запускаем веб-сервер
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    logger.info(f"📡 Health check server running on http://0.0.0.0:{port}")
+    # ===========================================
+    
     # Запуск поллинга
     try:
+        logger.info("🤖 Starting bot polling...")
         await dp.start_polling(bot)
     except KeyboardInterrupt:
         logger.info("👋 Бот остановлен пользователем")
@@ -558,6 +584,8 @@ async def main():
     finally:
         # Гарантированное закрытие сессии
         await bot.session.close()
+        # Останавливаем веб-сервер
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
