@@ -1,7 +1,7 @@
 # processors.py
 """
 Обработчики текста и видео: OCR, транскрибация, видео, коррекция, саммари, диалог
-Версия 4.3 - исправлены ошибки стриминга, истории и обработки ключей
+Версия 4.4 - исправлена совместимость с bot.py, улучшена обработка ключей
 """
 
 import io
@@ -555,17 +555,47 @@ async def summarize_text(text: str, groq_clients: list) -> str:
         return f"❌ Ошибка создания саммари: {str(e)[:100]}"
 
 
-def save_document_for_dialog(user_id: int, msg_id: int, full_text: str):
-    """Сохраняем документ для возможности диалога"""
+# ============================================================================
+# ДИАЛОГОВЫЙ РЕЖИМ - УЛУЧШЕННАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ РАЗНЫХ КЛЮЧЕЙ
+# ============================================================================
+
+def save_document_for_dialog(user_id: int, msg_id: int, document_text: str, source: str = "unknown"):
+    """
+    Сохраняем документ для возможности диалога
+    Поддерживает разные форматы ключей для совместимости
+    """
     if user_id not in document_dialogues:
         document_dialogues[user_id] = {}
     
+    # Сохраняем с несколькими ключами для максимальной совместимости
     document_dialogues[user_id][msg_id] = {
-        "full_text": full_text,
+        "full_text": document_text,        # Основной ключ для processors.py
+        "text": document_text,              # Для совместимости с bot.py
+        "original": document_text,          # Еще один вариант из bot.py
         "history": [],
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "source": source
     }
-    logger.info(f"Сохранен документ для диалога: user={user_id}, msg={msg_id}")
+    
+    logger.info(f"💾 Сохранен документ для диалога: user={user_id}, msg={msg_id}, длина={len(document_text)}")
+    return document_dialogues[user_id][msg_id]
+
+
+def get_document_text(user_id: int, msg_id: int) -> Optional[str]:
+    """
+    Получить текст документа из хранилища, пробуя разные ключи
+    """
+    if user_id not in document_dialogues or msg_id not in document_dialogues[user_id]:
+        return None
+    
+    doc_data = document_dialogues[user_id][msg_id]
+    
+    # Пробуем разные возможные ключи
+    for key in ["full_text", "text", "original"]:
+        if key in doc_data and doc_data[key]:
+            return doc_data[key]
+    
+    return None
 
 
 async def answer_document_question(
@@ -580,7 +610,12 @@ async def answer_document_question(
         return "❌ Документ не найден. Сначала загрузите документ и сделайте саммари."
     
     doc_data = document_dialogues[user_id][msg_id]
-    full_text = doc_data["full_text"]
+    
+    # Получаем текст документа через универсальную функцию
+    full_text = get_document_text(user_id, msg_id)
+    if not full_text:
+        return "❌ Не удалось извлечь текст документа."
+    
     history = doc_data.get("history", [])
     
     # Обрезаем документ для запроса
@@ -646,24 +681,36 @@ async def stream_document_answer(
     question: str,
     groq_clients: list
 ) -> AsyncGenerator[str, None]:
-    """Стриминг ответа на вопрос по документу"""
+    """
+    Стриминг ответа на вопрос по документу
+    Исправлена версия с поддержкой разных форматов хранения
+    """
     
-    # Проверка наличия документа
-    if user_id not in document_dialogues:
-        yield "❌ Документ не найден."
-        return
-
-    if msg_id not in document_dialogues[user_id]:
-        yield "❌ Документ не найден."
-        return
-
     # Проверка наличия Groq клиентов
     if not groq_clients:
         yield "❌ Ошибка: нет доступных Groq клиентов"
         return
 
+    # Проверка наличия документа
+    if user_id not in document_dialogues:
+        logger.error(f"User {user_id} not found in document_dialogues")
+        yield "❌ Документ не найден. Сначала загрузите документ."
+        return
+
+    if msg_id not in document_dialogues[user_id]:
+        logger.error(f"Msg {msg_id} not found for user {user_id}")
+        yield "❌ Документ не найден. Сначала загрузите документ."
+        return
+
     doc_data = document_dialogues[user_id][msg_id]
-    full_text = doc_data["full_text"]
+    
+    # Получаем текст документа через универсальную функцию
+    full_text = get_document_text(user_id, msg_id)
+    if not full_text:
+        logger.error(f"No text found in doc_data for user {user_id}, msg {msg_id}")
+        yield "❌ Не удалось извлечь текст документа."
+        return
+    
     history = doc_data.get("history", [])
 
     # Формируем контекст из истории
@@ -672,7 +719,8 @@ async def stream_document_answer(
         # Поддержка обоих форматов ключей
         q = turn.get('question') or turn.get('q', '')
         a = turn.get('answer') or turn.get('a', '')
-        context += f"Вопрос: {q}\nОтвет: {a}\n\n"
+        if q and a:
+            context += f"Вопрос: {q}\nОтвет: {a}\n\n"
 
     # Обрезаем документ
     if len(full_text) > 20000:
@@ -680,7 +728,8 @@ async def stream_document_answer(
     else:
         doc_preview = full_text
 
-    prompt = f"""
+    prompt = f"""Ты - ассистент, который отвечает на вопросы по содержанию документа.
+
 Документ:
 {doc_preview}
 
@@ -689,12 +738,15 @@ async def stream_document_answer(
 Вопрос:
 {question}
 
-Ответь строго по документу.
-"""
+Ответь на вопрос, используя только информацию из документа. Если ответа нет в документе, так и скажи.
+Ответ должен быть подробным, но по существу."""
 
-    client = groq_clients[0]
+    # Получаем клиент для стриминга
+    client_index = 0
+    client = groq_clients[client_index % len(groq_clients)]
     
     try:
+        logger.info(f"Starting stream for user {user_id}, msg {msg_id}")
         stream = await client.chat.completions.create(
             model=config.GROQ_MODELS["reasoning"],
             messages=[
@@ -706,12 +758,16 @@ async def stream_document_answer(
         )
 
         full_answer = ""
+        chunk_count = 0
 
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 piece = chunk.choices[0].delta.content
                 full_answer += piece
+                chunk_count += 1
                 yield piece
+
+        logger.info(f"Stream completed: {chunk_count} chunks, {len(full_answer)} chars")
 
         # Сохраняем в историю в обоих форматах
         history.append({
@@ -790,7 +846,6 @@ async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                     text += f"\n--- Страница {page_num} ---\n"
                     text += page_text + "\n"
                 
-                # ИСПРАВЛЕНО: tables -> find_tables()
                 tables = page.find_tables()
                 if tables:
                     for table_idx, table in enumerate(tables, 1):
@@ -933,6 +988,7 @@ __all__ = [
     'save_document_for_dialog',
     'answer_document_question',
     'stream_document_answer',
+    'get_document_text',
     'document_dialogues',
     'PDFPLUMBER_AVAILABLE',
     'DOCX_AVAILABLE',
