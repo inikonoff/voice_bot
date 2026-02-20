@@ -912,6 +912,74 @@ async def voice_handler(message: types.Message):
         await msg.edit_text("❌ Ошибка обработки голосового сообщения")
 
 
+@dp.message(F.video_note)
+async def video_note_handler(message: types.Message):
+    """Обработка кружочков (video_note)"""
+    user_id = message.from_user.id
+
+    if user_id in active_dialogs:
+        await message.answer("⏳ Голосовые вопросы пока не поддерживаются. Напишите текст.")
+        return
+
+    msg = await message.answer("🎥 Обрабатываю кружочек...")
+
+    try:
+        file_info = await bot.get_file(message.video_note.file_id)
+
+        buffer = io.BytesIO()
+        await bot.download_file(file_info.file_path, buffer)
+
+        # Кружочки приходят как mp4 — транскрибируем как видеофайл
+        original_text = await processors.process_video_file(
+            buffer.getvalue(), "video_note.mp4", groq_clients, with_timecodes=False
+        )
+
+        if original_text.startswith("❌"):
+            await msg.edit_text(original_text)
+            return
+
+        available_modes = processors.get_available_modes(original_text)
+
+        save_to_history(
+            user_id,
+            msg.message_id,
+            original_text,
+            mode="basic",
+            available_modes=available_modes
+        )
+
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "video_note"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["cached_results"] = {"basic": None, "premium": None, "summary": None}
+
+        preview = original_text[:config.PREVIEW_LENGTH]
+        if len(original_text) > config.PREVIEW_LENGTH:
+            preview += "..."
+
+        modes_text = "📝 Как есть, ✨ Красиво"
+        if "summary" in available_modes:
+            modes_text += ", 📊 Саммари"
+
+        await msg.edit_text(
+            f"✅ <b>Распознанный текст из кружочка:</b>\n\n"
+            f"<i>{preview}</i>\n\n"
+            f"<b>Доступные режимы:</b> {modes_text}\n"
+            f"<b>Выберите вариант обработки:</b>",
+            parse_mode="HTML",
+            reply_markup=create_options_keyboard(user_id, msg.message_id)
+        )
+
+        try:
+            await message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"Video note handler error: {e}")
+        await msg.edit_text("❌ Ошибка обработки кружочка")
+
+
 @dp.message(F.audio)
 async def audio_handler(message: types.Message):
     """Обработка аудиофайлов"""
@@ -1002,7 +1070,7 @@ async def text_handler(message: types.Message):
         msg = await message.answer(f"🔗 Обрабатываю {platform} видео...\n{config.MSG_LOOKING_FOR_SUBTITLES}")
         
         try:
-            original_text = await processors.video_platform_processor.process_video_url(original_text, groq_clients)
+            original_text = await processors.video_platform_processor.process_video_url(original_text, groq_clients, with_timecodes=True)
             
             if original_text.startswith("❌"):
                 await msg.edit_text(original_text)
