@@ -335,7 +335,7 @@ class VideoPlatformProcessor:
                 },
                 
                 # Добавляем куки, если файл существует
-                'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
+                'cookiefile': 'youtube_cookies.txt' if os.path.exists('youtube_cookies.txt') else None,
                 
                 'extractor_retries': 5,
                 'file_access_retries': 5,
