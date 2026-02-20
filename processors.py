@@ -272,8 +272,19 @@ class VideoPlatformProcessor:
         return None
     
     @staticmethod
-    async def extract_youtube_subtitles(video_id: str) -> Optional[str]:
-        """Извлечение субтитров из YouTube видео"""
+    def _format_timecode(seconds: float) -> str:
+        """Форматирует секунды в [ЧЧ:ММ:СС] или [ММ:СС]"""
+        seconds = int(seconds)
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h > 0:
+            return f"[{h:02d}:{m:02d}:{s:02d}]"
+        return f"[{m:02d}:{s:02d}]"
+
+    @staticmethod
+    async def extract_youtube_subtitles(video_id: str, with_timecodes: bool = True) -> Optional[str]:
+        """Извлечение субтитров из YouTube видео (с таймкодами по умолчанию)"""
         if not YT_TRANSCRIPT_API_AVAILABLE:
             return None
         
@@ -282,7 +293,18 @@ class VideoPlatformProcessor:
                 try:
                     api_lang = lang.replace('a.', '')
                     transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[api_lang])
-                    text = " ".join([item['text'] for item in transcript])
+                    
+                    if with_timecodes:
+                        lines = []
+                        for item in transcript:
+                            tc = VideoPlatformProcessor._format_timecode(item['start'])
+                            text = item['text'].replace('\n', ' ').strip()
+                            if text:
+                                lines.append(f"{tc} {text}")
+                        text = "\n".join(lines)
+                    else:
+                        text = " ".join([item['text'] for item in transcript])
+                    
                     logger.info(f"YouTube subtitles extracted ({lang}): {len(text)} chars")
                     return text
                 except Exception:
@@ -367,8 +389,11 @@ class VideoPlatformProcessor:
             return None
     
     @staticmethod
-    async def process_video_url(url: str, groq_clients: list) -> str:
-        """Обработка ссылки на видео"""
+    async def process_video_url(url: str, groq_clients: list, with_timecodes: bool = True) -> str:
+        """Обработка ссылки на видео.
+        
+        with_timecodes=True — текст будет содержать таймкоды вида [MM:SS] Текст...
+        """
         
         is_valid, platform = VideoPlatformProcessor._validate_url(url)
         if not is_valid:
@@ -380,9 +405,11 @@ class VideoPlatformProcessor:
             if platform == 'youtube' and config.YOUTUBE_PREFER_SUBTITLES:
                 video_id = VideoPlatformProcessor._extract_youtube_video_id(url)
                 if video_id:
-                    subtitles = await VideoPlatformProcessor.extract_youtube_subtitles(video_id)
+                    subtitles = await VideoPlatformProcessor.extract_youtube_subtitles(
+                        video_id, with_timecodes=with_timecodes
+                    )
                     if subtitles and len(subtitles.strip()) > config.MIN_TEXT_LENGTH:
-                        logger.info(f"Using YouTube subtitles")
+                        logger.info("Using YouTube subtitles")
                         return subtitles
             
             temp_audio_path = f"{config.TEMP_DIR}/audio_{int(time.time())}_{os.getpid()}"
@@ -395,7 +422,8 @@ class VideoPlatformProcessor:
             with open(audio_path, 'rb') as f:
                 audio_bytes = f.read()
             
-            text = await transcribe_voice(audio_bytes, groq_clients)
+            # Для YouTube и других платформ — с таймкодами через verbose_json
+            text = await transcribe_voice(audio_bytes, groq_clients, with_timecodes=with_timecodes)
             
             try:
                 os.remove(audio_path)
@@ -416,18 +444,58 @@ video_platform_processor = VideoPlatformProcessor()
 # AUDIO TRANSCRIPTION
 # ============================================================================
 
-async def transcribe_voice(audio_bytes: bytes, groq_clients: list) -> str:
-    """Транскрибация голоса через Whisper"""
+def _format_timecode(seconds: float) -> str:
+    """Форматирует секунды в [ЧЧ:ММ:СС] или [ММ:СС]"""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"[{h:02d}:{m:02d}:{s:02d}]"
+    return f"[{m:02d}:{s:02d}]"
+
+
+def _segments_to_timecoded_text(segments: list) -> str:
+    """Преобразует сегменты Whisper в текст с таймкодами"""
+    lines = []
+    for seg in segments:
+        tc = _format_timecode(seg.get("start", 0))
+        text = seg.get("text", "").strip()
+        if text:
+            lines.append(f"{tc} {text}")
+    return "\n".join(lines)
+
+
+async def transcribe_voice(audio_bytes: bytes, groq_clients: list, with_timecodes: bool = False) -> str:
+    """Транскрибация голоса через Whisper.
+    
+    with_timecodes=True — возвращает текст с таймкодами вида [MM:SS] Текст...
+    """
     
     async def transcribe(client):
-        response = await client.audio.transcriptions.create(
-            model=config.GROQ_MODELS["transcription"],
-            file=("audio.ogg", audio_bytes, "audio/ogg"),
-            language=config.AUDIO_LANGUAGE,
-            response_format="text",
-            temperature=config.MODEL_TEMPERATURES["transcription"],
-        )
-        return response
+        if with_timecodes:
+            response = await client.audio.transcriptions.create(
+                model=config.GROQ_MODELS["transcription"],
+                file=("audio.ogg", audio_bytes, "audio/ogg"),
+                language=config.AUDIO_LANGUAGE,
+                response_format="verbose_json",
+                temperature=config.MODEL_TEMPERATURES["transcription"],
+            )
+            # verbose_json возвращает объект с полем segments
+            segments = getattr(response, "segments", None)
+            if segments:
+                return _segments_to_timecoded_text(segments)
+            # Fallback: если сегментов нет — просто текст
+            return getattr(response, "text", str(response))
+        else:
+            response = await client.audio.transcriptions.create(
+                model=config.GROQ_MODELS["transcription"],
+                file=("audio.ogg", audio_bytes, "audio/ogg"),
+                language=config.AUDIO_LANGUAGE,
+                response_format="text",
+                temperature=config.MODEL_TEMPERATURES["transcription"],
+            )
+            return response
     
     try:
         result = await _make_groq_request(groq_clients, transcribe)
@@ -788,8 +856,11 @@ async def stream_document_answer(
 # FILE PROCESSING
 # ============================================================================
 
-async def process_video_file(video_bytes: bytes, filename: str, groq_clients: list) -> str:
-    """Обработка локального видеофайла"""
+async def process_video_file(video_bytes: bytes, filename: str, groq_clients: list, with_timecodes: bool = False) -> str:
+    """Обработка локального видеофайла.
+    
+    with_timecodes=True — текст будет содержать таймкоды.
+    """
     
     try:
         file_ext = filename.split('.')[-1] if '.' in filename else 'mp4'
@@ -811,7 +882,7 @@ async def process_video_file(video_bytes: bytes, filename: str, groq_clients: li
         with open(temp_audio_path, 'rb') as f:
             audio_bytes = f.read()
         
-        text = await transcribe_voice(audio_bytes, groq_clients)
+        text = await transcribe_voice(audio_bytes, groq_clients, with_timecodes=with_timecodes)
         
         try:
             os.remove(temp_video_path)
