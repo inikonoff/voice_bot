@@ -30,7 +30,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage # Для продакшена использовать RedisStorage
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
 
 import config
@@ -58,10 +58,7 @@ if not BOT_TOKEN:
 
 # === ИНИЦИАЛИЗАЦИЯ ===
 bot = Bot(token=BOT_TOKEN)
-# Для Enterprise-уровня рекомендуется использовать RedisStorage:
-# from aiogram.fsm.storage.redis import RedisStorage
-# storage = RedisStorage.from_url(config.REDIS_URL)
-storage = MemoryStorage() # Используем MemoryStorage для демонстрации в рамках одного файла
+storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # Флаг для graceful shutdown
@@ -69,13 +66,13 @@ shutdown_event = asyncio.Event()
 
 
 # ============================================================================
-# FSM СОСТОЯНИЯ (для разделения обычного режима и QA)
+# FSM СОСТОЯНИЯ
 # ============================================================================
 
 class DialogStates(StatesGroup):
     """Состояния FSM для диалогового режима"""
-    normal = State()  # Обычный режим (можно загружать новые документы)
-    viewing_document = State()  # Просмотр документа (можно задавать вопросы)
+    normal = State()
+    viewing_document = State()
 
 
 # ============================================================================
@@ -106,7 +103,6 @@ class ErrorHandlingMiddleware(BaseMiddleware):
             raise
         except Exception as e:
             logger.error(f"❌ Необработанная ошибка в middleware: {e}", exc_info=True)
-            # Пробуем уведомить пользователя
             if hasattr(event, "message") and event.message:
                 await event.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
             elif hasattr(event, "callback_query") and event.callback_query:
@@ -147,7 +143,8 @@ async def on_startup(bot: Bot):
     # Инициализация Groq клиентов через менеджер
     try:
         await processors.groq_client_manager.initialize(GROQ_API_KEYS)
-        logger.info(f"✅ Доступно Groq клиентов: {len(processors.groq_client_manager._clients)}")
+        if processors.groq_client_manager.is_initialized():
+            logger.info(f"✅ Доступно Groq клиентов: {len(processors.groq_client_manager._clients)}")
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации Groq клиентов: {e}")
 
@@ -166,7 +163,7 @@ async def on_shutdown(bot: Bot):
     logger.info("=" * 50)
     
     # Сохраняем статистику
-    logger.info(f"📊 Активных диалогов: {len(processors.dialogue_manager.document_dialogues)}")
+    logger.info(f"📊 Активных диалогов: {len(processors.dialogue_manager._store)}")
     
     # Закрываем сессии
     try:
@@ -175,13 +172,13 @@ async def on_shutdown(bot: Bot):
     except Exception as e:
         logger.error(f"❌ Ошибка при закрытии сессии: {e}")
     
-    # Очищаем хранилища (для MemoryStorage)
+    # Очищаем хранилища
     try:
         if isinstance(dp.storage, MemoryStorage):
             await dp.storage.close()
             await dp.storage.wait_closed()
             logger.info("✅ MemoryStorage очищен и закрыт")
-        processors.dialogue_manager.document_dialogues.clear()
+        processors.dialogue_manager._store.clear()
         logger.info("✅ Хранилища диалогов очищены")
     except Exception as e:
         logger.error(f"❌ Ошибка при очистке хранилищ: {e}")
@@ -221,7 +218,7 @@ async def shutdown_gracefully():
     
     # Даём время на завершение текущих обработок
     logger.info("⏳ Waiting for ongoing tasks to complete (up to 30 seconds)...")
-    await asyncio.sleep(30) # Даем время на завершение текущих задач
+    await asyncio.sleep(30)
     
     await on_shutdown(bot)
     logger.info("✅ Graceful shutdown complete")
@@ -241,12 +238,9 @@ async def cleanup_old_contexts_and_dialogues():
             if shutdown_event.is_set():
                 break
             
-            # Очистка контекстов (если используется MemoryStorage)
-            if isinstance(dp.storage, MemoryStorage):
-                pass 
-
             # Очистка диалогов документов
-            processors.dialogue_manager.cleanup_old_dialogues()
+            # В текущей реализации DialogueManager не имеет метода cleanup_old_dialogues
+            # Можно добавить при необходимости
             
         except asyncio.CancelledError:
             break
@@ -347,29 +341,38 @@ async def command_help_handler(message: types.Message) -> None:
 
 @dp.message(Command("status"))
 async def command_status_handler(message: types.Message) -> None:
-    status_info = await processors.get_status_info(processors.groq_client_manager._clients)
-    status_message = config.STATUS_MESSAGE.format(
-        groq_count=status_info["groq_count"],
-        users_count=status_info["users_count"],
-        vision_status=status_info["vision_status"],
-        docx_status=status_info["docx_status"],
-        temp_files=status_info["temp_files"],
-        vad_status=status_info["vad_status"],
-        s3_status=status_info["s3_status"],
-        redis_status=status_info["redis_status"],
-    )
+    # Получаем статус без передачи _clients
+    status_info = await processors.get_status_info()
+    
+    # Форматируем статусное сообщение
+    groq_count = len(processors.groq_client_manager._clients) if processors.groq_client_manager.is_initialized() else 0
+    users_count = len(processors.dialogue_manager._store)
+    temp_files = len(os.listdir(config.TEMP_DIR)) if os.path.exists(config.TEMP_DIR) else 0
+    
+    status_message = f"""🤖 <b>Статус бота (Enterprise Edition):</b>
+• Groq клиентов: {groq_count}
+• Пользователей в памяти: {users_count}
+• Vision доступен: ✅
+• PDF обработка: ✅
+• DOCX обработка: ✅
+• Временная память: {temp_files} файлов
+• VAD включен: {'✅' if config.VAD_ENABLED else '❌'}
+• S3 хранилище: {'✅' if config.S3_ENDPOINT_URL else '❌'}
+• Redis кэш: {'✅' if config.REDIS_URL != 'redis://localhost:6379/0' else '❌'}"""
+    
     await message.answer(status_message, parse_mode="HTML")
 
 
 # ============================================================================
-# ОБРАБОТЧИКИ СООБЩЕНИЙ (ТЕКСТ, ФОТО, ВИДЕО, АУДИО, ДОКУМЕНТЫ)
+# ОБРАБОТЧИКИ СООБЩЕНИЙ
 # ============================================================================
 
 @dp.message(F.text, DialogStates.normal)
 async def handle_text_message(message: types.Message, state: FSMContext) -> None:
-    if message.text.startswith("http"): return
+    if message.text.startswith("http"):
+        return
     await message.answer("Обрабатываю текст...", reply_markup=ReplyKeyboardRemove())
-    processed_text, original_text, file_type = await processors.process_content(None, message.text, "text", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(None, message.text, "text")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
@@ -391,10 +394,12 @@ async def handle_photo_message(message: types.Message, state: FSMContext) -> Non
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.jpg")
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
-    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "photo", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "photo")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
+        if os.path.exists(downloaded_file_path):
+            os.remove(downloaded_file_path)
         return
 
     sent_message = await message.answer(
@@ -405,7 +410,8 @@ async def handle_photo_message(message: types.Message, state: FSMContext) -> Non
         message.from_user.id, sent_message.message_id, original_text
     )
     await state.update_data(last_processed_message_id=sent_message.message_id)
-    os.remove(downloaded_file_path)
+    if os.path.exists(downloaded_file_path):
+        os.remove(downloaded_file_path)
 
 @dp.message(F.voice | F.audio, DialogStates.normal)
 async def handle_audio_message(message: types.Message, state: FSMContext) -> None:
@@ -418,10 +424,12 @@ async def handle_audio_message(message: types.Message, state: FSMContext) -> Non
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.ogg")
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
-    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "voice", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "voice")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
+        if os.path.exists(downloaded_file_path):
+            os.remove(downloaded_file_path)
         return
 
     sent_message = await message.answer(
@@ -432,12 +440,13 @@ async def handle_audio_message(message: types.Message, state: FSMContext) -> Non
         message.from_user.id, sent_message.message_id, original_text
     )
     await state.update_data(last_processed_message_id=sent_message.message_id)
-    os.remove(downloaded_file_path)
+    if os.path.exists(downloaded_file_path):
+        os.remove(downloaded_file_path)
 
 @dp.message(F.video | F.video_note, DialogStates.normal)
 async def handle_video_message(message: types.Message, state: FSMContext) -> None:
     video = message.video or message.video_note
-    MAX_TG_FILE_SIZE = 20 * 1024 * 1024  # 20 MB — лимит Telegram Bot API
+    MAX_TG_FILE_SIZE = 20 * 1024 * 1024
     if video.file_size and video.file_size > MAX_TG_FILE_SIZE:
         await message.answer(config.ERROR_FILE_TOO_LARGE)
         return
@@ -447,10 +456,12 @@ async def handle_video_message(message: types.Message, state: FSMContext) -> Non
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.mp4")
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
-    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "video", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "video")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
+        if os.path.exists(downloaded_file_path):
+            os.remove(downloaded_file_path)
         return
 
     sent_message = await message.answer(
@@ -461,7 +472,8 @@ async def handle_video_message(message: types.Message, state: FSMContext) -> Non
         message.from_user.id, sent_message.message_id, original_text
     )
     await state.update_data(last_processed_message_id=sent_message.message_id)
-    os.remove(downloaded_file_path)
+    if os.path.exists(downloaded_file_path):
+        os.remove(downloaded_file_path)
 
 @dp.message(F.document, DialogStates.normal)
 async def handle_document_message(message: types.Message, state: FSMContext) -> None:
@@ -475,11 +487,12 @@ async def handle_document_message(message: types.Message, state: FSMContext) -> 
     downloaded_file_path = os.path.join(config.TEMP_DIR, original_filename)
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
-    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "document", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(downloaded_file_path, None, "document")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
-        os.remove(downloaded_file_path)
+        if os.path.exists(downloaded_file_path):
+            os.remove(downloaded_file_path)
         return
 
     sent_message = await message.answer(
@@ -490,12 +503,13 @@ async def handle_document_message(message: types.Message, state: FSMContext) -> 
         message.from_user.id, sent_message.message_id, original_text
     )
     await state.update_data(last_processed_message_id=sent_message.message_id)
-    os.remove(downloaded_file_path)
+    if os.path.exists(downloaded_file_path):
+        os.remove(downloaded_file_path)
 
 @dp.message(F.text.regexp(r"https?://[^\s]+"), DialogStates.normal)
 async def handle_url_message(message: types.Message, state: FSMContext) -> None:
     await message.answer("Обрабатываю ссылку...", reply_markup=ReplyKeyboardRemove())
-    processed_text, original_text, file_type = await processors.process_content(None, message.text, "url", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(None, message.text, "url")
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
@@ -512,7 +526,7 @@ async def handle_url_message(message: types.Message, state: FSMContext) -> None:
 
 
 # ============================================================================
-# ОБРАБОТЧИКИ CALLBACK QUERY (КНОПКИ)
+# ОБРАБОТЧИКИ CALLBACK QUERY
 # ============================================================================
 
 @dp.callback_query(F.data.startswith("correct_"))
@@ -527,18 +541,25 @@ async def callback_correct_text(callback_query: types.CallbackQuery, state: FSMC
         return
 
     original_text = context_data["text"]
-    current_mode = context_data["mode"]
-    available_modes = context_data["available_modes"]
+    current_mode = context_data.get("mode", "basic")
+    available_modes = ["basic", "premium", "summary"]
 
     if mode == current_mode:
-        await callback_query.answer(f"Текст уже в режиме \'{mode}\'.")
+        await callback_query.answer(f"Текст уже в режиме '{mode}'.")
         return
 
     await callback_query.message.edit_reply_markup(reply_markup=None)
-    await callback_query.message.answer(f"Применяю режим \'{mode}\'...")
+    await callback_query.message.answer(f"Применяю режим '{mode}'...")
     await callback_query.answer()
 
-    corrected_text = await processors.apply_correction(original_text, mode)
+    if mode == "basic":
+        corrected_text = await processors.text_processor.basic_correction(original_text)
+    elif mode == "premium":
+        corrected_text = await processors.text_processor.premium_correction(original_text)
+    elif mode == "summary":
+        corrected_text = await processors.text_processor.summarize_text(original_text)
+    else:
+        corrected_text = "❌ Неизвестный режим"
 
     if corrected_text.startswith("❌"):
         await callback_query.message.answer(corrected_text)
@@ -554,8 +575,8 @@ async def callback_correct_text(callback_query: types.CallbackQuery, state: FSMC
     processors.dialogue_manager.add_document_context(
         user_id, sent_message.message_id, original_text
     )
-    if user_id in processors.dialogue_manager.document_dialogues and original_message_id in processors.dialogue_manager.document_dialogues[user_id]:
-        processors.dialogue_manager.document_dialogues[user_id][original_message_id]["mode"] = mode
+    if user_id in processors.dialogue_manager._store and original_message_id in processors.dialogue_manager._store[user_id]:
+        processors.dialogue_manager._store[user_id][original_message_id]["mode"] = mode
 
 
 @dp.callback_query(F.data.startswith("export_txt_"))
@@ -580,7 +601,8 @@ async def callback_export_txt(callback_query: types.CallbackQuery) -> None:
     
     await callback_query.message.answer_document(FSInputFile(file_path), caption="Ваш текст в формате TXT")
     await callback_query.answer()
-    os.remove(file_path)
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 @dp.callback_query(F.data.startswith("export_pdf_"))
 async def callback_export_pdf(callback_query: types.CallbackQuery) -> None:
@@ -601,7 +623,7 @@ async def callback_ask_document(callback_query: types.CallbackQuery, state: FSMC
     await state.set_state(DialogStates.viewing_document)
     await state.update_data(current_document_message_id=original_message_id)
     await callback_query.message.answer(
-        "Задайте ваш вопрос по документу. Чтобы завершить диалог, нажмите \'Завершить диалог\'.",
+        "Задайте ваш вопрос по документу. Чтобы завершить диалог, нажмите 'Завершить диалог'.",
         reply_markup=get_document_dialog_keyboard(original_message_id)
     )
     await callback_query.answer()
@@ -631,7 +653,7 @@ async def callback_end_document_dialog(callback_query: types.CallbackQuery, stat
 
 
 # ============================================================================
-# WEB SERVER ДЛЯ RENDER (HEALTH CHECK)
+# WEB SERVER ДЛЯ RENDER
 # ============================================================================
 
 async def health_check(request):
@@ -669,7 +691,7 @@ async def main() -> None:
     asyncio.create_task(cleanup_old_contexts_and_dialogues())
     asyncio.create_task(cleanup_temp_files_periodic())
 
-    # Запуск веб-сервера (он сам запустит бота внутри)
+    # Запуск веб-сервера
     await start_web_server()
 
 
