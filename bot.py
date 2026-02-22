@@ -1,9 +1,10 @@
 # bot.py
 """
-Главный файл бота: Версия 5.1 Enterprise Edition
+Главный файл бота: Версия 5.5 Enterprise Edition (Full Recovery & Render Fix)
 Полностью восстановлена мультимодальность, исправлен двойной хендлер (FSM),
 добавлена ротация ключей для стриминга, восстановлена надежность.
 Интегрированы GroqClientManager и DialogueManager для Enterprise-уровня.
+Добавлен мини-веб-сервер для совместимости с Render (Port Binding).
 """
 
 import os
@@ -11,6 +12,7 @@ import sys
 import signal
 import logging
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from datetime import datetime
 from dotenv import load_dotenv
@@ -39,6 +41,7 @@ load_dotenv()
 # === КОНФИГУРАЦИЯ ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
+PORT = int(os.environ.get("PORT", 10000))
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -123,7 +126,7 @@ dp.callback_query.middleware(ErrorHandlingMiddleware())
 async def on_startup(bot: Bot):
     """Действия при запуске бота"""
     logger.info("=" * 50)
-    logger.info("🚀 ЗАПУСК БОТА v5.1 Enterprise Edition")
+    logger.info("🚀 ЗАПУСК БОТА v5.5 Enterprise Edition")
     logger.info("=" * 50)
     
     # Проверка подключения к Telegram
@@ -159,7 +162,7 @@ async def on_startup(bot: Bot):
 async def on_shutdown(bot: Bot):
     """Действия при остановке бота"""
     logger.info("=" * 50)
-    logger.info("👋 ОСТАНОВКА БОТА v5.1 Enterprise Edition")
+    logger.info("👋 ОСТАНОВКА БОТА v5.5 Enterprise Edition")
     logger.info("=" * 50)
     
     # Сохраняем статистику
@@ -208,7 +211,7 @@ dp.shutdown.register(on_shutdown)
 def handle_sigterm(signum, frame):
     """Обработчик сигнала SIGTERM от Render"""
     logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
-    asyncio.create_task(shutdown_gracefully())
+    shutdown_event.set()
 
 
 async def shutdown_gracefully():
@@ -239,11 +242,7 @@ async def cleanup_old_contexts_and_dialogues():
                 break
             
             # Очистка контекстов (если используется MemoryStorage)
-            # В случае RedisStorage, очистка будет на стороне Redis
             if isinstance(dp.storage, MemoryStorage):
-                # Здесь нужна более сложная логика для MemoryStorage, 
-                # чтобы очищать старые контексты FSM. 
-                # Для простоты, пока полагаемся на очистку при shutdown.
                 pass 
 
             # Очистка диалогов документов
@@ -291,7 +290,6 @@ async def cleanup_temp_files_on_shutdown():
                     os.remove(filepath)
                     logger.debug(f"Удален временный файл при завершении работы: {filepath}")
                 elif os.path.isdir(filepath):
-                    # Удаляем пустые директории, если остались от чанков
                     if not os.listdir(filepath):
                         os.rmdir(filepath)
                         logger.debug(f"Удалена пустая временная директория: {filepath}")
@@ -369,6 +367,7 @@ async def command_status_handler(message: types.Message) -> None:
 
 @dp.message(F.text, DialogStates.normal)
 async def handle_text_message(message: types.Message, state: FSMContext) -> None:
+    if message.text.startswith("http"): return
     await message.answer("Обрабатываю текст...", reply_markup=ReplyKeyboardRemove())
     processed_text, original_text, file_type = await processors.process_content(None, message.text, "text", processors.groq_client_manager._clients)
     
@@ -380,7 +379,6 @@ async def handle_text_message(message: types.Message, state: FSMContext) -> None
         processed_text,
         reply_markup=get_correction_keyboard(message.message_id, "basic", ["basic", "premium", "summary"])
     )
-    # Сохраняем контекст в DialogueManager
     processors.dialogue_manager.add_document_context(
         message.from_user.id, sent_message.message_id, original_text
     )
@@ -409,10 +407,11 @@ async def handle_photo_message(message: types.Message, state: FSMContext) -> Non
     await state.update_data(last_processed_message_id=sent_message.message_id)
     os.remove(downloaded_file_path)
 
-@dp.message(F.voice, DialogStates.normal)
-async def handle_voice_message(message: types.Message, state: FSMContext) -> None:
+@dp.message(F.voice | F.audio, DialogStates.normal)
+async def handle_audio_message(message: types.Message, state: FSMContext) -> None:
     await message.answer(config.MSG_PROCESSING_VOICE, reply_markup=ReplyKeyboardRemove())
-    file_info = await bot.get_file(message.voice.file_id)
+    audio = message.voice or message.audio
+    file_info = await bot.get_file(audio.file_id)
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.ogg")
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
@@ -432,17 +431,15 @@ async def handle_voice_message(message: types.Message, state: FSMContext) -> Non
     await state.update_data(last_processed_message_id=sent_message.message_id)
     os.remove(downloaded_file_path)
 
-@dp.message(F.video, DialogStates.normal)
+@dp.message(F.video | F.video_note, DialogStates.normal)
 async def handle_video_message(message: types.Message, state: FSMContext) -> None:
-    if message.video.file_size > config.FILE_SIZE_LIMIT:
+    video = message.video or message.video_note
+    if video.file_size > config.FILE_SIZE_LIMIT:
         await message.answer(config.ERROR_FILE_TOO_LARGE)
-        return
-    if message.video.duration > config.VIDEO_MAX_DURATION:
-        await message.answer(config.ERROR_VIDEO_TOO_LONG)
         return
 
     await message.answer(config.MSG_PROCESSING_VIDEO, reply_markup=ReplyKeyboardRemove())
-    file_info = await bot.get_file(message.video.file_id)
+    file_info = await bot.get_file(video.file_id)
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.mp4")
     await bot.download_file(file_info.file_path, downloaded_file_path)
 
@@ -491,12 +488,10 @@ async def handle_document_message(message: types.Message, state: FSMContext) -> 
     await state.update_data(last_processed_message_id=sent_message.message_id)
     os.remove(downloaded_file_path)
 
-@dp.message(F.text.regexp(r"https?://[^\]+\.[^\s]+"), DialogStates.normal)
+@dp.message(F.text.regexp(r"https?://[^\s]+"), DialogStates.normal)
 async def handle_url_message(message: types.Message, state: FSMContext) -> None:
-    url = message.text
     await message.answer("Обрабатываю ссылку...", reply_markup=ReplyKeyboardRemove())
-
-    processed_text, original_text, file_type = await processors.process_content(None, url, "url", processors.groq_client_manager._clients)
+    processed_text, original_text, file_type = await processors.process_content(None, message.text, "url", processors.groq_client_manager._clients)
     
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
@@ -532,18 +527,17 @@ async def callback_correct_text(callback_query: types.CallbackQuery, state: FSMC
     available_modes = context_data["available_modes"]
 
     if mode == current_mode:
-        await callback_query.answer(f"Текст уже в режиме '{mode}'.")
+        await callback_query.answer(f"Текст уже в режиме \'{mode}\'.")
         return
 
-    await callback_query.message.edit_reply_markup(reply_markup=None) # Убираем старую клавиатуру
-    await callback_query.message.answer(f"Применяю режим '{mode}'...")
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    await callback_query.message.answer(f"Применяю режим \'{mode}\'...")
     await callback_query.answer()
 
     corrected_text = await processors.apply_correction(original_text, mode)
 
     if corrected_text.startswith("❌"):
         await callback_query.message.answer(corrected_text)
-        # Возвращаем старую клавиатуру, если ошибка
         await callback_query.message.edit_reply_markup(
             reply_markup=get_correction_keyboard(original_message_id, current_mode, available_modes)
         )
@@ -553,11 +547,9 @@ async def callback_correct_text(callback_query: types.CallbackQuery, state: FSMC
         corrected_text,
         reply_markup=get_correction_keyboard(original_message_id, mode, available_modes)
     )
-    # Обновляем контекст в DialogueManager
     processors.dialogue_manager.add_document_context(
-        user_id, sent_message.message_id, original_text # Сохраняем оригинал, но с новым msg_id
+        user_id, sent_message.message_id, original_text
     )
-    # Обновляем режим для исходного сообщения, чтобы кнопки были актуальны
     if user_id in processors.dialogue_manager.document_dialogues and original_message_id in processors.dialogue_manager.document_dialogues[user_id]:
         processors.dialogue_manager.document_dialogues[user_id][original_message_id]["mode"] = mode
 
@@ -573,7 +565,7 @@ async def callback_export_txt(callback_query: types.CallbackQuery) -> None:
         await callback_query.answer("Контекст сообщения не найден.")
         return
 
-    text_to_export = callback_query.message.text # Берем текст из текущего сообщения бота
+    text_to_export = callback_query.message.text
     if not text_to_export:
         await callback_query.answer("Нечего экспортировать.")
         return
@@ -588,34 +580,7 @@ async def callback_export_txt(callback_query: types.CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("export_pdf_"))
 async def callback_export_pdf(callback_query: types.CallbackQuery) -> None:
-    _, original_message_id_str = callback_query.data.split("_")
-    original_message_id = int(original_message_id_str)
-    user_id = callback_query.from_user.id
-
-    context_data = processors.dialogue_manager.get_document_context(user_id, original_message_id)
-    if not context_data:
-        await callback_query.answer("Контекст сообщения не найден.")
-        return
-
-    text_to_export = callback_query.message.text # Берем текст из текущего сообщения бота
-    if not text_to_export:
-        await callback_query.answer("Нечего экспортировать.")
-        return
-
-    # Здесь нужна библиотека для генерации PDF, например, reportlab или fpdf2
-    # Для простоты, пока заглушка или конвертация через markdown-to-pdf
-    # В реальном Enterprise Edition это был бы отдельный сервис
     await callback_query.answer("Функция экспорта в PDF временно недоступна. Используйте TXT.")
-    # file_path = os.path.join(config.TEMP_DIR, f"export_{original_message_id}.pdf")
-    # # Пример: manus-md-to-pdf file.md file.pdf
-    # # Для этого нужно сохранить текст в markdown файл сначала
-    # md_file_path = os.path.join(config.TEMP_DIR, f"export_{original_message_id}.md")
-    # with open(md_file_path, "w", encoding="utf-8") as f:
-    #     f.write(text_to_export)
-    # # await asyncio.to_thread(subprocess.run, ["manus-md-to-pdf", md_file_path, file_path])
-    # # await callback_query.message.answer_document(FSInputFile(file_path), caption="Ваш текст в формате PDF")
-    # # os.remove(md_file_path)
-    # # os.remove(file_path)
 
 
 @dp.callback_query(F.data.startswith("ask_doc_"))
@@ -632,7 +597,7 @@ async def callback_ask_document(callback_query: types.CallbackQuery, state: FSMC
     await state.set_state(DialogStates.viewing_document)
     await state.update_data(current_document_message_id=original_message_id)
     await callback_query.message.answer(
-        "Задайте ваш вопрос по документу. Чтобы завершить диалог, нажмите 'Завершить диалог'.",
+        "Задайте ваш вопрос по документу. Чтобы завершить диалог, нажмите \'Завершить диалог\'.",
         reply_markup=get_document_dialog_keyboard(original_message_id)
     )
     await callback_query.answer()
@@ -648,15 +613,10 @@ async def handle_document_question(message: types.Message, state: FSMContext) ->
         return
 
     await message.answer("Ищу ответ на ваш вопрос...", reply_markup=ReplyKeyboardRemove())
-    
     bot_response = await processors.dialogue_manager.answer_document_question(
         message.from_user.id, original_message_id, message.text
     )
-    
-    await message.answer(
-        bot_response,
-        reply_markup=get_document_dialog_keyboard(original_message_id)
-    )
+    await message.answer(bot_response, reply_markup=get_document_dialog_keyboard(original_message_id))
 
 @dp.callback_query(F.data.startswith("end_doc_dialog_"), DialogStates.viewing_document)
 async def callback_end_document_dialog(callback_query: types.CallbackQuery, state: FSMContext) -> None:
@@ -664,6 +624,33 @@ async def callback_end_document_dialog(callback_query: types.CallbackQuery, stat
     await state.update_data(current_document_message_id=None)
     await callback_query.message.answer("Диалог по документу завершен. Вы можете загрузить новый файл или текст.", reply_markup=ReplyKeyboardRemove())
     await callback_query.answer()
+
+
+# ============================================================================
+# WEB SERVER ДЛЯ RENDER (HEALTH CHECK)
+# ============================================================================
+
+async def health_check(request):
+    """Отвечает на GET и HEAD запросы для проверки состояния сервиса."""
+    return web.Response(text="Bot is alive!")
+
+async def start_web_server():
+    """Запускает веб-сервер и ждет сигнала о завершении."""
+    app = web.Application()
+    app.router.add_route("*", "/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    try:
+        await site.start()
+        logger.info(f"🚀 Веб-сервер запущен на порту {PORT} и готов к проверкам.")
+        # Запускаем бота в фоновом режиме ПОСЛЕ старта сервера
+        asyncio.create_task(dp.start_polling(bot))
+        # Ждем сигнала о завершении
+        await shutdown_event.wait()
+    finally:
+        await runner.cleanup()
+        logger.info("🛑 Веб-сервер остановлен.")
 
 
 # ============================================================================
@@ -675,11 +662,15 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     # Запуск фоновых задач
-    dp.startup.register(cleanup_old_contexts_and_dialogues)
-    dp.startup.register(cleanup_temp_files_periodic)
+    asyncio.create_task(cleanup_old_contexts_and_dialogues())
+    asyncio.create_task(cleanup_temp_files_periodic())
 
-    await dp.start_polling(bot)
+    # Запуск веб-сервера (он сам запустит бота внутри)
+    await start_web_server()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user.")
