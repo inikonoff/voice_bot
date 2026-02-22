@@ -152,7 +152,7 @@ async def correct_text_basic(text: str) -> str:
     """Базовая коррекция (только ошибки, с цензурой мата)"""
     
     if not text or not text.strip():
-        return config.ERROR_NO_TEXT
+        return "❌ Пустой текст"
     
     async def correct(client):
         response = await client.chat.completions.create(
@@ -176,7 +176,7 @@ async def correct_text_premium(text: str) -> str:
     """Премиум коррекция (литературная обработка)"""
     
     if not text or not text.strip():
-        return config.ERROR_NO_TEXT
+        return "❌ Пустой текст"
     
     async def correct(client):
         response = await client.chat.completions.create(
@@ -194,6 +194,92 @@ async def correct_text_premium(text: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка премиум коррекции: {e}")
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
+
+
+# ============================================================================
+# ДИАЛОГ С ДОКУМЕНТАМИ
+# ============================================================================
+
+class DialogueManager:
+    """Управление диалогами по документам"""
+    
+    def __init__(self):
+        self._store: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    
+    def add_document_context(self, user_id: int, message_id: int, text: str):
+        """Сохранить документ для диалога"""
+        if user_id not in self._store:
+            self._store[user_id] = {}
+        
+        self._store[user_id][message_id] = {
+            "text": text,
+            "history": [],
+            "last_accessed": time.time()
+        }
+    
+    def get_document_context(self, user_id: int, message_id: int) -> Optional[Dict]:
+        """Получить контекст документа"""
+        return self._store.get(user_id, {}).get(message_id)
+    
+    async def answer_document_question(self, user_id: int, message_id: int, question: str) -> str:
+        """Ответить на вопрос по документу"""
+        
+        context = self.get_document_context(user_id, message_id)
+        if not context:
+            return "❌ Документ не найден"
+        
+        doc_text = context["text"]
+        history = context["history"]
+        
+        # Формируем историю для промпта
+        history_text = ""
+        if history:
+            for item in history[-5:]:  # Последние 5 сообщений
+                history_text += f"Вопрос: {item['question']}\nОтвет: {item['answer']}\n\n"
+        
+        # Обрезаем документ если слишком длинный
+        if len(doc_text) > 15000:
+            doc_text = doc_text[:15000] + "... [документ обрезан]"
+        
+        prompt = config.DIALOG_PROMPT.format(
+            doc_text=doc_text,
+            history=history_text or "История пуста.",
+            question=question
+        )
+        
+        async def answer(client):
+            response = await client.chat.completions.create(
+                model=config.GROQ_MODELS["reasoning"],
+                messages=[
+                    {"role": "system", "content": "Ты отвечаешь строго по документу."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=config.MODEL_TEMPERATURES["reasoning"],
+            )
+            return response.choices[0].message.content.strip()
+        
+        try:
+            reply = await groq_client_manager.make_request(answer)
+            
+            # Сохраняем в историю
+            context["history"].append({
+                "question": question,
+                "answer": reply,
+                "timestamp": time.time()
+            })
+            
+            # Ограничиваем историю
+            if len(context["history"]) > 20:
+                context["history"] = context["history"][-20:]
+            
+            return reply
+            
+        except Exception as e:
+            logger.error(f"Ошибка диалога: {e}")
+            return f"❌ Ошибка при ответе: {str(e)[:100]}"
+
+
+dialogue_manager = DialogueManager()
 
 
 # ============================================================================
@@ -255,4 +341,9 @@ async def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     
     if ext == 'pdf':
         return await extract_text_from_pdf(file_bytes)
-    elif
+    elif ext == 'docx':
+        return await extract_text_from_docx(file_bytes)
+    elif ext == 'txt':
+        return await extract_text_from_txt(file_bytes)
+    else:
+        return "❌ Неподдерживаемый формат файла. Поддерживаются: PDF, DOCX, TXT"
