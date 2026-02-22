@@ -1,8 +1,26 @@
+# Основные библиотеки бота
 aiogram>=3.0.0
 python-dotenv
 aiohttp
 openai
+
+# Обработка документов и экспорт
 pdfplumber
-yt-dlp
-reportlab
 python-docx
+reportlab
+fpdf2
+
+# Работа с видео и YouTube
+yt-dlp
+youtube-transcript-api
+
+# Обработка аудио (VAD, сжатие, нарезка)
+pydub
+
+# Интеграция с Supabase (для будущих задач)
+supabase
+
+# Утилиты и производительность
+ujson
+uvloop; sys_platform != 'win32'
+certifi
