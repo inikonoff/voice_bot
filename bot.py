@@ -411,6 +411,9 @@ async def handle_photo_message(message: types.Message, state: FSMContext) -> Non
 async def handle_audio_message(message: types.Message, state: FSMContext) -> None:
     await message.answer(config.MSG_PROCESSING_VOICE, reply_markup=ReplyKeyboardRemove())
     audio = message.voice or message.audio
+    if audio.file_size and audio.file_size > 20 * 1024 * 1024:
+    await message.answer(config.ERROR_FILE_TOO_LARGE)
+    return
     file_info = await bot.get_file(audio.file_id)
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.ogg")
     await bot.download_file(file_info.file_path, downloaded_file_path)
@@ -434,7 +437,8 @@ async def handle_audio_message(message: types.Message, state: FSMContext) -> Non
 @dp.message(F.video | F.video_note, DialogStates.normal)
 async def handle_video_message(message: types.Message, state: FSMContext) -> None:
     video = message.video or message.video_note
-    if video.file_size > config.FILE_SIZE_LIMIT:
+    MAX_TG_FILE_SIZE = 20 * 1024 * 1024  # 20 MB — лимит Telegram Bot API
+    if video.file_size and video.file_size > MAX_TG_FILE_SIZE:
         await message.answer(config.ERROR_FILE_TOO_LARGE)
         return
 
