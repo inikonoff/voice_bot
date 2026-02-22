@@ -412,8 +412,8 @@ async def handle_audio_message(message: types.Message, state: FSMContext) -> Non
     await message.answer(config.MSG_PROCESSING_VOICE, reply_markup=ReplyKeyboardRemove())
     audio = message.voice or message.audio
     if audio.file_size and audio.file_size > 20 * 1024 * 1024:
-    await message.answer(config.ERROR_FILE_TOO_LARGE)
-    return
+        await message.answer(config.ERROR_FILE_TOO_LARGE)
+        return
     file_info = await bot.get_file(audio.file_id)
     downloaded_file_path = os.path.join(config.TEMP_DIR, f"{file_info.file_unique_id}.ogg")
     await bot.download_file(file_info.file_path, downloaded_file_path)
