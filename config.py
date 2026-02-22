@@ -342,3 +342,25 @@ GROQ_MODELS = {
     "premium": "llama-3.3-70b-versatile",                   # 12K TPM
     "reasoning": "meta-llama/llama-4-scout-17b-16e-instruct", # 30K TPM !!!
 }
+# ============================================================================
+# PRODUCTION HARDENING (v6)
+# ============================================================================
+
+# --- Параллелизм ---
+MAX_PARALLEL_REQUESTS = 20  # Глобальный лимит одновременных AI-запросов
+
+# --- Circuit Breaker ---
+MAX_FAILURES_BEFORE_DISABLE = 3  # Сколько подряд ошибок допускается
+CIRCUIT_BREAKER_TIMEOUT = 60     # Сколько секунд ключ отключен
+
+# --- Retry / Backoff ---
+MAX_BACKOFF_SECONDS = 15         # Максимальный backoff
+REQUEST_TIMEOUT = 90             # Таймаут одного AI-запроса
+
+# --- Token budgeting ---
+MODEL_TOKEN_LIMITS = {
+    "basic": 8000,
+    "premium": 16000,
+    "reasoning": 30000,  # llama-4-scout ≈ 32k контекст
+    "vision": 16000,
+}
