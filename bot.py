@@ -342,9 +342,6 @@ async def command_help_handler(message: types.Message) -> None:
 @dp.message(Command("status"))
 async def command_status_handler(message: types.Message) -> None:
     # Получаем статус без передачи _clients
-    status_info = await processors.get_status_info()
-    
-    # Форматируем статусное сообщение
     groq_count = len(processors.groq_client_manager._clients) if processors.groq_client_manager.is_initialized() else 0
     users_count = len(processors.dialogue_manager._store)
     temp_files = len(os.listdir(config.TEMP_DIR)) if os.path.exists(config.TEMP_DIR) else 0
@@ -378,6 +375,10 @@ async def handle_text_message(message: types.Message, state: FSMContext) -> None
         await message.answer(processed_text)
         return
 
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Получен пустой текст после обработки."
+
     sent_message = await message.answer(
         processed_text,
         reply_markup=get_correction_keyboard(message.message_id, "basic", ["basic", "premium", "summary"])
@@ -401,6 +402,10 @@ async def handle_photo_message(message: types.Message, state: FSMContext) -> Non
         if os.path.exists(downloaded_file_path):
             os.remove(downloaded_file_path)
         return
+
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Не удалось распознать текст на изображении. Возможно, изображение не содержит текста или текст нечитаем."
 
     sent_message = await message.answer(
         processed_text,
@@ -431,6 +436,10 @@ async def handle_audio_message(message: types.Message, state: FSMContext) -> Non
         if os.path.exists(downloaded_file_path):
             os.remove(downloaded_file_path)
         return
+
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Не удалось распознать речь в аудио. Возможно, в записи нет речи или качество слишком низкое."
 
     sent_message = await message.answer(
         processed_text,
@@ -464,6 +473,10 @@ async def handle_video_message(message: types.Message, state: FSMContext) -> Non
             os.remove(downloaded_file_path)
         return
 
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Не удалось распознать текст из видео. Возможно, в видео нет звука или звук низкого качества."
+
     sent_message = await message.answer(
         processed_text,
         reply_markup=get_correction_keyboard(message.message_id, "basic", ["basic", "premium", "summary"])
@@ -495,6 +508,10 @@ async def handle_document_message(message: types.Message, state: FSMContext) -> 
             os.remove(downloaded_file_path)
         return
 
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Не удалось извлечь текст из документа. Возможно, файл содержит только изображения или защищен."
+
     sent_message = await message.answer(
         processed_text,
         reply_markup=get_correction_keyboard(message.message_id, "basic", ["basic", "premium", "summary"])
@@ -514,6 +531,10 @@ async def handle_url_message(message: types.Message, state: FSMContext) -> None:
     if processed_text.startswith("❌"):
         await message.answer(processed_text)
         return
+
+    # Проверка на пустой текст
+    if not processed_text or processed_text.strip() == "":
+        processed_text = "⚠️ Не удалось извлечь содержимое по ссылке. Проверьте, что ссылка доступна и содержит текст."
 
     sent_message = await message.answer(
         processed_text,
@@ -567,6 +588,10 @@ async def callback_correct_text(callback_query: types.CallbackQuery, state: FSMC
             reply_markup=get_correction_keyboard(original_message_id, current_mode, available_modes)
         )
         return
+
+    # Проверка на пустой текст
+    if not corrected_text or corrected_text.strip() == "":
+        corrected_text = "⚠️ Не удалось применить коррекцию. Попробуйте другой режим."
 
     sent_message = await callback_query.message.answer(
         corrected_text,
@@ -642,6 +667,11 @@ async def handle_document_question(message: types.Message, state: FSMContext) ->
     bot_response = await processors.dialogue_manager.answer_document_question(
         message.from_user.id, original_message_id, message.text
     )
+    
+    # Проверка на пустой ответ
+    if not bot_response or bot_response.strip() == "":
+        bot_response = "⚠️ Не удалось найти ответ на ваш вопрос. Попробуйте переформулировать."
+        
     await message.answer(bot_response, reply_markup=get_document_dialog_keyboard(original_message_id))
 
 @dp.callback_query(F.data.startswith("end_doc_dialog_"), DialogStates.viewing_document)
