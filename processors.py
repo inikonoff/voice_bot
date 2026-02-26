@@ -54,12 +54,16 @@ try:
 except ImportError:
     SILERO_AVAILABLE = False
 
-# WebRTC VAD (лёгкая альтернатива Silero, ~5 МБ)
+# WebRTC VAD — пробуем оба пакета: webrtcvad-wheels (prebuilt) и webrtcvad (source)
 try:
     import webrtcvad
     WEBRTCVAD_AVAILABLE = True
 except ImportError:
-    WEBRTCVAD_AVAILABLE = False
+    try:
+        import webrtcvad_wheels as webrtcvad  # некоторые версии пакета меняют имя модуля
+        WEBRTCVAD_AVAILABLE = True
+    except ImportError:
+        WEBRTCVAD_AVAILABLE = False
 
 # Выбор бэкенда через переменную окружения:
 #   VAD_BACKEND=silero   — Silero (точнее, ~250 МБ RAM, нужен torch)
