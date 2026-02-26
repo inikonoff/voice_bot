@@ -21,6 +21,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
+from processors import VAD_BACKEND
 
 import config
 import processors
@@ -120,7 +121,8 @@ def save_to_history(
         "chat_id": None,
         "filename": None,
     }
-
+def get_user_vad(user_id: int) -> str:
+    return user_context.get(user_id, {}).get("vad_backend", VAD_BACKEND)
 
 # ============================================================================
 # СОХРАНЕНИЕ ФАЙЛОВ
@@ -249,6 +251,18 @@ def create_keyboard(
         )
     return builder.as_markup()
 
+def create_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    current = user_context.get(user_id, {}).get("vad_backend", VAD_BACKEND)
+    labels = {
+        "webrtc":  "🎙 VAD: WebRTC",
+        "silero":  "🎙 VAD: Silero",
+        "none":    "🎙 VAD: выкл",
+    }
+    # Показываем две кнопки — не текущую
+    options = [k for k in labels if k != current]
+    buttons = [[KeyboardButton(text=labels[o]) for o in options]]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -486,6 +500,39 @@ async def exit_dialog_handler(message: types.Message):
 # ============================================================================
 # МЕДИА-ХЭНДЛЕРЫ
 # ============================================================================
+
+@router.message(Command("vad"))
+async def vad_handler(message: types.Message):
+    user_id = message.from_user.id
+    args = message.text.split()
+    backend = args[1].lower() if len(args) > 1 else None
+
+    if backend not in ("webrtc", "silero", "none"):
+        await message.answer(
+            "Использование: /vad webrtc | silero | none",
+            reply_markup=create_main_keyboard(user_id)
+        )
+        return
+
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    user_context[user_id]["vad_backend"] = backend
+
+    await message.answer(
+        f"✅ VAD переключён: <b>{backend}</b>",
+        parse_mode="HTML",
+        reply_markup=create_main_keyboard(user_id)
+    )
+@router.message(F.text.regexp(r"^🎙 VAD: (.+)$"))
+async def vad_button_handler(message: types.Message):
+    mapping = {"WebRTC": "webrtc", "Silero": "silero", "выкл": "none"}
+    label = message.text.replace("🎙 VAD: ", "")
+    backend = mapping.get(label)
+    if not backend:
+        return
+    # Переиспользуем логику — эмулируем команду
+    message.text = f"/vad {backend}"
+    await vad_handler(message)
 
 @router.message(F.voice)
 async def voice_handler(message: types.Message):
