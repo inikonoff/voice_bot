@@ -371,6 +371,7 @@ class AudioEngine:
 
     @classmethod
     async def process_voice_vad(cls, audio_bytes: bytes) -> bytes:
+        backend = backend or VAD_BACKEND
         """
         Полный пайплайн VAD-предобработки.
 
@@ -725,21 +726,15 @@ def _segments_to_timecoded_text(segments: list) -> str:
 
 
 async def transcribe_voice(
-    audio_bytes: bytes, groq_clients: list, with_timecodes: bool = False
+    audio_bytes: bytes,
+    groq_clients: list,
+    with_timecodes: bool = False,
+    vad_backend: Optional[str] = None,   # ← добавить
 ) -> str:
-    """
-    Транскрибация голоса через Whisper (Groq).
-
-    Пайплайн:
-        audio_bytes → AudioEngine.process_voice_vad → Whisper
-
-    VAD-предобработка сокращает файл на 30-50%, убирая тишину между словами.
-    Если VAD недоступен — байты идут напрямую в Whisper.
-
-    with_timecodes=True → возвращает текст с таймкодами [MM:SS]
-    """
-    # Предобработка через Silero VAD
-    processed_bytes = await audio_engine.process_voice_vad(audio_bytes)
+    processed_bytes = await audio_engine.process_voice_vad(
+        audio_bytes,
+        backend=vad_backend or VAD_BACKEND
+    )
 
     async def transcribe(client):
         if with_timecodes:
