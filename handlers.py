@@ -15,16 +15,18 @@ from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardRemove,
     FSInputFile,
     TelegramObject,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
-from processors import VAD_BACKEND
 
 import config
 import processors
+from processors import VAD_BACKEND
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,11 @@ def set_shared_state(bot: Bot, groq_clients: list):
     _bot = bot
     _groq_clients = groq_clients
     logger.info(f"Handlers initialized: {len(groq_clients)} Groq clients")
+
+
+def get_user_vad(user_id: int) -> str:
+    """Возвращает VAD бэкенд пользователя или глобальный дефолт из env."""
+    return user_context.get(user_id, {}).get("vad_backend", VAD_BACKEND)
 
 
 # ============================================================================
@@ -121,8 +128,7 @@ def save_to_history(
         "chat_id": None,
         "filename": None,
     }
-def get_user_vad(user_id: int) -> str:
-    return user_context.get(user_id, {}).get("vad_backend", VAD_BACKEND)
+
 
 # ============================================================================
 # СОХРАНЕНИЕ ФАЙЛОВ
@@ -210,6 +216,27 @@ def create_dialog_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+# Метки для кнопок VAD
+_VAD_LABELS = {
+    "webrtc": "🎙 VAD: WebRTC",
+    "silero": "🎙 VAD: Silero",
+    "none":   "🎙 VAD: выкл",
+}
+_VAD_FROM_LABEL = {v: k for k, v in _VAD_LABELS.items()}
+
+
+def create_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """
+    Клавиатура внизу чата.
+    Показывает две кнопки — варианты VAD, которые НЕ выбраны сейчас.
+    Так пользователь всегда видит, на что можно переключиться.
+    """
+    current = get_user_vad(user_id)
+    options = [k for k in _VAD_LABELS if k != current]
+    buttons = [[KeyboardButton(text=_VAD_LABELS[o]) for o in options]]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
 def create_keyboard(
     msg_id: int, current_mode: str, available_modes: list = None
 ) -> InlineKeyboardMarkup:
@@ -251,18 +278,6 @@ def create_keyboard(
         )
     return builder.as_markup()
 
-def create_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-    current = user_context.get(user_id, {}).get("vad_backend", VAD_BACKEND)
-    labels = {
-        "webrtc":  "🎙 VAD: WebRTC",
-        "silero":  "🎙 VAD: Silero",
-        "none":    "🎙 VAD: выкл",
-    }
-    # Показываем две кнопки — не текущую
-    options = [k for k in labels if k != current]
-    buttons = [[KeyboardButton(text=labels[o]) for o in options]]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -449,7 +464,7 @@ async def start_handler(message: types.Message):
     await message.answer(
         config.START_MESSAGE,
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=create_main_keyboard(message.from_user.id),
     )
 
 
@@ -502,15 +517,19 @@ async def exit_dialog_handler(message: types.Message):
 # ============================================================================
 
 @router.message(Command("vad"))
-async def vad_handler(message: types.Message):
+async def vad_command_handler(message: types.Message):
+    """Переключение VAD бэкенда командой: /vad webrtc | silero | none"""
     user_id = message.from_user.id
     args = message.text.split()
     backend = args[1].lower() if len(args) > 1 else None
 
     if backend not in ("webrtc", "silero", "none"):
+        current = get_user_vad(user_id)
         await message.answer(
-            "Использование: /vad webrtc | silero | none",
-            reply_markup=create_main_keyboard(user_id)
+            f"Текущий VAD: <b>{current}</b>\n"
+            f"Использование: /vad webrtc | silero | none",
+            parse_mode="HTML",
+            reply_markup=create_main_keyboard(user_id),
         )
         return
 
@@ -518,21 +537,25 @@ async def vad_handler(message: types.Message):
         user_context[user_id] = {}
     user_context[user_id]["vad_backend"] = backend
 
+    labels = {"webrtc": "WebRTC (~5 МБ)", "silero": "Silero (~250 МБ)", "none": "выключен"}
     await message.answer(
-        f"✅ VAD переключён: <b>{backend}</b>",
+        f"✅ VAD переключён: <b>{labels[backend]}</b>",
         parse_mode="HTML",
-        reply_markup=create_main_keyboard(user_id)
+        reply_markup=create_main_keyboard(user_id),
     )
-@router.message(F.text.regexp(r"^🎙 VAD: (.+)$"))
+    logger.info(f"User {user_id} switched VAD to: {backend}")
+
+
+@router.message(F.text.regexp(r"^🎙 VAD: .+$"))
 async def vad_button_handler(message: types.Message):
-    mapping = {"WebRTC": "webrtc", "Silero": "silero", "выкл": "none"}
-    label = message.text.replace("🎙 VAD: ", "")
-    backend = mapping.get(label)
+    """Обрабатывает нажатие кнопки клавиатуры '🎙 VAD: ...'"""
+    backend = _VAD_FROM_LABEL.get(message.text)
     if not backend:
         return
-    # Переиспользуем логику — эмулируем команду
+    # Переиспользуем логику команды
     message.text = f"/vad {backend}"
-    await vad_handler(message)
+    await vad_command_handler(message)
+
 
 @router.message(F.voice)
 async def voice_handler(message: types.Message):
@@ -552,7 +575,8 @@ async def voice_handler(message: types.Message):
         await _bot.download_file(file_info.file_path, voice_buffer)
 
         original_text = await processors.transcribe_voice(
-            voice_buffer.getvalue(), _groq_clients
+            voice_buffer.getvalue(), _groq_clients,
+            vad_backend=get_user_vad(user_id),
         )
 
         if original_text.startswith("❌"):
@@ -612,7 +636,8 @@ async def video_note_handler(message: types.Message):
         await _bot.download_file(file_info.file_path, buffer)
 
         original_text = await processors.process_video_file(
-            buffer.getvalue(), "video_note.mp4", _groq_clients, with_timecodes=False
+            buffer.getvalue(), "video_note.mp4", _groq_clients,
+            with_timecodes=False, vad_backend=get_user_vad(user_id),
         )
 
         if original_text.startswith("❌"):
@@ -667,7 +692,8 @@ async def audio_handler(message: types.Message):
         await _bot.download_file(file_info.file_path, audio_buffer)
 
         original_text = await processors.transcribe_voice(
-            audio_buffer.getvalue(), _groq_clients
+            audio_buffer.getvalue(), _groq_clients,
+            vad_backend=get_user_vad(user_id),
         )
 
         if original_text.startswith("❌"):
@@ -746,7 +772,8 @@ async def file_handler(message: types.Message):
             await msg.edit_text("🔍 Извлекаю текст...")
 
         original_text = await processors.extract_text_from_file(
-            file_bytes, filename, _groq_clients
+            file_bytes, filename, _groq_clients,
+            vad_backend=get_user_vad(user_id),
         )
 
         if original_text.startswith("❌"):
@@ -825,7 +852,9 @@ async def text_handler(message: types.Message):
         )
         try:
             original_text = await processors.video_platform_processor.process_video_url(
-                original_text, _groq_clients, with_timecodes=True
+                original_text, _groq_clients,
+                with_timecodes=True,
+                vad_backend=get_user_vad(user_id),
             )
             if original_text.startswith("❌"):
                 await msg.edit_text(original_text)
