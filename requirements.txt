@@ -19,7 +19,9 @@ psutil==6.1.0
 
 # ── VAD: WebRTC (лёгкий, ~5 МБ, для Render Free) ────────────────────────────
 # VAD_BACKEND=webrtc (default)
-webrtcvad==2.0.10
+# webrtcvad-wheels — форк с предсобранными бинарями, не требует компиляции.
+# Если по какой-то причине не встанет — fallback: webrtcvad==2.0.10 (нужен gcc + libc6-dev)
+webrtcvad-wheels==2.0.14
 
 # ── VAD: Silero (точный, ~250 МБ RAM, для Render Starter и выше) ─────────────
 # Раскомментировать если VAD_BACKEND=silero
