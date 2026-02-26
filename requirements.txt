@@ -1,26 +1,40 @@
-# Основные библиотеки бота
-aiogram>=3.0.0
-python-dotenv
-aiohttp
-openai
+# ============================================================================
+# requirements.txt
+# Голосовой бот v4.0 — полный список зависимостей
+# ============================================================================
 
-# Обработка документов и экспорт
-pdfplumber
-python-docx
-reportlab
-fpdf2
+# ── Веб-фреймворк и сервер ────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
 
-# Работа с видео и YouTube
-yt-dlp
-youtube-transcript-api
+# ── Telegram бот ─────────────────────────────────────────────────────────────
+aiogram==3.15.0
 
-# Обработка аудио (VAD, сжатие, нарезка)
-pydub
+# ── Groq / OpenAI клиент ─────────────────────────────────────────────────────
+openai==1.56.2
 
-# Интеграция с Supabase (для будущих задач)
-supabase
+# ── Мониторинг ресурсов (для /metrics) ───────────────────────────────────────
+psutil==6.1.0
 
-# Утилиты и производительность
-ujson
-uvloop; sys_platform != 'win32'
-certifi
+# ── VAD: WebRTC (лёгкий, ~5 МБ, для Render Free) ────────────────────────────
+# VAD_BACKEND=webrtc (default)
+webrtcvad==2.0.10
+
+# ── VAD: Silero (точный, ~250 МБ RAM, для Render Starter и выше) ─────────────
+# Раскомментировать если VAD_BACKEND=silero
+# torch==2.5.1
+# torchaudio==2.5.1
+# Для CPU-only (значительно меньше размер образа):
+# torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
+# torchaudio==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
+
+# ── Обработка документов ─────────────────────────────────────────────────────
+pdfplumber==0.11.4
+python-docx==1.1.2
+reportlab==4.2.5
+
+# ── Видео и аудио (yt-dlp для YouTube/TikTok/Rutube) ─────────────────────────
+yt-dlp==2024.11.18
+youtube-transcript-api==0.6.3
+# ffmpeg устанавливается системно (см. Dockerfile), не через pip
