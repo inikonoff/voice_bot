@@ -370,18 +370,18 @@ class AudioEngine:
     # ── Публичный метод ───────────────────────────────────────────────────────
 
     @classmethod
-    async def process_voice_vad(cls, audio_bytes: bytes) -> bytes:
-        backend = backend or VAD_BACKEND
+    async def process_voice_vad(cls, audio_bytes: bytes, backend: str = None) -> bytes:
         """
         Полный пайплайн VAD-предобработки.
 
         Принимает байты любого формата (.ogg, .mp3, .m4a, .wav...).
         Возвращает WAV-байты с вырезанной тишиной — готовы для Whisper.
 
-        На любом шаге при ошибке — graceful fallback на предыдущий результат,
-        транскрибация не прерывается никогда.
+        backend — явный выбор бэкенда (per-user). Если None — читает VAD_BACKEND из env.
+        На любом шаге при ошибке — graceful fallback, транскрибация не прерывается никогда.
         """
-        backend = VAD_BACKEND
+        backend = (backend or VAD_BACKEND).lower()
+        logger.debug(f"VAD pipeline: backend={backend}")
 
         # Шаг 1: конвертируем в WAV 16kHz (нужно для обоих бэкендов)
         wav_bytes = await cls._to_wav16k(audio_bytes)
@@ -391,16 +391,21 @@ class AudioEngine:
 
         # Шаг 2: применяем выбранный бэкенд
         if backend == "none":
-            logger.debug("VAD отключён (VAD_BACKEND=none), передаём WAV без фильтрации")
+            logger.debug("VAD отключён (backend=none), передаём WAV без фильтрации")
             return wav_bytes
 
         if backend == "silero":
             result = cls._apply_silero(wav_bytes)
+            if result is None:
+                logger.error(
+                    "VAD: Silero вернул None (см. ошибку выше), "
+                    "падаем на WAV без фильтрации"
+                )
         else:
             # default: webrtc
             result = cls._apply_webrtc(wav_bytes)
-            if result is None and backend == "webrtc":
-                logger.warning("WebRTC VAD недоступен, передаём WAV без фильтрации")
+            if result is None:
+                logger.warning("VAD: WebRTC недоступен или упал, передаём WAV без фильтрации")
 
         return result if result else wav_bytes
 
@@ -651,7 +656,8 @@ class VideoPlatformProcessor:
 
     @staticmethod
     async def process_video_url(
-        url: str, groq_clients: list, with_timecodes: bool = True
+        url: str, groq_clients: list, with_timecodes: bool = True,
+        vad_backend: Optional[str] = None,
     ) -> str:
         is_valid, platform = VideoPlatformProcessor._validate_url(url)
         if not is_valid:
@@ -683,7 +689,9 @@ class VideoPlatformProcessor:
                 audio_bytes = f.read()
 
             text = await transcribe_voice(
-                audio_bytes, groq_clients, with_timecodes=with_timecodes
+                audio_bytes, groq_clients,
+                with_timecodes=with_timecodes,
+                vad_backend=vad_backend,
             )
 
             try:
@@ -729,12 +737,19 @@ async def transcribe_voice(
     audio_bytes: bytes,
     groq_clients: list,
     with_timecodes: bool = False,
-    vad_backend: Optional[str] = None,   # ← добавить
+    vad_backend: Optional[str] = None,
 ) -> str:
-    processed_bytes = await audio_engine.process_voice_vad(
-        audio_bytes,
-        backend=vad_backend or VAD_BACKEND
-    )
+    """
+    Транскрибация голоса через Whisper (Groq).
+
+    Пайплайн:
+        audio_bytes → AudioEngine.process_voice_vad(backend) → Whisper
+
+    vad_backend — per-user выбор бэкенда (webrtc/silero/none).
+                  Если None — используется глобальный VAD_BACKEND из env.
+    with_timecodes=True → возвращает текст с таймкодами [MM:SS]
+    """
+    processed_bytes = await audio_engine.process_voice_vad(audio_bytes, backend=vad_backend)
 
     async def transcribe(client):
         if with_timecodes:
@@ -1099,7 +1114,11 @@ async def stream_document_answer(
 # ============================================================================
 
 async def process_video_file(
-    video_bytes: bytes, filename: str, groq_clients: list, with_timecodes: bool = False
+    video_bytes: bytes,
+    filename: str,
+    groq_clients: list,
+    with_timecodes: bool = False,
+    vad_backend: Optional[str] = None,
 ) -> str:
     try:
         file_ext = filename.split(".")[-1] if "." in filename else "mp4"
@@ -1121,7 +1140,11 @@ async def process_video_file(
         with open(temp_audio, "rb") as f:
             audio_bytes = f.read()
 
-        text = await transcribe_voice(audio_bytes, groq_clients, with_timecodes=with_timecodes)
+        text = await transcribe_voice(
+            audio_bytes, groq_clients,
+            with_timecodes=with_timecodes,
+            vad_backend=vad_backend,
+        )
 
         for path in (temp_video, temp_audio):
             try:
@@ -1190,7 +1213,8 @@ async def extract_text_from_txt(txt_bytes: bytes) -> str:
 
 
 async def extract_text_from_file(
-    file_bytes: bytes, filename: str, groq_clients: list
+    file_bytes: bytes, filename: str, groq_clients: list,
+    vad_backend: Optional[str] = None,
 ) -> str:
     mime_type, _ = mimetypes.guess_type(filename)
     file_ext = filename.lower().split(".")[-1] if "." in filename else ""
@@ -1202,7 +1226,9 @@ async def extract_text_from_file(
         return await vision_processor.extract_text(file_bytes)
 
     if file_ext in config.VIDEO_SUPPORTED_FORMATS:
-        return await process_video_file(file_bytes, filename, groq_clients)
+        return await process_video_file(
+            file_bytes, filename, groq_clients, vad_backend=vad_backend
+        )
 
     if mime_type == "application/pdf" or file_ext == "pdf":
         return await extract_text_from_pdf(file_bytes)
