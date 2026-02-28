@@ -18,13 +18,7 @@ GROQ_TIMEOUT = 120.0                      # Таймаут для Groq API (ув
 GROQ_RETRY_COUNT = 3                      # Количество повторов на клиент
 
 # === МОДЕЛИ GROQ ===
-GROQ_MODELS = {
-    "transcription": "whisper-large-v3-turbo",
-    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "basic": "openai/gpt-oss-20b",
-    "premium": "llama-3.3-70b-versatile",
-    "reasoning": "openai/gpt-oss-120b",  # Для саммари и диалога
-}
+# Определены ниже в разделе "МОДЕЛИ GROQ"
 
 # === ТЕМПЕРАТУРЫ ===
 MODEL_TEMPERATURES = {
@@ -65,6 +59,7 @@ YTDLP_FRAGMENT_RETRIES = 10
 # PoT токены (можно задать через переменные окружения)
 PO_TOKEN = os.environ.get("PO_TOKEN", None)  # Опционально
 VISITOR_DATA = os.environ.get("VISITOR_DATA", None)  # Опционально
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "youtube_cookies.txt")  # Путь к файлу куки
 
 # === VOICE MESSAGES (КРУЖОЧКИ) ===
 VOICE_MESSAGE_ENABLED = True
