@@ -324,7 +324,42 @@ class VideoPlatformProcessor:
             return None
         
         try:
-            # Обновленная конфигурация для обхода блокировок YouTube
+            # Пути к файлу с куки (проверяем несколько мест)
+            cookie_paths = [
+                os.environ.get("YTDLP_COOKIES_FILE", ""),
+                "youtube_cookies.txt",
+                "/app/youtube_cookies.txt",
+                "/data/youtube_cookies.txt",
+            ]
+            cookie_file = next((p for p in cookie_paths if p and os.path.exists(p)), None)
+            
+            # PO Token и Visitor Data из config/env
+            po_token = config.PO_TOKEN
+            visitor_data = config.VISITOR_DATA
+            
+            # Формируем extractor_args в зависимости от наличия PO Token
+            if po_token:
+                # С PO Token используем mweb — наиболее стабильный вариант
+                extractor_args = {
+                    'youtube': {
+                        'player_client': ['mweb'],
+                        'po_token': [f'mweb+https://www.youtube.com/={po_token}'],
+                    }
+                }
+                logger.info("yt-dlp: using mweb client with PO Token")
+            else:
+                # Без PO Token используем tv_embedded + web — они пока не требуют токена
+                extractor_args = {
+                    'youtube': {
+                        'player_client': ['tv_embedded', 'web'],
+                    }
+                }
+                logger.info("yt-dlp: using tv_embedded/web clients (no PO Token)")
+            
+            # Добавляем visitor_data если есть
+            if visitor_data:
+                extractor_args['youtube']['visitor_data'] = [visitor_data]
+            
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': output_path,
@@ -341,13 +376,7 @@ class VideoPlatformProcessor:
                     'preferredquality': '64',
                 }],
                 
-                # Используем современные методы обхода (PoToken и мобильные клиенты)
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['web_creator', 'ios', 'android'],
-                        'skip': ['hls', 'dash'],
-                    }
-                },
+                'extractor_args': extractor_args,
                 
                 # Заголовки
                 'http_headers': {
@@ -356,13 +385,15 @@ class VideoPlatformProcessor:
                     'Accept-Language': 'en-US,en;q=0.9',
                 },
                 
-                # Добавляем куки, если файл существует
-                'cookiefile': 'youtube_cookies.txt' if os.path.exists('youtube_cookies.txt') else None,
-                
                 'extractor_retries': 5,
                 'file_access_retries': 5,
                 'throttledratelimit': 1000000,
             }
+            
+            # Добавляем куки только если файл реально существует
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
+                logger.info(f"yt-dlp: using cookies from {cookie_file}")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 logger.info(f"Downloading audio from: {url}")
