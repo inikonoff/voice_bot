@@ -761,6 +761,7 @@ async def transcribe_voice(
                 model=config.GROQ_MODELS["transcription"],
                 file=("audio.wav", processed_bytes, "audio/wav"),
                 language=config.AUDIO_LANGUAGE,
+                prompt=config.WHISPER_PROMPT,
                 response_format="verbose_json",
                 temperature=config.MODEL_TEMPERATURES["transcription"],
             )
@@ -773,6 +774,7 @@ async def transcribe_voice(
                 model=config.GROQ_MODELS["transcription"],
                 file=("audio.wav", processed_bytes, "audio/wav"),
                 language=config.AUDIO_LANGUAGE,
+                prompt=config.WHISPER_PROMPT,
                 response_format="text",
                 temperature=config.MODEL_TEMPERATURES["transcription"],
             )
