@@ -37,15 +37,7 @@ MODEL_TEMPERATURES = {
 
 # === AUDIO ===
 AUDIO_SAMPLE_RATE = 16000
-
-# None = автоопределение (ошибается на коротких фразах).
-# Оставляем None, но компенсируем через WHISPER_PROMPT ниже.
-AUDIO_LANGUAGE = os.environ.get("AUDIO_LANGUAGE", "") or None
-
-# Подсказка Whisper о контексте. Кириллица в prompt сильно склоняет модель
-# к русскому, но не блокирует английский если речь явно на нём.
-WHISPER_PROMPT = "Голосовое сообщение на русском или английском языке. Voice message in Russian or English."
-
+AUDIO_LANGUAGE = None                      # None для автоопределения
 TRANSCRIPTION_TEMPERATURE = 0.0
 
 # === VIDEO ===
