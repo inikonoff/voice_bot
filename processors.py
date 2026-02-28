@@ -622,9 +622,11 @@ class VideoPlatformProcessor:
                         "preferredquality": "64",
                     }
                 ],
+                # tv_embedded и mweb меньше триггерят бот-проверку на серверных IP
+                # web_creator убран — он первым получает капчу на датацентрах
                 "extractor_args": {
                     "youtube": {
-                        "player_client": ["web_creator", "ios", "android"],
+                        "player_client": ["tv_embedded", "mweb", "ios"],
                         "skip": ["hls", "dash"],
                     }
                 },
@@ -756,14 +758,17 @@ async def transcribe_voice(
     processed_bytes = await audio_engine.process_voice_vad(audio_bytes, backend=vad_backend)
 
     async def transcribe(client):
+        # Groq не принимает language=None как строку — передаём параметр только если язык задан
+        lang_kwargs = {"language": config.AUDIO_LANGUAGE} if config.AUDIO_LANGUAGE else {}
+
         if with_timecodes:
             response = await client.audio.transcriptions.create(
                 model=config.GROQ_MODELS["transcription"],
                 file=("audio.wav", processed_bytes, "audio/wav"),
-                language=config.AUDIO_LANGUAGE,
                 prompt=config.WHISPER_PROMPT,
                 response_format="verbose_json",
                 temperature=config.MODEL_TEMPERATURES["transcription"],
+                **lang_kwargs,
             )
             segments = getattr(response, "segments", None)
             if segments:
@@ -773,10 +778,10 @@ async def transcribe_voice(
             response = await client.audio.transcriptions.create(
                 model=config.GROQ_MODELS["transcription"],
                 file=("audio.wav", processed_bytes, "audio/wav"),
-                language=config.AUDIO_LANGUAGE,
                 prompt=config.WHISPER_PROMPT,
                 response_format="text",
                 temperature=config.MODEL_TEMPERATURES["transcription"],
+                **lang_kwargs,
             )
             return response
 
