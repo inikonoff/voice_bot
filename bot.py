@@ -2,13 +2,7 @@
 """
 Главный файл бота: хэндлеры, управление контекстом, видео-обработка
 Версия 3.2 (Гибрид: 3.1 + middleware, стриминг, диалоговый режим из 6.4)
-
-НОВОЕ В ВЕРСИИ 3.2:
-1. ✅ Middleware для централизованной обработки ошибок
-2. ✅ Улучшенный startup/shutdown с детальным логированием
-3. ✅ Стриминг ответов в диалоговом режиме
-4. ✅ Диалоговый режим для вопросов по документам
-5. ✅ Сохранение всего функционала 3.1 (видео, аудио, режимы, экспорт)
+С ИНТЕГРАЦИЕЙ АНТИПАДЕНИЕ ШАБЛОНА (FastAPI + мониторинг + graceful shutdown)
 """
 
 import os
@@ -17,11 +11,15 @@ import sys
 import signal
 import logging
 import asyncio
+import time
+import psutil
 from typing import Optional, List, Dict, Any, Callable, Awaitable
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from aiohttp import web
+from fastapi import FastAPI, Request, Response
 from openai import AsyncOpenAI
+import uvicorn
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -34,6 +32,8 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 import config
 import processors
@@ -57,31 +57,59 @@ if not BOT_TOKEN:
     logger.error("BOT_TOKEN not found! Exiting.")
     exit(1)
 
-# === ИНИЦИАЛИЗАЦИЯ ===
-bot = Bot(token=BOT_TOKEN)
+# === ИНИЦИАЛИЗАЦИЯ БОТА ===
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
+start_time = time.time()
+polling_task = None
+is_shutting_down = False
+shutdown_event = asyncio.Event()
+stats = {"total_updates": 0, "errors": 0, "processed_messages": 0}
 
 # Глобальное хранилище: user_id -> { message_id: {"text": "...", "mode": "...", "time": ...} }
 user_context: Dict[int, Dict[int, Any]] = {}
 
-# НОВО: Хранилище активных диалогов (user_id -> message_id документа)
+# Хранилище активных диалогов (user_id -> message_id документа)
 active_dialogs: Dict[int, int] = {}
 
 groq_clients = []
 current_client_index = 0
 
-# Флаг для graceful shutdown
-shutdown_event = asyncio.Event()
+
+# ============================================================================
+# ОБРАБОТКА СИГНАЛОВ (GRACEFUL SHUTDOWN)
+# ============================================================================
+
+def handle_sigterm(signum, frame):
+    """Обработчик сигнала SIGTERM от Render"""
+    global is_shutting_down
+    if is_shutting_down:
+        return
+    logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
+    is_shutting_down = True
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(shutdown_event.set()))
+    except RuntimeError:
+        # Если нет запущенного цикла, создаем новый
+        asyncio.run(initiate_shutdown())
+
+
+async def initiate_shutdown():
+    """Инициировать graceful shutdown"""
+    shutdown_event.set()
 
 
 # ============================================================================
-# НОВО: MIDDLEWARE ДЛЯ ОБРАБОТКИ ОШИБОК (ИЗ 6.4)
+# MIDDLEWARE ДЛЯ ОБРАБОТКИ ОШИБОК И МОНИТОРИНГА
 # ============================================================================
 
 class ErrorHandlingMiddleware(BaseMiddleware):
     """
     Middleware для обработки ошибок и автоматического восстановления
-    Централизованная обработка исключений во всех хендлерах
+    Централизованная обработка исключений во всех хендлерах + мониторинг
     """
     async def __call__(
         self,
@@ -89,23 +117,42 @@ class ErrorHandlingMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any]
     ) -> Any:
+        global stats
+        stats["total_updates"] += 1
+        
         try:
-            return await handler(event, data)
+            result = await handler(event, data)
+            stats["processed_messages"] += 1
+            return result
         except TelegramUnauthorizedError as e:
+            stats["errors"] += 1
             logger.error(f"❌ Ошибка авторизации в middleware: {e}")
+            if is_shutting_down:
+                raise
             # Не пробуем сбросить вебхук здесь - это может вызвать рекурсию
             raise
         except TelegramNetworkError as e:
+            stats["errors"] += 1
             logger.error(f"❌ Сетевая ошибка в middleware: {e}")
+            if is_shutting_down:
+                raise
             # Можно добавить автоматическое восстановление через retry
             raise
         except Exception as e:
+            stats["errors"] += 1
             logger.error(f"❌ Необработанная ошибка в middleware: {e}", exc_info=True)
+            
+            if is_shutting_down:
+                raise
+                
             # Пробуем уведомить пользователя, если это возможно
-            if hasattr(event, "message") and event.message:
-                await event.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
-            elif hasattr(event, "callback_query") and event.callback_query:
-                await event.callback_query.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
+            try:
+                if hasattr(event, "message") and event.message:
+                    await event.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
+                elif hasattr(event, "callback_query") and event.callback_query:
+                    await event.callback_query.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
+            except:
+                pass
             raise
 
 
@@ -115,149 +162,210 @@ dp.callback_query.middleware(ErrorHandlingMiddleware())
 
 
 # ============================================================================
-# НОВО: УЛУЧШЕННЫЙ STARTUP/SHUTDOWN (ИЗ 6.4)
+# POLLING TASK (С АВТОМАТИЧЕСКИМ ВОССТАНОВЛЕНИЕМ)
 # ============================================================================
 
-async def on_startup(bot: Bot):
-    """Действия при запуске бота с детальным логированием"""
-    logger.info("=" * 50)
-    logger.info("🚀 ЗАПУСК БОТА v3.2")
-    logger.info("=" * 50)
+async def run_polling():
+    """Задача для запуска polling с автоматическим восстановлением после ошибок"""
+    global is_shutting_down
+    logger.info("🚀 Starting bot polling task...")
     
-    # Шаг 1: Проверяем подключение к Telegram
-    logger.info("🤖 ШАГ 1: Проверка подключения к Telegram...")
-    try:
-        me = await bot.get_me()
-        logger.info(f"   ✅ Бот @{me.username} (ID: {me.id}) успешно подключен")
-    except TelegramUnauthorizedError as e:
-        logger.error(f"   ❌ ОШИБКА АВТОРИЗАЦИИ: Проверьте BOT_TOKEN!")
-        logger.error(f"   Детали: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"   ❌ Не удалось подключиться к Telegram: {e}")
-        raise
-    
-    # Шаг 2: Проверяем и сбрасываем вебхук
-    logger.info("📡 ШАГ 2: Проверка вебхука...")
-    try:
-        webhook_info = await bot.get_webhook_info()
-        logger.info(f"   Текущий вебхук: {webhook_info.url or 'не установлен'}")
-        logger.info(f"   Ожидающих обновлений: {webhook_info.pending_update_count}")
-        
-        if webhook_info.url:
-            logger.info("   🗑️ Удаление вебхука...")
-            await bot.delete_webhook(drop_pending_updates=True)
-            await asyncio.sleep(1)
-            
-            # Проверяем результат
-            webhook_info = await bot.get_webhook_info()
-            if not webhook_info.url:
-                logger.info("   ✅ Вебхук успешно удален")
-            else:
-                logger.warning("   ⚠️ Вебхук не удалился, пробуем еще раз...")
-                await bot.delete_webhook(drop_pending_updates=True)
-                await asyncio.sleep(2)
-        else:
-            logger.info("   ✅ Вебхук уже сброшен")
-            
-    except Exception as e:
-        logger.error(f"   ❌ Ошибка при сбросе вебхука: {e}")
-    
-    # Шаг 3: Проверяем Groq клиенты
-    logger.info("🔧 ШАГ 3: Проверка Groq клиентов...")
-    if groq_clients:
-        logger.info(f"   ✅ Доступно Groq клиентов: {len(groq_clients)}")
-        # Проверяем первый клиент
+    while not is_shutting_down:
         try:
-            # Простой тестовый запрос
-            logger.info("   ⚡ Тестирование Groq API...")
-            # Здесь можно добавить тестовый запрос если нужно
-            logger.info("   ✅ Groq API работает")
+            logger.info("🔄 Polling started")
+            await dp.start_polling(bot)
+        except asyncio.CancelledError:
+            logger.info("Polling task cancelled")
+            break
         except Exception as e:
-            logger.warning(f"   ⚠️ Проблема с Groq API: {e}")
-    else:
-        logger.warning("   ⚠️ Groq клиенты не доступны")
-    
-    logger.info("=" * 50)
-    logger.info("✅ БОТ ГОТОВ К РАБОТЕ")
-    logger.info("=" * 50)
+            if is_shutting_down:
+                logger.info("Shutting down, exiting polling loop")
+                break
+            logger.error(f"❌ Polling crashed: {e}. Restarting in 5 seconds...", exc_info=True)
+            await asyncio.sleep(5)
 
 
-async def on_shutdown(bot: Bot):
-    """Действия при остановке бота"""
+# ============================================================================
+# FASTAPI ПРИЛОЖЕНИЕ (ДЛЯ ХОСТИНГА И МОНИТОРИНГА)
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Жизненный цикл FastAPI приложения"""
+    global polling_task
+    
     logger.info("=" * 50)
-    logger.info("👋 ОСТАНОВКА БОТА v3.2")
+    logger.info("🟢 FASTAPI APP STARTING")
     logger.info("=" * 50)
     
-    # Шаг 1: Сохраняем контекст (опционально)
-    logger.info("📝 Сохранение контекста...")
-    try:
-        # Здесь можно сохранить контекст в Redis/файл, если нужно
-        logger.info(f"   Пользователей в контексте: {len(user_context)}")
-        logger.info(f"   Активных диалогов: {len(active_dialogs)}")
-    except Exception as e:
-        logger.error(f"   ❌ Ошибка при сохранении: {e}")
+    # Шаг 1: Инициализация Groq клиентов
+    logger.info("🔧 Initializing Groq clients...")
+    init_groq_clients()
+    processors.vision_processor.init_clients(groq_clients)
     
-    # Шаг 2: Закрываем сессии
-    logger.info("📡 Закрытие сессий...")
-    try:
-        await bot.session.close()
-        logger.info("   ✅ Сессия бота закрыта")
-    except Exception as e:
-        logger.error(f"   ❌ Ошибка при закрытии сессии: {e}")
+    # Инициализируем хранилище диалогов в processors если его нет
+    if not hasattr(processors, 'document_dialogues'):
+        processors.document_dialogues = {}
     
-    # Шаг 3: Очищаем временные данные
-    logger.info("🧹 Очистка временных данных...")
+    # Шаг 2: Сброс вебхука перед запуском polling
+    logger.info("📡 Clearing webhook...")
     try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook cleared")
+    except Exception as e:
+        logger.error(f"❌ Error clearing webhook: {e}")
+    
+    # Шаг 3: Запуск polling в фоне
+    logger.info("🤖 Starting bot polling...")
+    polling_task = asyncio.create_task(run_polling())
+    
+    # Шаг 4: Запуск фоновых задач очистки
+    logger.info("🧹 Starting cleanup tasks...")
+    cleanup_task = asyncio.create_task(cleanup_old_contexts())
+    temp_cleanup_task = asyncio.create_task(cleanup_temp_files())
+    
+    # Шаг 5: Регистрация обработчиков сигналов
+    logger.info("📡 Registering signal handlers...")
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, handle_sigterm, sig, None)
+        except NotImplementedError:
+            # Windows не поддерживает сигналы
+            logger.warning(f"Signal handler for {sig} not supported on this platform")
+    
+    logger.info("=" * 50)
+    logger.info("✅ BOT IS RUNNING")
+    logger.info("=" * 50)
+    
+    yield  # Приложение работает
+    
+    # === SHUTDOWN ===
+    logger.info("=" * 50)
+    logger.info("🔴 SHUTTING DOWN")
+    logger.info("=" * 50)
+    
+    # Останавливаем polling
+    if polling_task and not polling_task.done():
+        logger.info("🛑 Stopping polling...")
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            logger.info("✅ Polling stopped")
+    
+    # Отменяем фоновые задачи
+    logger.info("🛑 Canceling cleanup tasks...")
+    cleanup_task.cancel()
+    temp_cleanup_task.cancel()
+    
+    try:
+        await asyncio.gather(cleanup_task, temp_cleanup_task, return_exceptions=True)
+    except:
+        pass
+    
+    # Сохраняем контекст и закрываем сессии
+    logger.info("📝 Saving context and closing sessions...")
+    try:
+        logger.info(f"   Users in context: {len(user_context)}")
+        logger.info(f"   Active dialogs: {len(active_dialogs)}")
         user_context.clear()
         active_dialogs.clear()
-        # Очищаем диалоговые хранилища в processors
         if hasattr(processors, 'document_dialogues'):
             processors.document_dialogues.clear()
-        logger.info("   ✅ Хранилища очищены")
+        await bot.session.close()
+        logger.info("✅ Cleanup complete")
     except Exception as e:
-        logger.error(f"   ❌ Ошибка при очистке: {e}")
+        logger.error(f"❌ Error during cleanup: {e}")
     
     logger.info("=" * 50)
-    logger.info("✅ БОТ ОСТАНОВЛЕН")
+    logger.info("✅ BOT STOPPED")
     logger.info("=" * 50)
 
 
-# Регистрируем обработчики запуска и остановки
-dp.startup.register(on_startup)
-dp.shutdown.register(on_shutdown)
+# Создаем FastAPI приложение
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url=None,  # Отключаем документацию в production
+    redoc_url=None
+)
+
+
+# === FASTAPI MIDDLEWARE ДЛЯ МОНИТОРИНГА ===
+@app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+    """Мониторинг HTTP запросов"""
+    stats["total_updates"] += 1
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        stats["errors"] += 1
+        logger.error(f"HTTP error: {e}")
+        raise
+
+
+# === HEALTH CHECK ENDPOINTS ===
+@app.get("/health")
+@app.head("/health")
+@app.get("/ping")
+async def health():
+    """Health check для Uptime Robot и Render"""
+    return Response(
+        content='{"status": "healthy", "service": "speech-flow-bot", "version": "3.2"}',
+        media_type="application/json",
+        status_code=200
+    )
+
+
+@app.get("/")
+async def root():
+    """Корневой эндпоинт"""
+    return {
+        "service": "Speech Flow Bot",
+        "version": "3.2",
+        "status": "running",
+        "uptime": int(time.time() - start_time)
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Метрики для мониторинга (Prometheus format)"""
+    uptime = int(time.time() - start_time)
+    ram_mb = psutil.Process().memory_info().rss / 1024 / 1024
+    cpu = psutil.Process().cpu_percent()
+    
+    text = f"""# HELP bot_uptime Uptime in seconds
+# TYPE bot_uptime gauge
+bot_uptime {uptime}
+# HELP bot_ram_mb RAM usage in MB
+# TYPE bot_ram_mb gauge
+bot_ram_mb {ram_mb:.2f}
+# HELP bot_cpu CPU usage percent
+# TYPE bot_cpu gauge
+bot_cpu {cpu}
+# HELP bot_requests_total Total requests processed
+# TYPE bot_requests_total counter
+bot_requests_total {stats["total_updates"]}
+# HELP bot_errors_total Total errors
+# TYPE bot_errors_total counter
+bot_errors_total {stats["errors"]}
+# HELP bot_processed_messages Total processed messages
+# TYPE bot_processed_messages counter
+bot_processed_messages {stats["processed_messages"]}
+# HELP bot_active_dialogs Active dialog sessions
+# TYPE bot_active_dialogs gauge
+bot_active_dialogs {len(active_dialogs)}
+# HELP bot_users_in_context Users with active context
+# TYPE bot_users_in_context gauge
+bot_users_in_context {len(user_context)}
+"""
+    return Response(content=text, media_type="text/plain")
 
 
 # ============================================================================
-# ОБРАБОТКА СИГНАЛОВ (ИЗ 3.1)
-# ============================================================================
-
-def handle_sigterm(signum, frame):
-    """Обработчик сигнала SIGTERM от Render"""
-    logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
-    asyncio.create_task(shutdown())
-
-
-async def shutdown():
-    """Graceful shutdown"""
-    logger.info("🛑 Starting graceful shutdown...")
-    
-    # Устанавливаем событие завершения
-    shutdown_event.set()
-    
-    # Даём время на завершение текущих обработок (30 секунд)
-    logger.info("⏳ Waiting for ongoing tasks to complete (up to 30 seconds)...")
-    await asyncio.sleep(30)
-    
-    # Вызываем on_shutdown вручную
-    await on_shutdown(bot)
-    
-    logger.info("✅ Graceful shutdown complete")
-    sys.exit(0)
-
-
-# ============================================================================
-# ИНИЦИАЛИЗАЦИЯ GROQ КЛИЕНТОВ (ИЗ 3.1)
+# ИНИЦИАЛИЗАЦИЯ GROQ КЛИЕНТОВ
 # ============================================================================
 
 def init_groq_clients():
@@ -286,7 +394,7 @@ def init_groq_clients():
 
 
 # ============================================================================
-# УПРАВЛЕНИЕ КЭШЕМ И КОНТЕКСТОМ (ИЗ 3.1)
+# УПРАВЛЕНИЕ КЭШЕМ И КОНТЕКСТОМ
 # ============================================================================
 
 def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", available_modes: list = None):
@@ -315,11 +423,11 @@ def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", a
 
 async def cleanup_old_contexts():
     """Фоновая задача: удаление контекстов старше CACHE_TIMEOUT_SECONDS"""
-    while not shutdown_event.is_set():
+    while not is_shutting_down and not shutdown_event.is_set():
         try:
             await asyncio.sleep(config.CACHE_CHECK_INTERVAL)
             
-            if shutdown_event.is_set():
+            if is_shutting_down or shutdown_event.is_set():
                 break
             
             current_time = datetime.now()
@@ -352,11 +460,11 @@ async def cleanup_old_contexts():
 
 async def cleanup_temp_files():
     """Фоновая задача: удаление старых временных файлов"""
-    while not shutdown_event.is_set():
+    while not is_shutting_down and not shutdown_event.is_set():
         try:
             await asyncio.sleep(config.TEMP_FILE_RETENTION)
             
-            if shutdown_event.is_set() or not config.CLEANUP_TEMP_FILES:
+            if is_shutting_down or shutdown_event.is_set() or not config.CLEANUP_TEMP_FILES:
                 continue
             
             current_time = datetime.now().timestamp()
@@ -389,7 +497,7 @@ async def cleanup_temp_files():
 
 
 # ============================================================================
-# НОВО: КЛАВИАТУРА ДЛЯ ДИАЛОГОВОГО РЕЖИМА (ИЗ 6.4)
+# КЛАВИАТУРЫ
 # ============================================================================
 
 def create_dialog_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -403,10 +511,6 @@ def create_dialog_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-
-# ============================================================================
-# СОЗДАНИЕ КЛАВИАТУР (ИЗ 3.1, ОБНОВЛЕНО)
-# ============================================================================
 
 def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None) -> InlineKeyboardMarkup:
     """Создаем клавиатуру, где в callback_data зашит ID сообщения"""
@@ -477,7 +581,6 @@ def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary_{msg_id}"),
         )
     
-    # НОВО: Добавляем кнопку для диалогового режима
     if ctx_data and len(ctx_data.get("original", "")) > 100:  # Только для достаточно длинных текстов
         builder.row(
             InlineKeyboardButton(
@@ -528,7 +631,6 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
         else:
             builder.row(mode_buttons[i])
     
-    # Добавляем кнопку диалога
     if len(ctx_data.get("original", "")) > 100:
         builder.row(
             InlineKeyboardButton(
@@ -547,7 +649,7 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
 
 
 # ============================================================================
-# СОХРАНЕНИЕ ФАЙЛОВ (ИЗ 3.1)
+# СОХРАНЕНИЕ ФАЙЛОВ
 # ============================================================================
 
 async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[str]:
@@ -624,66 +726,7 @@ async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[st
 
 
 # ============================================================================
-# ВЕБ-СЕРВЕР (для Render/Uptime Robot)
-# ============================================================================
-
-async def health_check(request):
-    """Health check для Uptime Robot и Render"""
-    return web.Response(
-        text='{"status": "healthy", "service": "speech-flow-bot", "version": "3.2"}',
-        content_type="application/json",
-        status=200
-    )
-
-
-async def start_web_server():
-    """Запуск фонового веб-сервера"""
-    try:
-        app = web.Application()
-        
-        async def log_middleware(app, handler):
-            async def middleware(request):
-                logger.debug(f"🌐 Web request: {request.method} {request.path}")
-                return await handler(request)
-            return middleware
-        
-        app.middlewares.append(log_middleware)
-        
-        app.router.add_get('/', health_check)
-        app.router.add_get('/health', health_check)
-        app.router.add_get('/ping', health_check)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        port = int(os.environ.get("PORT", 8080))
-        
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        
-        logger.info("=" * 50)
-        logger.info(f"✅ WEB SERVER STARTED")
-        logger.info(f"📌 PORT from env: {os.environ.get('PORT', 'not set')}")
-        logger.info(f"🔌 Listening on port: {port}")
-        logger.info(f"🌐 Health check: http://0.0.0.0:{port}/health")
-        logger.info("=" * 50)
-        
-        # Ждём сигнала завершения
-        await shutdown_event.wait()
-        
-        # Останавливаем сервер при завершении
-        logger.info("🛑 Stopping web server...")
-        await runner.cleanup()
-        logger.info("✅ Web server stopped")
-        
-    except asyncio.CancelledError:
-        logger.info("Web server task cancelled")
-    except Exception as e:
-        logger.error(f"❌ Error in web server: {e}")
-
-
-# ============================================================================
-# НОВО: СТРИМИНГ ОТВЕТОВ В ДИАЛОГОВОМ РЕЖИМЕ (ИЗ 6.4)
+# СТРИМИНГ ОТВЕТОВ В ДИАЛОГОВОМ РЕЖИМЕ
 # ============================================================================
 
 async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: int, question: str):
@@ -695,6 +738,10 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
     edit_counter = 0
     
     try:
+        if is_shutting_down:
+            await placeholder.edit_text("🛑 Бот останавливается, попробуйте позже.")
+            return
+        
         # Проверяем наличие Groq клиентов
         if not groq_clients:
             await placeholder.edit_text("❌ Ошибка: нет доступных Groq клиентов")
@@ -713,7 +760,7 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
             await placeholder.edit_text("❌ Текст документа пуст")
             return
         
-        # НОВО: Сохраняем в document_dialogues для processors (если там используется)
+        # Сохраняем в document_dialogues для processors
         if not hasattr(processors, 'document_dialogues'):
             processors.document_dialogues = {}
         
@@ -732,13 +779,12 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
             question,
             groq_clients
         ):
-            if chunk:
+            if chunk and not is_shutting_down:
                 accumulated += chunk
                 
-                # Обновляем сообщение при накоплении (каждые ~30 символов)
+                # Обновляем сообщение при накоплении
                 if len(accumulated) - last_edit_length > 30:
                     try:
-                        # Добавляем мигающий курсор для эффекта печати
                         display_text = accumulated + "▌"
                         if len(display_text) > 4096:
                             display_text = display_text[:4093] + "..."
@@ -751,6 +797,9 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
                     except Exception as edit_error:
                         logger.error(f"Ошибка редактирования: {edit_error}")
                     last_edit_length = len(accumulated)
+        
+        if is_shutting_down:
+            return
         
         # Финальный текст без курсора
         final_text = accumulated if accumulated else "❌ Пустой ответ"
@@ -775,12 +824,19 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
                 "timestamp": datetime.now().isoformat()
             })
         
-    except Exception as e:
-        logger.error(f"Ошибка стриминга: {e}", exc_info=True)
+    except asyncio.CancelledError:
+        logger.info("Streaming cancelled")
         try:
-            await placeholder.edit_text(f"❌ Ошибка при генерации ответа: {str(e)[:200]}")
+            await placeholder.edit_text("🛑 Генерация прервана.")
         except:
             pass
+    except Exception as e:
+        logger.error(f"Ошибка стриминга: {e}", exc_info=True)
+        if not is_shutting_down:
+            try:
+                await placeholder.edit_text(f"❌ Ошибка при генерации ответа: {str(e)[:200]}")
+            except:
+                pass
 
 
 # ============================================================================
@@ -790,6 +846,7 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     """Команда /start"""
+    stats["processed_messages"] += 1
     await message.answer(
         config.START_MESSAGE,
         parse_mode="HTML",
@@ -800,6 +857,7 @@ async def start_handler(message: types.Message):
 @dp.message(Command("help"))
 async def help_handler(message: types.Message):
     """Команда /help"""
+    stats["processed_messages"] += 1
     await message.answer(
         config.HELP_MESSAGE,
         parse_mode="HTML"
@@ -809,6 +867,7 @@ async def help_handler(message: types.Message):
 @dp.message(Command("status"))
 async def status_handler(message: types.Message):
     """Команда /status"""
+    stats["processed_messages"] += 1
     
     docx_status = "✅"
     try:
@@ -827,8 +886,8 @@ async def status_handler(message: types.Message):
         temp_files=temp_files
     )
     
-    # НОВО: Добавляем информацию о диалогах
     status_text += f"\n\n💬 Активных диалогов: {len(active_dialogs)}"
+    status_text += f"\n📊 Всего обработано сообщений: {stats['processed_messages']}"
     
     await message.answer(status_text, parse_mode="HTML")
 
@@ -836,6 +895,7 @@ async def status_handler(message: types.Message):
 @dp.message(Command("exit"))
 async def exit_dialog_handler(message: types.Message):
     """Команда для выхода из диалогового режима"""
+    stats["processed_messages"] += 1
     user_id = message.from_user.id
     
     if user_id in active_dialogs:
@@ -848,11 +908,14 @@ async def exit_dialog_handler(message: types.Message):
 @dp.message(F.voice)
 async def voice_handler(message: types.Message):
     """Обработка голосовых сообщений и кружочков"""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+        
     user_id = message.from_user.id
     
     # Если пользователь в диалоговом режиме, обрабатываем как вопрос
     if user_id in active_dialogs:
-        # Здесь можно добавить транскрибацию голоса в текст и обработку как вопроса
         await message.answer("⏳ Голосовые вопросы пока не поддерживаются. Напишите текст.")
         return
     
@@ -915,6 +978,10 @@ async def voice_handler(message: types.Message):
 @dp.message(F.video_note)
 async def video_note_handler(message: types.Message):
     """Обработка кружочков (video_note)"""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+        
     user_id = message.from_user.id
 
     if user_id in active_dialogs:
@@ -929,7 +996,6 @@ async def video_note_handler(message: types.Message):
         buffer = io.BytesIO()
         await bot.download_file(file_info.file_path, buffer)
 
-        # Кружочки приходят как mp4 — транскрибируем как видеофайл
         original_text = await processors.process_video_file(
             buffer.getvalue(), "video_note.mp4", groq_clients, with_timecodes=False
         )
@@ -983,9 +1049,12 @@ async def video_note_handler(message: types.Message):
 @dp.message(F.audio)
 async def audio_handler(message: types.Message):
     """Обработка аудиофайлов"""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+        
     user_id = message.from_user.id
     
-    # Если пользователь в диалоговом режиме, выходим из него
     if user_id in active_dialogs:
         del active_dialogs[user_id]
     
@@ -1048,16 +1117,17 @@ async def audio_handler(message: types.Message):
 @dp.message(F.text)
 async def text_handler(message: types.Message):
     """Обработка текстовых сообщений и ссылок"""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+        
     user_id = message.from_user.id
     original_text = message.text.strip()
     
-    # НОВО: Проверяем, находится ли пользователь в режиме диалога
+    # Проверяем, находится ли пользователь в режиме диалога
     if user_id in active_dialogs:
-        # Получаем ID сообщения с документом
         msg_id = active_dialogs[user_id]
         question = message.text
-        
-        # Обработка стримингового ответа
         await handle_streaming_answer(message, user_id, msg_id, question)
         return
     
@@ -1132,9 +1202,12 @@ async def text_handler(message: types.Message):
 @dp.message(F.photo | F.document | F.video)
 async def file_handler(message: types.Message):
     """Обработка файлов и изображений"""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+        
     user_id = message.from_user.id
     
-    # Если пользователь в диалоговом режиме, выходим из него
     if user_id in active_dialogs:
         del active_dialogs[user_id]
     
@@ -1229,13 +1302,17 @@ async def file_handler(message: types.Message):
 
 
 # ============================================================================
-# НОВО: ДИАЛОГОВЫЕ CALLBACK ОБРАБОТЧИКИ (ИЗ 6.4)
+# ДИАЛОГОВЫЕ CALLBACK ОБРАБОТЧИКИ
 # ============================================================================
 
 @dp.callback_query(F.data.startswith("dialog_start_"))
 async def dialog_start_callback(callback: types.CallbackQuery):
     """Начало диалога с документом"""
     await callback.answer()
+    
+    if is_shutting_down:
+        await callback.message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
     
     parts = callback.data.split("_")
     if len(parts) < 4:
@@ -1304,10 +1381,8 @@ async def dialog_exit_callback(callback: types.CallbackQuery):
         msg_id = active_dialogs[user_id]
         del active_dialogs[user_id]
         
-        # Очищаем историю диалога если нужно
         if hasattr(processors, 'document_dialogues') and user_id in processors.document_dialogues:
             if msg_id in processors.document_dialogues[user_id]:
-                # Сохраняем последние 5 сообщений для контекста, остальное чистим
                 if len(processors.document_dialogues[user_id][msg_id].get("history", [])) > 10:
                     processors.document_dialogues[user_id][msg_id]["history"] = \
                         processors.document_dialogues[user_id][msg_id]["history"][-10:]
@@ -1316,12 +1391,16 @@ async def dialog_exit_callback(callback: types.CallbackQuery):
 
 
 # ============================================================================
-# CALLBACK ОБРАБОТЧИКИ (ИЗ 3.1, АДАПТИРОВАНЫ)
+# ОБРАБОТЧИКИ РЕЖИМОВ
 # ============================================================================
 
 @dp.callback_query(F.data.startswith("process_"))
 async def process_callback(callback: types.CallbackQuery):
     """Начальная обработка текста"""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+        
     await callback.answer()
     
     try:
@@ -1386,12 +1465,17 @@ async def process_callback(callback: types.CallbackQuery):
             
     except Exception as e:
         logger.error(f"Process callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка обработки")
+        if not is_shutting_down:
+            await callback.message.edit_text("❌ Ошибка обработки")
 
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def mode_callback(callback: types.CallbackQuery):
-    """Обработка переключения режимов (альтернативный формат)"""
+    """Обработка переключения режимов"""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+        
     await callback.answer()
     
     try:
@@ -1437,12 +1521,17 @@ async def mode_callback(callback: types.CallbackQuery):
         
     except Exception as e:
         logger.error(f"Mode callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка переключения")
+        if not is_shutting_down:
+            await callback.message.edit_text("❌ Ошибка переключения")
 
 
 @dp.callback_query(F.data.startswith("switch_"))
 async def switch_callback(callback: types.CallbackQuery):
     """Переключение между режимами"""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+        
     await callback.answer()
     
     try:
@@ -1512,12 +1601,17 @@ async def switch_callback(callback: types.CallbackQuery):
             
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
-        await callback.message.edit_text("❌ Ошибка переключения")
+        if not is_shutting_down:
+            await callback.message.edit_text("❌ Ошибка переключения")
 
 
 @dp.callback_query(F.data.startswith("export_"))
 async def export_callback(callback: types.CallbackQuery):
     """Экспорт в файл"""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+        
     await callback.answer()
     
     try:
@@ -1577,61 +1671,26 @@ async def export_callback(callback: types.CallbackQuery):
         
     except Exception as e:
         logger.error(f"Export callback error: {e}")
-        await callback.message.answer("❌ Ошибка создания файла")
+        if not is_shutting_down:
+            await callback.message.answer("❌ Ошибка создания файла")
 
 
 # ============================================================================
-# ЗАПУСК БОТА
+# ТОЧКА ВХОДА
 # ============================================================================
-
-async def main():
-    logger.info("🚀 Bot v3.2 starting process...")
-    
-    # Регистрируем обработчик SIGTERM
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    logger.info("✅ SIGTERM handler registered")
-    
-    # Инициализация клиентов
-    init_groq_clients()
-    processors.vision_processor.init_clients(groq_clients)
-    
-    # Инициализируем хранилище диалогов в processors если его нет
-    if not hasattr(processors, 'document_dialogues'):
-        processors.document_dialogues = {}
-    
-    # Запускаем фоновые задачи
-    web_server_task = asyncio.create_task(start_web_server())
-    cleanup_task = asyncio.create_task(cleanup_old_contexts())
-    temp_cleanup_task = asyncio.create_task(cleanup_temp_files())
-    
-    logger.info("✅ Starting polling...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    try:
-        # Запускаем polling (startup и shutdown зарегистрированы ранее)
-        await dp.start_polling(bot)
-    except asyncio.CancelledError:
-        logger.info("Polling cancelled")
-    finally:
-        # Отменяем фоновые задачи
-        web_server_task.cancel()
-        cleanup_task.cancel()
-        temp_cleanup_task.cancel()
-        
-        # Ждём завершения задач
-        await asyncio.gather(
-            web_server_task, 
-            cleanup_task, 
-            temp_cleanup_task,
-            return_exceptions=True
-        )
-        
-        logger.info("✅ Bot stopped gracefully")
-
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        port = int(os.environ.get("PORT", 8080))
+        logger.info(f"🚀 Starting server on port {port}")
+        uvicorn.run(
+            "bot:app",
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            workers=1,  # Важно: только 1 воркер для aiogram
+            loop="asyncio"
+        )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
