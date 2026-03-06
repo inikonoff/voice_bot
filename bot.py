@@ -993,7 +993,7 @@ async def text_handler(message: types.Message):
         processing_users.discard(user_id)
 
 
-@dp.message(F.photo | F.document | F.video)
+@dp.message(F.photo | F.document)
 async def file_handler(message: types.Message):
     if is_shutting_down:
         await message.answer("🛑 Бот останавливается, попробуйте позже.")
@@ -1019,9 +1019,6 @@ async def file_handler(message: types.Message):
         elif message.document:
             file_info = await bot.get_file(message.document.file_id)
             filename = message.document.file_name or f"file_{file_info.file_unique_id}"
-        elif message.video:
-            file_info = await bot.get_file(message.video.file_id)
-            filename = message.video.file_name or f"video_{file_info.file_unique_id}.mp4"
 
         file_buffer = io.BytesIO()
         await bot.download_file(file_info.file_path, file_buffer)
@@ -1036,8 +1033,6 @@ async def file_handler(message: types.Message):
         # Прогресс-сообщение для PDF
         if file_ext == 'pdf':
             await msg.edit_text(config.MSG_PROCESSING_PDF)
-        elif file_ext in config.VIDEO_SUPPORTED_FORMATS:
-            await msg.edit_text("🔊 Извлекаю звук из видео...")
         else:
             await msg.edit_text("🔍 Извлекаю текст...")
 
@@ -1063,8 +1058,6 @@ async def file_handler(message: types.Message):
         source_type = "file"
         if file_ext == "pdf":
             source_type = "pdf"
-        elif file_ext in config.VIDEO_SUPPORTED_FORMATS:
-            source_type = "video_file"
 
         asyncio.create_task(_bg_save_transcript(user_id, source_type, original_text, msg.message_id, message))
 
@@ -1077,7 +1070,7 @@ async def file_handler(message: types.Message):
             modes_text += ", 📊 Саммари"
 
         is_image = filename.startswith("photo_") or file_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
-        file_type_label = "видео" if file_ext in config.VIDEO_SUPPORTED_FORMATS else "изображения" if is_image else "файла"
+        file_type_label = "изображения" if is_image else "файла"
 
         await msg.edit_text(
             f"✅ <b>Извлечённый текст из {file_type_label}:</b>\n\n"
