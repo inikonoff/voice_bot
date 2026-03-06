@@ -3,15 +3,18 @@ python-dotenv
 aiohttp
 openai
 pdfplumber
-yt-dlp
 reportlab
 python-docx
 
-# Добавленные зависимости
-fastapi>=0.104.0              # Для веб-сервера и health checks
-uvicorn[standard]>=0.24.0     # ASGI сервер для FastAPI
-psutil>=5.9.0                 # Для мониторинга ресурсов (опционально)
-pytesseract>=0.3.10            # OCR для изображений
-Pillow>=10.0.0                 # Обработка изображений
-ffmpeg-python>=0.2.0           # Для работы с видео/аудио
-requests>=2.31.0                # Для HTTP запросов
+# Веб-сервер
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Мониторинг (опционально)
+psutil>=5.9.0
+
+# Обработка изображений
+Pillow>=10.0.0
+
+# Supabase (опционально — если не нужна БД, можно не устанавливать, бот работает без неё)
+supabase>=2.0.0
