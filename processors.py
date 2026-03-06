@@ -1,7 +1,7 @@
 # processors.py
 """
-Обработчики текста: OCR, транскрибация, видео (локальное), коррекция, саммари, диалог, экспорт
-Версия 5.0 — убраны видеоплатформы, добавлен DOCX, исправлен PDF (asyncio.to_thread)
+Обработчики текста: OCR, транскрибация, кружочки, коррекция, саммари, диалог, экспорт
+Версия 5.1 — убрана обработка видеофайлов (только кружочки), добавлен DOCX
 """
 
 import io
@@ -481,7 +481,7 @@ async def process_video_file(video_bytes: bytes, filename: str, groq_clients: li
             f.write(video_bytes)
 
         duration = await video_processor.check_video_duration(temp_video_path)
-        if duration and duration > config.VIDEO_MAX_DURATION:
+        if duration and duration > 3600:
             os.remove(temp_video_path)
             return config.ERROR_VIDEO_TOO_LONG
 
@@ -586,9 +586,6 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
     if mime_type and mime_type.startswith('image/') or file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
         vision_processor.init_clients(groq_clients)
         return await vision_processor.extract_text(file_bytes)
-
-    if file_ext in config.VIDEO_SUPPORTED_FORMATS:
-        return await process_video_file(file_bytes, filename, groq_clients)
 
     if mime_type == 'application/pdf' or file_ext == 'pdf':
         return await extract_text_from_pdf(file_bytes)
