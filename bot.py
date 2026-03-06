@@ -28,6 +28,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     FSInputFile,
     TelegramObject,
+    BotCommand,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
@@ -198,6 +199,17 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Webhook cleared")
     except Exception as e:
         logger.error(f"❌ Error clearing webhook: {e}")
+
+    # Меню команд (кнопка «Меню» в интерфейсе Telegram)
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start",   description="👋 О боте"),
+            BotCommand(command="help",    description="📋 Инструкция"),
+            BotCommand(command="history", description="📜 История обработок"),
+        ])
+        logger.info("✅ Bot commands menu set")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not set bot commands: {e}")
 
     # Запуск polling
     polling_task = asyncio.create_task(run_polling())
@@ -422,7 +434,7 @@ def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None
 
     if current_mode and current_mode in ("basic", "premium"):
         builder.row(
-            InlineKeyboardButton(text="🧠 Разобрать по косточкам", callback_data=f"breakdown_{msg_id}")
+            InlineKeyboardButton(text="✏️ Работа над ошибками", callback_data=f"breakdown_{msg_id}")
         )
 
     if current_mode:
@@ -476,10 +488,10 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
             callback_data=f"dialog_start_{user_id}_{msg_id}"
         ))
 
-    # Кнопка "Разобрать по косточкам" — только для basic и premium
+    # Кнопка "Работа над ошибками" — только для basic и premium
     if current in ("basic", "premium"):
         builder.row(InlineKeyboardButton(
-            text="🧠 Разобрать по косточкам",
+            text="✏️ Работа над ошибками",
             callback_data=f"breakdown_{msg_id}"
         ))
 
@@ -667,7 +679,6 @@ async def status_handler(message: types.Message):
         temp_files=temp_files,
     )
     status_text += f"\n\n💬 Активных диалогов: {len(active_dialogs)}"
-    status_text += f"\n📊 Обработано сообщений: {stats['processed_messages']}"
     await message.answer(status_text, parse_mode="HTML")
 
 
@@ -689,7 +700,7 @@ async def history_handler(message: types.Message):
         "voice": "🎙️", "audio": "🎵", "video_note": "🎥",
         "file": "📄", "text": "📝"
     }
-    lines = ["📜 <b>Последние 10 обработок:</b>\n"]
+    lines = [f"📊 Обработано сообщений: {stats['processed_messages']}\n\n📜 <b>Последние 10 обработок:</b>\n"]
     for i, rec in enumerate(records, 1):
         emoji = source_emoji.get(rec.get("source_type", ""), "📌")
         preview = (rec.get("original_text") or "")[:80].replace("\n", " ")
