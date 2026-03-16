@@ -1,27 +1,23 @@
-# Telegram Bot
-aiogram==3.20.0
-
-# Web Server
-fastapi
-uvicorn
-
-# Groq / OpenAI-compatible client
-openai
-
-# Environment
+aiogram>=3.0.0
 python-dotenv
-
-# PDF reading
+aiohttp
+openai
 pdfplumber
-
-# PDF writing (export)
 reportlab
-
-# DOCX reading & writing
 python-docx
 
-# Database (optional — bot works without it)
-supabase
+# Веб-сервер
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
 
-# Monitoring (optional — used for RAM metrics in /status)
-psutil
+# Мониторинг (опционально)
+psutil>=5.9.0
+
+# Обработка изображений
+Pillow>=10.0.0
+
+# Supabase (опционально — если не нужна БД, можно не устанавливать, бот работает без неё)
+supabase>=2.0.0
+httpx>=0.27.0
+langdetect>=1.0.9
+youtube-transcript-api>=0.6.0

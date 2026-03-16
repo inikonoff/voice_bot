@@ -495,6 +495,20 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
             callback_data=f"breakdown_{msg_id}"
         ))
 
+    # Кнопка перевода — если оригинал не на русском
+    original = ctx_data.get("original", "")
+    if original and processors.is_non_russian(original):
+        if ctx_data.get("is_translated", False):
+            builder.row(InlineKeyboardButton(
+                text="↩️ Оригинал",
+                callback_data=f"translate_back_{user_id}_{msg_id}"
+            ))
+        else:
+            builder.row(InlineKeyboardButton(
+                text="🌐 Перевести на русский",
+                callback_data=f"translate_{user_id}_{msg_id}"
+            ))
+
     if current:
         builder.row(
             InlineKeyboardButton(text="📄 TXT", callback_data=f"export_{user_id}_{current}_{msg_id}_txt"),
@@ -925,6 +939,163 @@ async def audio_handler(message: types.Message):
     except Exception as e:
         logger.error(f"Audio handler error: {e}")
         await msg.edit_text("❌ Ошибка обработки аудиофайла")
+    finally:
+        processing_users.discard(user_id)
+
+
+@dp.message(F.text.regexp(r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+'))
+async def youtube_handler(message: types.Message):
+    """Обработка YouTube-ссылок: субтитры → диалог + саммари."""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+
+    user_id = message.from_user.id
+
+    if user_id in active_dialogs:
+        await message.answer("⏳ Сначала выйдите из режима вопросов: /exit")
+        return
+
+    if user_id in processing_users:
+        await message.answer(config.ERROR_BUSY)
+        return
+
+    url = message.text.strip()
+    video_id = processors.extract_youtube_video_id(url)
+    if not video_id:
+        await message.answer("❌ Не удалось распознать YouTube-ссылку")
+        return
+
+    processing_users.add(user_id)
+    msg = await message.answer(config.MSG_FETCHING_SUBTITLES)
+
+    try:
+        result = await processors.fetch_youtube_subtitles(video_id)
+
+        if result["error"]:
+            await msg.edit_text(result["error"])
+            return
+
+        segments = result["raw"]
+        lang = result["lang"]
+        raw_text = processors._segments_to_plain_text(segments)
+        timecoded_text = processors._segments_to_timecoded(segments)
+
+        await msg.edit_text(config.MSG_FORMATTING_SUBTITLES)
+
+        # Форматируем в диалог через LLM (убираем рекламу, группируем)
+        dialogue_text = await processors.format_subtitles_as_dialogue(raw_text, groq_clients)
+
+        # Делаем саммари параллельно — уже есть готовый dialogue_text
+        await msg.edit_text("📊 Делаю саммари...")
+        summary = await processors.summarize_text(dialogue_text, groq_clients)
+        if summary.startswith("❌"):
+            summary = dialogue_text[:500] + "..."
+
+        # Сохраняем оба варианта в контекст
+        available_modes = ["basic", "premium", "summary"]
+        save_to_history(user_id, msg.message_id, dialogue_text, mode="summary", available_modes=available_modes)
+
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            ctx = user_context[user_id][msg.message_id]
+            ctx["type"] = "youtube"
+            ctx["chat_id"] = message.chat.id
+            ctx["original"] = dialogue_text
+            ctx["timecoded"] = timecoded_text   # сырой с таймкодами, для экспорта
+            ctx["cached_results"]["summary"] = summary
+            ctx["yt_lang"] = lang
+            ctx["yt_url"] = url
+
+        asyncio.create_task(_bg_save_transcript(user_id, "youtube", dialogue_text, msg.message_id, message))
+
+        lang_flag = "🇷🇺" if lang == "ru" else "🌐"
+        display = summary if len(summary) <= 4000 else summary[:3997] + "..."
+
+        await msg.edit_text(
+            f"📺 <b>YouTube</b> {lang_flag}\n"
+            f"<a href='{url}'>youtu.be/{video_id}</a>\n\n"
+            f"{display}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=create_switch_keyboard(user_id, msg.message_id)
+        )
+        try:
+            await message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"YouTube handler error: {e}")
+        await msg.edit_text(f"❌ Ошибка обработки YouTube: {str(e)[:100]}")
+    finally:
+        processing_users.discard(user_id)
+
+
+@dp.message(F.text.regexp(r'https?://\S+'))
+async def url_handler(message: types.Message):
+    """Обработка ссылок: скрейпим страницу и сразу показываем саммари."""
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+
+    user_id = message.from_user.id
+
+    if user_id in active_dialogs:
+        await message.answer("⏳ Сначала выйдите из режима вопросов: /exit")
+        return
+
+    if user_id in processing_users:
+        await message.answer(config.ERROR_BUSY)
+        return
+
+    url = message.text.strip()
+    processing_users.add(user_id)
+    msg = await message.answer(config.MSG_FETCHING_URL)
+
+    try:
+        page_text = await processors.fetch_url_text(url)
+
+        if page_text.startswith("❌"):
+            await msg.edit_text(page_text)
+            return
+
+        await msg.edit_text("📊 Делаю саммари страницы...")
+        summary = await processors.summarize_text(page_text, groq_clients)
+
+        # Если текст слишком короткий для саммари — показываем как есть
+        if summary.startswith("❌"):
+            summary = page_text
+
+        available_modes = processors.get_available_modes(page_text)
+        if "summary" not in available_modes:
+            available_modes.append("summary")
+
+        save_to_history(user_id, msg.message_id, page_text, mode="summary", available_modes=available_modes)
+
+        if user_id in user_context and msg.message_id in user_context[user_id]:
+            user_context[user_id][msg.message_id]["type"] = "url"
+            user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
+            user_context[user_id][msg.message_id]["original"] = page_text
+            user_context[user_id][msg.message_id]["cached_results"]["summary"] = summary
+
+        asyncio.create_task(_bg_save_transcript(user_id, "url", page_text, msg.message_id, message))
+
+        domain = url.split("/")[2] if len(url.split("/")) > 2 else url
+        display = summary if len(summary) <= 4000 else summary[:3997] + "..."
+
+        await msg.edit_text(
+            f"🌐 <b>{domain}</b>\n\n{display}",
+            parse_mode="HTML",
+            reply_markup=create_switch_keyboard(user_id, msg.message_id)
+        )
+        try:
+            await message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.error(f"URL handler error: {e}")
+        await msg.edit_text(f"❌ Ошибка обработки ссылки: {str(e)[:100]}")
     finally:
         processing_users.discard(user_id)
 
@@ -1421,6 +1592,86 @@ async def export_callback(callback: types.CallbackQuery):
         if not is_shutting_down:
             await callback.message.answer("❌ Ошибка создания файла")
 
+
+
+# ============================================================================
+# TRANSLATE CALLBACKS
+# ============================================================================
+
+@dp.callback_query(F.data.startswith("translate_back_"))
+async def translate_back_callback(callback: types.CallbackQuery):
+    """Возврат к оригинальному тексту после перевода."""
+    await callback.answer()
+    parts = callback.data.split("_")
+    if len(parts) < 4:
+        return
+    user_id = int(parts[2])
+    msg_id = int(parts[3])
+
+    if callback.from_user.id != user_id:
+        return
+
+    ctx_data = user_context.get(user_id, {}).get(msg_id)
+    if not ctx_data:
+        await callback.answer("❌ Данные устарели.", show_alert=True)
+        return
+
+    current_mode = ctx_data.get("mode", "basic")
+    original_result = ctx_data["cached_results"].get(current_mode) or ctx_data.get("original", "")
+    ctx_data["is_translated"] = False
+
+    display = original_result if len(original_result) <= 4000 else original_result[:3997] + "..."
+    await callback.message.edit_text(display, reply_markup=create_switch_keyboard(user_id, msg_id))
+
+
+@dp.callback_query(F.data.regexp(r'^translate_\d+_\d+$'))
+async def translate_callback(callback: types.CallbackQuery):
+    """Перевод текущего варианта на русский язык."""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+
+    await callback.answer()
+
+    try:
+        parts = callback.data.split("_")
+        if len(parts) < 3:
+            return
+        user_id = int(parts[1])
+        msg_id = int(parts[2])
+
+        if callback.from_user.id != user_id:
+            return
+
+        ctx_data = user_context.get(user_id, {}).get(msg_id)
+        if not ctx_data:
+            await callback.answer("❌ Данные устарели.", show_alert=True)
+            return
+
+        current_mode = ctx_data.get("mode", "basic")
+        text_to_translate = ctx_data["cached_results"].get(current_mode) or ctx_data.get("original", "")
+
+        if not text_to_translate:
+            await callback.answer("⚠️ Нет текста для перевода", show_alert=True)
+            return
+
+        await callback.message.edit_text(config.MSG_TRANSLATING)
+
+        translated = await processors.translate_to_russian(text_to_translate, groq_clients)
+
+        if translated.startswith("❌"):
+            await callback.message.answer(translated)
+            return
+
+        ctx_data["is_translated"] = True
+
+        display = translated if len(translated) <= 4000 else translated[:3997] + "..."
+        await callback.message.edit_text(display, reply_markup=create_switch_keyboard(user_id, msg_id))
+
+    except Exception as e:
+        logger.error(f"Translate callback error: {e}")
+        if not is_shutting_down:
+            await callback.message.answer("❌ Ошибка перевода")
 
 
 # ============================================================================

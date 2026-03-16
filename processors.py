@@ -321,6 +321,278 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 
 
 # ============================================================================
+# YOUTUBE СУБТИТРЫ
+# ============================================================================
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    YT_TRANSCRIPT_AVAILABLE = True
+except ImportError:
+    YT_TRANSCRIPT_AVAILABLE = False
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    """Извлекает video_id из любого формата YouTube-ссылки."""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def is_youtube_url(url: str) -> bool:
+    return bool(extract_youtube_video_id(url.strip()))
+
+
+def _format_yt_timecode(seconds: float) -> str:
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"[{h:02d}:{m:02d}:{s:02d}]"
+    return f"[{m:02d}:{s:02d}]"
+
+
+async def fetch_youtube_subtitles(video_id: str) -> dict:
+    """
+    Загружает субтитры YouTube видео.
+    Возвращает dict:
+      - 'raw': список сегментов [{'start': float, 'text': str}, ...]
+      - 'lang': код языка
+      - 'error': строка с ❌ если субтитры недоступны
+    """
+    if not YT_TRANSCRIPT_AVAILABLE:
+        return {"error": "❌ Для YouTube субтитров требуется установить youtube-transcript-api"}
+
+    def _fetch():
+        # Приоритет: ru → en → любые доступные
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        for lang in ("ru", "en"):
+            try:
+                t = transcript_list.find_transcript([lang])
+                return t.fetch(), lang
+            except Exception:
+                pass
+
+        # Берём первый доступный
+        try:
+            t = transcript_list.find_manually_created_transcript(
+                [t.language_code for t in transcript_list]
+            )
+            return t.fetch(), t.language_code
+        except Exception:
+            pass
+
+        # Автогенерированные
+        try:
+            t = transcript_list.find_generated_transcript(
+                [t.language_code for t in transcript_list]
+            )
+            return t.fetch(), t.language_code
+        except Exception:
+            raise NoTranscriptFound(video_id, [], {})
+
+    try:
+        segments, lang = await asyncio.to_thread(_fetch)
+        return {"raw": segments, "lang": lang, "error": None}
+    except TranscriptsDisabled:
+        return {"error": "❌ Субтитры отключены для этого видео"}
+    except NoTranscriptFound:
+        return {"error": "❌ Субтитры недоступны для этого видео"}
+    except Exception as e:
+        logger.error(f"YouTube subtitles error: {e}")
+        return {"error": f"❌ Не удалось получить субтитры: {str(e)[:100]}"}
+
+
+def _segments_to_plain_text(segments: list) -> str:
+    """Субтитры → сплошной текст для передачи в LLM."""
+    return " ".join(s.get("text", "").replace("\n", " ").strip() for s in segments if s.get("text", "").strip())
+
+
+def _segments_to_timecoded(segments: list) -> str:
+    """Субтитры → текст с таймкодами."""
+    lines = []
+    for seg in segments:
+        text = seg.get("text", "").replace("\n", " ").strip()
+        if text:
+            tc = _format_yt_timecode(seg.get("start", 0))
+            lines.append(f"{tc} {text}")
+    return "\n".join(lines)
+
+
+async def format_subtitles_as_dialogue(raw_text: str, groq_clients: list) -> str:
+    """
+    LLM форматирует субтитры в читаемый диалог:
+    - убирает рекламные интеграции
+    - группирует реплики в абзацы по смыслу
+    - сохраняет живую речь
+    """
+    truncated = raw_text[:12000] + ("... [обрезано]" if len(raw_text) > 12000 else "")
+
+    prompt = f"""Перед тобой субтитры видео — сплошной текст из кусочков речи.
+
+ЗАДАЧА:
+Отформатируй в читаемый текст диалога/монолога:
+
+1. Убери рекламные интеграции — фрагменты где говорящий явно рекламирует продукт, сервис или просит подписаться/поставить лайк. Замени их на: [реклама вырезана]
+2. Объедини короткие обрывки в связные абзацы по смыслу (смена темы = новый абзац)
+3. Исправь только явные ошибки распознавания — не редактируй стиль и речь
+4. Сохрани все имена, факты, цифры
+5. Если в тексте чётко слышно смену говорящего (по контексту) — можешь обозначить абзац с новой строки, но не придумывай имена
+
+ФОРМАТ: только готовый текст, без предисловий
+
+Субтитры:
+{truncated}"""
+
+    async def fmt(client):
+        response = await client.chat.completions.create(
+            model=config.GROQ_MODELS["premium"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+
+    try:
+        return await _make_groq_request(groq_clients, fmt)
+    except Exception as e:
+        logger.error(f"Subtitle formatting error: {e}")
+        # Fallback — возвращаем сырой текст
+        return raw_text
+
+
+# ============================================================================
+# URL SCRAPING
+# ============================================================================
+
+def is_url(text: str) -> bool:
+    """Проверяет, является ли текст обычным URL (не YouTube)."""
+    text = text.strip()
+    if not (text.startswith(("http://", "https://")) and " " not in text and len(text) > 10):
+        return False
+    return not is_youtube_url(text)
+
+
+async def fetch_url_text(url: str) -> str:
+    """Скачивает страницу по URL и извлекает текст."""
+    try:
+        import httpx
+        from html.parser import HTMLParser
+
+        class _TextExtractor(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self._text = []
+                self._skip = False
+
+            def handle_starttag(self, tag, attrs):
+                if tag in ("script", "style", "nav", "footer", "header"):
+                    self._skip = True
+
+            def handle_endtag(self, tag):
+                if tag in ("script", "style", "nav", "footer", "header"):
+                    self._skip = False
+
+            def handle_data(self, data):
+                if not self._skip:
+                    stripped = data.strip()
+                    if stripped:
+                        self._text.append(stripped)
+
+            def get_text(self):
+                return "\n".join(self._text)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru,en;q=0.9",
+        }
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+
+        parser = _TextExtractor()
+        parser.feed(response.text)
+        text = parser.get_text()
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        text = "\n".join(lines)
+
+        if not text or len(text) < 50:
+            return "❌ Не удалось извлечь текст со страницы. Возможно, сайт защищён от парсинга."
+
+        if len(text) > 30000:
+            text = text[:30000] + "\n... [страница обрезана]"
+
+        logger.info(f"Fetched URL {url}: {len(text)} chars")
+        return text
+
+    except ImportError:
+        return "❌ Для обработки ссылок требуется установить httpx"
+    except Exception as e:
+        logger.error(f"URL fetch error: {e}")
+        return f"❌ Не удалось загрузить страницу: {str(e)[:100]}"
+
+
+# ============================================================================
+# ОПРЕДЕЛЕНИЕ ЯЗЫКА
+# ============================================================================
+
+def detect_language(text: str) -> str:
+    """Определяет язык текста. Возвращает код ('ru', 'en', ...) или 'unknown'."""
+    try:
+        from langdetect import detect
+        return detect(text[:1000])
+    except Exception:
+        return "unknown"
+
+
+def is_non_russian(text: str) -> bool:
+    """Возвращает True если текст явно не на русском."""
+    return detect_language(text) not in ("ru", "unknown")
+
+
+# ============================================================================
+# ПЕРЕВОД
+# ============================================================================
+
+async def translate_to_russian(text: str, groq_clients: list) -> str:
+    """Переводит текст на русский язык."""
+    if not text.strip():
+        return config.ERROR_EMPTY_TEXT
+
+    text_to_translate = _truncate_text_for_model(text, "premium")
+
+    prompt = (
+        "Переведи следующий текст на русский язык.\n"
+        "Сохрани структуру, абзацы и форматирование оригинала.\n"
+        "Переводи точно, без сокращений и добавлений.\n"
+        "Выведи ТОЛЬКО перевод, без предисловий и комментариев.\n\n"
+        f"Текст:\n{text_to_translate}"
+    )
+
+    async def translate(client):
+        response = await client.chat.completions.create(
+            model=config.GROQ_MODELS["premium"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        return response.choices[0].message.content.strip()
+
+    try:
+        return await _make_groq_request(groq_clients, translate)
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return f"❌ Ошибка перевода: {str(e)[:100]}"
+
+
+# ============================================================================
 # РАБОТА НАД ОШИБКАМИ
 # ============================================================================
 
@@ -779,6 +1051,17 @@ __all__ = [
     'save_to_pdf',
     'save_to_docx',
     'explain_corrections',
+    'breakdown_corrections',
+    'is_url',
+    'fetch_url_text',
+    'is_youtube_url',
+    'extract_youtube_video_id',
+    'fetch_youtube_subtitles',
+    'format_subtitles_as_dialogue',
+    'YT_TRANSCRIPT_AVAILABLE',
+    'detect_language',
+    'is_non_russian',
+    'translate_to_russian',
     'PDFPLUMBER_AVAILABLE',
     'DOCX_AVAILABLE',
 ]
