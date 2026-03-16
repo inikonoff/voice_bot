@@ -325,7 +325,7 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 # ============================================================================
 
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    from youtube_transcript_api import YouTubeTranscriptApi
     YT_TRANSCRIPT_AVAILABLE = True
 except ImportError:
     YT_TRANSCRIPT_AVAILABLE = False
@@ -360,53 +360,50 @@ def _format_yt_timecode(seconds: float) -> str:
 async def fetch_youtube_subtitles(video_id: str) -> dict:
     """
     Загружает субтитры YouTube видео.
-    Возвращает dict:
-      - 'raw': список сегментов [{'start': float, 'text': str}, ...]
-      - 'lang': код языка
-      - 'error': строка с ❌ если субтитры недоступны
+    Совместимо с youtube-transcript-api >= 1.0
     """
     if not YT_TRANSCRIPT_AVAILABLE:
         return {"error": "❌ Для YouTube субтитров требуется установить youtube-transcript-api"}
 
     def _fetch():
-        # Приоритет: ru → en → любые доступные
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Новый API (>= 1.0): FetchedTranscriptSnippet объекты
+        fetched = YouTubeTranscriptApi.get_transcript(
+            video_id,
+            languages=["ru", "en"],  # приоритет: сначала ru, потом en
+        )
+        return fetched, "ru"  # язык определим по содержимому
 
-        for lang in ("ru", "en"):
-            try:
-                t = transcript_list.find_transcript([lang])
-                return t.fetch(), lang
-            except Exception:
-                pass
-
-        # Берём первый доступный
-        try:
-            t = transcript_list.find_manually_created_transcript(
-                [t.language_code for t in transcript_list]
-            )
-            return t.fetch(), t.language_code
-        except Exception:
-            pass
-
-        # Автогенерированные
-        try:
-            t = transcript_list.find_generated_transcript(
-                [t.language_code for t in transcript_list]
-            )
-            return t.fetch(), t.language_code
-        except Exception:
-            raise NoTranscriptFound(video_id, [], {})
+    def _fetch_any():
+        # Если ru/en недоступны — берём что есть
+        fetched = YouTubeTranscriptApi.get_transcript(video_id)
+        return fetched, "unknown"
 
     try:
-        segments, lang = await asyncio.to_thread(_fetch)
+        try:
+            segments, lang = await asyncio.to_thread(_fetch)
+        except Exception:
+            segments, lang = await asyncio.to_thread(_fetch_any)
+            lang = "unknown"
+
+        if not segments:
+            return {"error": "❌ Субтитры пустые"}
+
+        # Определяем язык по первым словам через langdetect
+        sample = " ".join(s.get("text", "") for s in segments[:20])
+        detected = detect_language(sample)
+        if detected != "unknown":
+            lang = detected
+
         return {"raw": segments, "lang": lang, "error": None}
-    except TranscriptsDisabled:
-        return {"error": "❌ Субтитры отключены для этого видео"}
-    except NoTranscriptFound:
-        return {"error": "❌ Субтитры недоступны для этого видео"}
+
     except Exception as e:
+        err = str(e)
         logger.error(f"YouTube subtitles error: {e}")
-        return {"error": f"❌ Не удалось получить субтитры: {str(e)[:100]}"}
+        if "Could not retrieve" in err or "disabled" in err.lower():
+            return {"error": "❌ Субтитры недоступны для этого видео"}
+        if "No transcripts" in err:
+            return {"error": "❌ Субтитры не найдены для этого видео"}
+        return {"error": f"❌ Не удалось получить субтитры: {err[:100]}"}
 
 
 def _segments_to_plain_text(segments: list) -> str:
