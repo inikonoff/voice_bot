@@ -369,13 +369,23 @@ async def fetch_youtube_subtitles(video_id: str) -> dict:
     def _fetch():
         ytt = YouTubeTranscriptApi()
         try:
-            # Приоритет: ru → en
             result = ytt.fetch(video_id, languages=["ru", "en"])
         except Exception:
-            # Любой доступный язык
             result = ytt.fetch(video_id)
-        # FetchedTranscript → список dict через to_raw_data()
-        return result.to_raw_data(), getattr(result, "language_code", "unknown")
+
+        lang = getattr(result, "language_code", "unknown")
+
+        # FetchedTranscript можно итерировать напрямую или через to_raw_data()
+        try:
+            segments = result.to_raw_data()
+        except AttributeError:
+            # Если to_raw_data нет — итерируем как список объектов
+            segments = [
+                {"text": s.text, "start": s.start, "duration": getattr(s, "duration", 0)}
+                for s in result
+            ]
+
+        return segments, lang
 
     try:
         segments, lang = await asyncio.to_thread(_fetch)
@@ -393,10 +403,13 @@ async def fetch_youtube_subtitles(video_id: str) -> dict:
 
     except Exception as e:
         err = str(e)
-        logger.error(f"YouTube subtitles error: {e}")
-        if "Could not retrieve" in err or "disabled" in err.lower() or "No transcripts" in err:
+        logger.error(f"YouTube subtitles error (type={type(e).__name__}): {err}")
+        if "disabled" in err.lower():
+            return {"error": "❌ Субтитры отключены автором видео"}
+        if "No transcripts" in err or "Could not retrieve a transcript" in err:
             return {"error": "❌ Субтитры недоступны для этого видео"}
-        return {"error": f"❌ Не удалось получить субтитры: {err[:120]}"}
+        # Показываем реальную ошибку — поможет в отладке
+        return {"error": f"❌ Ошибка субтитров: {err[:200]}"}
 
 
 def _segments_to_plain_text(segments: list) -> str:
