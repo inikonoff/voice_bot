@@ -326,9 +326,31 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
+    try:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        _WEBSHARE_PROXY_AVAILABLE = True
+    except ImportError:
+        _WEBSHARE_PROXY_AVAILABLE = False
     YT_TRANSCRIPT_AVAILABLE = True
 except ImportError:
     YT_TRANSCRIPT_AVAILABLE = False
+    _WEBSHARE_PROXY_AVAILABLE = False
+
+
+def _make_ytt_api():
+    """Создаёт YouTubeTranscriptApi с Webshare-прокси если заданы WEBSHARE_USERNAME/PASSWORD."""
+    ws_user = os.environ.get("WEBSHARE_USERNAME", "").strip()
+    ws_pass = os.environ.get("WEBSHARE_PASSWORD", "").strip()
+    if ws_user and ws_pass and _WEBSHARE_PROXY_AVAILABLE:
+        logger.debug("YouTube transcript: using Webshare proxy")
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=ws_user,
+                proxy_password=ws_pass,
+            )
+        )
+    logger.debug("YouTube transcript: no proxy configured")
+    return YouTubeTranscriptApi()
 
 
 def extract_youtube_video_id(url: str) -> Optional[str]:
@@ -361,25 +383,51 @@ async def fetch_youtube_subtitles(video_id: str) -> dict:
     """
     Загружает субтитры YouTube видео.
     Совместимо с youtube-transcript-api >= 1.0
-    Новый API: YouTubeTranscriptApi().fetch(video_id, languages=[...])
+
+    Стратегия:
+    1. Пробуем fetch(languages=["ru", "en"])
+    2. Если не вышло — берём первый доступный язык через list_transcripts
+    3. Если всё равно нет — возвращаем реальную ошибку для диагностики
     """
     if not YT_TRANSCRIPT_AVAILABLE:
         return {"error": "❌ Для YouTube субтитров требуется установить youtube-transcript-api"}
 
     def _fetch():
-        ytt = YouTubeTranscriptApi()
+        ytt = _make_ytt_api()
+        result = None
+
+        # Попытка 1: предпочитаем ru/en
         try:
             result = ytt.fetch(video_id, languages=["ru", "en"])
-        except Exception:
-            result = ytt.fetch(video_id)
+        except Exception as e1:
+            logger.debug(f"YT fetch ru/en failed ({type(e1).__name__}): {e1}")
+
+        # Попытка 2: любой язык через list_transcripts
+        if result is None:
+            try:
+                transcript_list = ytt.list(video_id)
+                # Сначала ручные субтитры, потом авто-сгенерированные
+                transcript = None
+                for t in transcript_list:
+                    if not t.is_generated:
+                        transcript = t
+                        break
+                if transcript is None:
+                    for t in transcript_list:
+                        transcript = t
+                        break
+                if transcript is None:
+                    raise Exception("No transcripts found in list")
+                result = transcript.fetch()
+            except Exception as e2:
+                logger.debug(f"YT list fallback failed ({type(e2).__name__}): {e2}")
+                raise e2  # пробрасываем реальную ошибку
 
         lang = getattr(result, "language_code", "unknown")
 
-        # FetchedTranscript можно итерировать напрямую или через to_raw_data()
         try:
             segments = result.to_raw_data()
         except AttributeError:
-            # Если to_raw_data нет — итерируем как список объектов
             segments = [
                 {"text": s.text, "start": s.start, "duration": getattr(s, "duration", 0)}
                 for s in result
@@ -403,13 +451,26 @@ async def fetch_youtube_subtitles(video_id: str) -> dict:
 
     except Exception as e:
         err = str(e)
-        logger.error(f"YouTube subtitles error (type={type(e).__name__}): {err}")
-        if "disabled" in err.lower():
+        err_type = type(e).__name__
+        logger.error(f"YouTube subtitles error (type={err_type}): {err}")
+
+        # Блокировка YouTube на облачном IP (RequestBlocked / IpBlocked)
+        if "RequestBlocked" in err_type or "IpBlocked" in err_type or "blocked" in err.lower():
+            return {"error": "❌ YouTube блокирует запросы с этого сервера.\nПопробуйте позже или используйте другой источник."}
+        # Требуется PO-токен (новая защита YouTube с 2025)
+        if "PoTokenRequired" in err_type:
+            return {"error": "❌ YouTube требует авторизацию для этого видео (PO token). Субтитры недоступны."}
+        # Субтитры отключены автором
+        if "TranscriptsDisabled" in err_type or "disabled" in err.lower():
             return {"error": "❌ Субтитры отключены автором видео"}
-        if "No transcripts" in err or "Could not retrieve a transcript" in err:
-            return {"error": "❌ Субтитры недоступны для этого видео"}
-        # Показываем реальную ошибку — поможет в отладке
-        return {"error": f"❌ Ошибка субтитров: {err[:200]}"}
+        # Видео недоступно / приватное
+        if "VideoUnavailable" in err_type or "unavailable" in err.lower():
+            return {"error": "❌ Видео недоступно (возможно, приватное или удалено)"}
+        # Нет субтитров ни на одном языке
+        if "NoTranscriptFound" in err_type or "No transcripts" in err or "Could not retrieve" in err:
+            return {"error": "❌ У этого видео нет субтитров ни на одном языке"}
+        # Всё остальное — показываем реальную ошибку для диагностики
+        return {"error": f"❌ Ошибка субтитров ({err_type}): {err[:200]}"}
 
 
 def _segments_to_plain_text(segments: list) -> str:
@@ -524,10 +585,9 @@ async def fetch_url_text(url: str) -> str:
         import random
         headers = {
             "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            # НЕ указываем Accept-Encoding — httpx сам управляет декодированием сжатия.
-            # Явный заголовок может привести к двойному декодированию или кракозябрам.
+            "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
@@ -535,26 +595,6 @@ async def fetch_url_text(url: str) -> str:
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0",
         }
-
-        def _decode_response(response) -> str:
-            """Декодирует тело ответа с правильной кодировкой."""
-            # httpx.Response.text использует кодировку из Content-Type заголовка.
-            # Если там нет charset или она неверная — пробуем определить сами.
-            content_type = response.headers.get("content-type", "")
-            if "charset=" in content_type.lower():
-                return response.text  # доверяем серверу
-            # Пробуем UTF-8 сначала (большинство сайтов)
-            try:
-                return response.content.decode("utf-8")
-            except UnicodeDecodeError:
-                pass
-            # Пробуем cp1251 (старые русские сайты)
-            try:
-                return response.content.decode("cp1251")
-            except UnicodeDecodeError:
-                pass
-            # Fallback — httpx сам угадывает
-            return response.text
 
         last_error = None
         for attempt in range(3):
@@ -586,9 +626,8 @@ async def fetch_url_text(url: str) -> str:
 
                     response.raise_for_status()
 
-                    html_text = _decode_response(response)
                     parser = _TextExtractor()
-                    parser.feed(html_text)
+                    parser.feed(response.text)
                     text = parser.get_text()
 
                     lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 20]
