@@ -39,6 +39,65 @@ import config
 import processors
 import database
 
+
+# ============================================================================
+# УТИЛИТЫ: санитизация текста
+# ============================================================================
+
+import re as _re
+
+# Теги, которые Telegram принимает в HTML-режиме
+_TG_ALLOWED_TAGS = {
+    'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
+    'code', 'pre', 'a', 'tg-spoiler', 'tg-emoji', 'blockquote',
+}
+# Паттерн: любой HTML-тег
+# Матчим как обычные HTML-теги так и псевдо-теги с | которые LLM иногда генерирует
+_HTML_TAG_RE = _re.compile(r'<(/?)([|\w][|\w-]*)([^>]*)>', _re.IGNORECASE)
+
+
+def _strip_bad_tags(text: str) -> str:
+    """
+    Удаляет теги, которые Telegram не поддерживает в HTML-режиме,
+    оставляя разрешённые (<b>, <i>, <code> и т.д.).
+    Псевдо-теги типа |header_end| не затрагивает (это не HTML).
+    """
+    def _replace(m):
+        tag = m.group(2).lower()
+        if tag in _TG_ALLOWED_TAGS:
+            return m.group(0)  # оставляем как есть
+        # Неразрешённый тег — убираем угловые скобки чтобы Telegram не парсил
+        return m.group(0).replace('<', '&lt;').replace('>', '&gt;')
+    return _HTML_TAG_RE.sub(_replace, text)
+
+
+def sanitize_llm_output(text: str, allow_html: bool = False) -> str:
+    """
+    Очищает текст LLM перед отправкой в Telegram.
+
+    allow_html=False (по умолчанию): plain-text режим — все HTML-теги экранируются.
+      Используется для результатов коррекции/саммари, где LLM не должен генерировать разметку.
+
+    allow_html=True: LLM намеренно генерирует Telegram HTML (например breakdown).
+      Только невалидные/неподдерживаемые теги экранируются.
+    """
+    # 1. Null-байты (ломают Supabase и иногда Telegram)
+    text = text.replace('\x00', '')
+    if allow_html:
+        # Оставляем разрешённые теги, убираем остальные
+        text = _strip_bad_tags(text)
+    else:
+        # Полное экранирование — plain text
+        text = text.replace('&', '&amp;')
+        text = text.replace('<', '&lt;')
+        text = text.replace('>', '&gt;')
+    return text
+
+
+def sanitize_for_db(text: str) -> str:
+    """Убирает null-байты перед записью в Supabase."""
+    return text.replace('\x00', '') if text else text
+
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -646,7 +705,7 @@ async def _bg_save_transcript(user_id: int, source_type: str, original_text: str
         username=message.from_user.username if message.from_user else None,
         first_name=message.from_user.first_name if message.from_user else None,
     )
-    transcript_id = await database.save_transcript(user_id, source_type, original_text)
+    transcript_id = await database.save_transcript(user_id, source_type, sanitize_for_db(original_text))
     # Сохраняем transcript_id в контекст для последующего сохранения результатов
     if transcript_id and user_id in user_context and msg_id in user_context[user_id]:
         user_context[user_id][msg_id]["transcript_id"] = transcript_id
@@ -1370,20 +1429,21 @@ async def process_callback(callback: types.CallbackQuery):
         else:
             result = original_text
 
+        result_clean = sanitize_llm_output(result)
         user_context[user_id][msg_id]["mode"] = mode
-        user_context[user_id][msg_id]["cached_results"][mode] = result
+        user_context[user_id][msg_id]["cached_results"][mode] = result_clean
 
         # Сохраняем результат в БД в фоне
         transcript_id = ctx_data.get("transcript_id")
         if transcript_id:
-            asyncio.create_task(database.save_result(transcript_id, mode, result))
+            asyncio.create_task(database.save_result(transcript_id, mode, result_clean))
 
         available_modes = ctx_data.get("available_modes", ["basic", "premium"])
 
-        if len(result) > 4000:
+        if len(result_clean) > 4000:
             await callback.message.delete()
-            for i in range(0, len(result), 4000):
-                await callback.message.answer(result[i:i+4000])
+            for i in range(0, len(result_clean), 4000):
+                await callback.message.answer(result_clean[i:i+4000], parse_mode="HTML")
             await callback.message.answer(
                 "💾 <b>Переключение и экспорт:</b>",
                 parse_mode="HTML",
@@ -1391,7 +1451,8 @@ async def process_callback(callback: types.CallbackQuery):
             )
         else:
             await callback.message.edit_text(
-                result,
+                result_clean,
+                parse_mode="HTML",
                 reply_markup=create_switch_keyboard(user_id, msg_id)
             )
 
@@ -1437,15 +1498,17 @@ async def mode_callback(callback: types.CallbackQuery):
         else:
             processed = original_text
 
+        processed_clean = sanitize_llm_output(processed)
         user_context[user_id][msg_id]["mode"] = new_mode
-        user_context[user_id][msg_id]["cached_results"][new_mode] = processed
+        user_context[user_id][msg_id]["cached_results"][new_mode] = processed_clean
 
         transcript_id = ctx_data.get("transcript_id")
         if transcript_id:
-            asyncio.create_task(database.save_result(transcript_id, new_mode, processed))
+            asyncio.create_task(database.save_result(transcript_id, new_mode, processed_clean))
 
         await callback.message.edit_text(
-            processed,
+            processed_clean,
+            parse_mode="HTML",
             reply_markup=create_keyboard(msg_id, new_mode, ctx_data.get("available_modes", ["basic", "premium"]))
         )
 
@@ -1509,18 +1572,19 @@ async def switch_callback(callback: types.CallbackQuery):
                 asyncio.create_task(database.save_result(transcript_id, target_mode, result))
 
         user_context[target_user_id][msg_id]["mode"] = target_mode
+        result = sanitize_llm_output(result)
 
         if len(result) > 4000:
             await callback.message.delete()
             for i in range(0, len(result), 4000):
-                await callback.message.answer(result[i:i+4000])
+                await callback.message.answer(result[i:i+4000], parse_mode="HTML")
             await callback.message.answer(
                 "💾 <b>Переключение и экспорт:</b>",
                 parse_mode="HTML",
                 reply_markup=create_switch_keyboard(target_user_id, msg_id)
             )
         else:
-            await callback.message.edit_text(result, reply_markup=create_switch_keyboard(target_user_id, msg_id))
+            await callback.message.edit_text(result, parse_mode="HTML", reply_markup=create_switch_keyboard(target_user_id, msg_id))
 
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
@@ -1672,7 +1736,7 @@ async def translate_callback(callback: types.CallbackQuery):
         ctx_data["is_translated"] = True
 
         display = translated if len(translated) <= 4000 else translated[:3997] + "..."
-        await callback.message.edit_text(display, reply_markup=create_switch_keyboard(user_id, msg_id))
+        await callback.message.edit_text(sanitize_llm_output(display), parse_mode="HTML", reply_markup=create_switch_keyboard(user_id, msg_id))
 
     except Exception as e:
         logger.error(f"Translate callback error: {e}")
@@ -1724,7 +1788,7 @@ async def breakdown_callback(callback: types.CallbackQuery):
 
         mode_label = "«Как есть»" if current_mode == "basic" else "«Красиво»"
         await status_msg.edit_text(
-            f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n{result}",
+            f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n{sanitize_llm_output(result, allow_html=True)}",
             parse_mode="HTML"
         )
 
