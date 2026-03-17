@@ -659,10 +659,10 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
         if is_shutting_down:
             return
 
-        final = accumulated if accumulated else "❌ Пустой ответ"
+        final = sanitize_llm_output(accumulated) if accumulated else "❌ Пустой ответ"
         if len(final) > 4096:
             final = final[:4093] + "..."
-        await placeholder.edit_text(final, reply_markup=create_dialog_keyboard(user_id))
+        await placeholder.edit_text(final, parse_mode="HTML", reply_markup=create_dialog_keyboard(user_id))
 
     except asyncio.CancelledError:
         try:
