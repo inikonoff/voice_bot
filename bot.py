@@ -1034,6 +1034,13 @@ async def youtube_handler(message: types.Message):
 @dp.message(F.text.regexp(r'https?://\S+'))
 async def url_handler(message: types.Message):
     """Обработка ссылок: скрейпим страницу и сразу показываем саммари."""
+    url = message.text.strip()
+
+    # Пропускаем API-эндпоинты и служебные URL — обрабатываем как обычный текст
+    if not processors.is_url(url):
+        await text_handler(message)
+        return
+
     if is_shutting_down:
         await message.answer("🛑 Бот останавливается, попробуйте позже.")
         return
@@ -1048,7 +1055,6 @@ async def url_handler(message: types.Message):
         await message.answer(config.ERROR_BUSY)
         return
 
-    url = message.text.strip()
     processing_users.add(user_id)
     msg = await message.answer(config.MSG_FETCHING_URL)
 

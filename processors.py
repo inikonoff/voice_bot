@@ -474,11 +474,15 @@ async def format_subtitles_as_dialogue(raw_text: str, groq_clients: list) -> str
 # ============================================================================
 
 def is_url(text: str) -> bool:
-    """Проверяет, является ли текст обычным URL (не YouTube)."""
+    """Проверяет, является ли текст обычным URL (не YouTube, не API-эндпоинт)."""
     text = text.strip()
     if not (text.startswith(("http://", "https://")) and " " not in text and len(text) > 10):
         return False
-    return not is_youtube_url(text)
+    if is_youtube_url(text):
+        return False
+    # Исключаем API-эндпоинты и служебные URL
+    blocked = ("supabase.co", "api.", "/rest/v1/", "/graphql", "localhost", "127.0.0.1")
+    return not any(b in text for b in blocked)
 
 
 async def fetch_url_text(url: str) -> str:
