@@ -524,9 +524,10 @@ async def fetch_url_text(url: str) -> str:
         import random
         headers = {
             "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
+            # НЕ указываем Accept-Encoding — httpx сам управляет декодированием сжатия.
+            # Явный заголовок может привести к двойному декодированию или кракозябрам.
             "DNT": "1",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
@@ -534,6 +535,26 @@ async def fetch_url_text(url: str) -> str:
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0",
         }
+
+        def _decode_response(response) -> str:
+            """Декодирует тело ответа с правильной кодировкой."""
+            # httpx.Response.text использует кодировку из Content-Type заголовка.
+            # Если там нет charset или она неверная — пробуем определить сами.
+            content_type = response.headers.get("content-type", "")
+            if "charset=" in content_type.lower():
+                return response.text  # доверяем серверу
+            # Пробуем UTF-8 сначала (большинство сайтов)
+            try:
+                return response.content.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            # Пробуем cp1251 (старые русские сайты)
+            try:
+                return response.content.decode("cp1251")
+            except UnicodeDecodeError:
+                pass
+            # Fallback — httpx сам угадывает
+            return response.text
 
         last_error = None
         for attempt in range(3):
@@ -565,8 +586,9 @@ async def fetch_url_text(url: str) -> str:
 
                     response.raise_for_status()
 
+                    html_text = _decode_response(response)
                     parser = _TextExtractor()
-                    parser.feed(response.text)
+                    parser.feed(html_text)
                     text = parser.get_text()
 
                     lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 20]
