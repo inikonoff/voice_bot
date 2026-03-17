@@ -44,53 +44,52 @@ import database
 # УТИЛИТЫ: санитизация текста
 # ============================================================================
 
-import re as _re
-
-# Теги, которые Telegram принимает в HTML-режиме
-_TG_ALLOWED_TAGS = {
-    'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-    'code', 'pre', 'a', 'tg-spoiler', 'tg-emoji', 'blockquote',
-}
-# Паттерн: любой HTML-тег
-# Матчим как обычные HTML-теги так и псевдо-теги с | которые LLM иногда генерирует
-_HTML_TAG_RE = _re.compile(r'<(/?)([|\w][|\w-]*)([^>]*)>', _re.IGNORECASE)
 
 
-def _strip_bad_tags(text: str) -> str:
+
+def sanitize_llm_output(text: str) -> str:
     """
-    Удаляет теги, которые Telegram не поддерживает в HTML-режиме,
-    оставляя разрешённые (<b>, <i>, <code> и т.д.).
-    Псевдо-теги типа |header_end| не затрагивает (это не HTML).
+    Конвертирует Markdown-разметку от LLM в Telegram HTML и очищает мусор.
+
+    Порядок:
+    1. Убираем null-байты
+    2. Экранируем &, < , > в обычном тексте (до подстановки тегов)
+    3. Конвертируем MD-разметку → HTML-теги Telegram:
+       **text** / __text__  → <b>text</b>
+       *text* / _text_      → <i>text</i>
+       `text`               → <code>text</code>
+       ```block```          → <code>block</code>
+       ### Заголовок        → <b>Заголовок</b>
     """
-    def _replace(m):
-        tag = m.group(2).lower()
-        if tag in _TG_ALLOWED_TAGS:
-            return m.group(0)  # оставляем как есть
-        # Неразрешённый тег — убираем угловые скобки чтобы Telegram не парсил
-        return m.group(0).replace('<', '&lt;').replace('>', '&gt;')
-    return _HTML_TAG_RE.sub(_replace, text)
+    import re
 
-
-def sanitize_llm_output(text: str, allow_html: bool = False) -> str:
-    """
-    Очищает текст LLM перед отправкой в Telegram.
-
-    allow_html=False (по умолчанию): plain-text режим — все HTML-теги экранируются.
-      Используется для результатов коррекции/саммари, где LLM не должен генерировать разметку.
-
-    allow_html=True: LLM намеренно генерирует Telegram HTML (например breakdown).
-      Только невалидные/неподдерживаемые теги экранируются.
-    """
-    # 1. Null-байты (ломают Supabase и иногда Telegram)
+    # 1. Null-байты
     text = text.replace('\x00', '')
-    if allow_html:
-        # Оставляем разрешённые теги, убираем остальные
-        text = _strip_bad_tags(text)
-    else:
-        # Полное экранирование — plain text
-        text = text.replace('&', '&amp;')
-        text = text.replace('<', '&lt;')
-        text = text.replace('>', '&gt;')
+
+    # 2. Экранируем HTML-спецсимволы в сыром тексте
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+
+    # 3. Конвертируем Markdown → Telegram HTML
+
+    # Блоки кода (``` ... ```) — многострочные, первыми чтобы не трогать содержимое
+    text = re.sub(r'```(?:\w+)?\n?(.*?)```', lambda m: '<code>' + m.group(1).strip() + '</code>', text, flags=re.DOTALL)
+
+    # Инлайн код (`code`)
+    text = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', text)
+
+    # Bold: **text** или __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
+
+    # Italic: *text* или _text_ (не трогаем уже заменённые __bold__)
+    text = re.sub(r'\*([^*\n]+)\*', r'<i>\1</i>', text)
+    text = re.sub(r'(?<![_a-zA-Zа-яёА-ЯЁ])_([^_\n]+)_(?![_a-zA-Zа-яёА-ЯЁ])', r'<i>\1</i>', text)
+
+    # Заголовки Markdown (### / ## / #) → bold
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
     return text
 
 
@@ -1565,13 +1564,15 @@ async def switch_callback(callback: types.CallbackQuery):
             else:
                 result = "❌ Неизвестный режим"
 
+            result = sanitize_llm_output(result)
             user_context[target_user_id][msg_id]["cached_results"][target_mode] = result
 
             transcript_id = ctx_data.get("transcript_id")
             if transcript_id:
-                asyncio.create_task(database.save_result(transcript_id, target_mode, result))
+                asyncio.create_task(database.save_result(transcript_id, target_mode, sanitize_for_db(result)))
 
         user_context[target_user_id][msg_id]["mode"] = target_mode
+        # Санитизируем для Telegram (если result пришёл из кэша — ещё не обработан)
         result = sanitize_llm_output(result)
 
         if len(result) > 4000:
@@ -1788,7 +1789,7 @@ async def breakdown_callback(callback: types.CallbackQuery):
 
         mode_label = "«Как есть»" if current_mode == "basic" else "«Красиво»"
         await status_msg.edit_text(
-            f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n{sanitize_llm_output(result, allow_html=True)}",
+            f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n{sanitize_llm_output(result)}",
             parse_mode="HTML"
         )
 
