@@ -482,7 +482,7 @@ def is_url(text: str) -> bool:
 
 
 async def fetch_url_text(url: str) -> str:
-    """Скачивает страницу по URL и извлекает текст."""
+    """Скачивает страницу по URL и извлекает текст. С retry при 429."""
     try:
         import httpx
         from html.parser import HTMLParser
@@ -494,11 +494,11 @@ async def fetch_url_text(url: str) -> str:
                 self._skip = False
 
             def handle_starttag(self, tag, attrs):
-                if tag in ("script", "style", "nav", "footer", "header"):
+                if tag in ("script", "style", "nav", "footer", "header", "aside", "menu"):
                     self._skip = True
 
             def handle_endtag(self, tag):
-                if tag in ("script", "style", "nav", "footer", "header"):
+                if tag in ("script", "style", "nav", "footer", "header", "aside", "menu"):
                     self._skip = False
 
             def handle_data(self, data):
@@ -510,31 +510,81 @@ async def fetch_url_text(url: str) -> str:
             def get_text(self):
                 return "\n".join(self._text)
 
+        # Несколько вариантов User-Agent для ротации
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        ]
+
+        import random
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru,en;q=0.9",
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0",
         }
 
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
+        last_error = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(2 * attempt)  # 2s, 4s между попытками
+                headers["User-Agent"] = random.choice(user_agents)
 
-        parser = _TextExtractor()
-        parser.feed(response.text)
-        text = parser.get_text()
+            try:
+                async with httpx.AsyncClient(
+                    timeout=20,
+                    follow_redirects=True,
+                    headers=headers,
+                ) as client:
+                    response = await client.get(url)
 
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        text = "\n".join(lines)
+                    if response.status_code == 429:
+                        retry_after = int(response.headers.get("Retry-After", 5))
+                        wait = min(retry_after, 10)
+                        logger.warning(f"URL 429, waiting {wait}s (attempt {attempt+1})")
+                        await asyncio.sleep(wait)
+                        last_error = f"429 Too Many Requests"
+                        continue
 
-        if not text or len(text) < 50:
-            return "❌ Не удалось извлечь текст со страницы. Возможно, сайт защищён от парсинга."
+                    if response.status_code == 403:
+                        return "❌ Сайт закрыт для автоматических запросов (403 Forbidden)"
 
-        if len(text) > 30000:
-            text = text[:30000] + "\n... [страница обрезана]"
+                    if response.status_code == 401:
+                        return "❌ Сайт требует авторизации"
 
-        logger.info(f"Fetched URL {url}: {len(text)} chars")
-        return text
+                    response.raise_for_status()
+
+                    parser = _TextExtractor()
+                    parser.feed(response.text)
+                    text = parser.get_text()
+
+                    lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 20]
+                    text = "\n".join(lines)
+
+                    if not text or len(text) < 100:
+                        return "❌ Не удалось извлечь текст со страницы. Возможно, контент загружается динамически (JavaScript)."
+
+                    if len(text) > 30000:
+                        text = text[:30000] + "\n... [страница обрезана]"
+
+                    logger.info(f"Fetched URL {url}: {len(text)} chars")
+                    return text
+
+            except httpx.TimeoutException:
+                last_error = "таймаут соединения"
+                continue
+            except httpx.HTTPStatusError as e:
+                last_error = str(e)
+                break
+
+        return f"❌ Не удалось загрузить страницу: {last_error or 'неизвестная ошибка'}"
 
     except ImportError:
         return "❌ Для обработки ссылок требуется установить httpx"
