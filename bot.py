@@ -16,7 +16,7 @@ from typing import Optional, List, Dict, Any, Callable, Awaitable
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, UploadFile, File, Header, HTTPException
 from openai import AsyncOpenAI
 import uvicorn
 
@@ -43,9 +43,6 @@ import database
 # ============================================================================
 # УТИЛИТЫ: санитизация текста
 # ============================================================================
-
-
-
 
 def sanitize_llm_output(text: str) -> str:
     """
@@ -108,6 +105,7 @@ load_dotenv()
 # === КОНФИГУРАЦИЯ ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
+APP_SECRET_TOKEN = os.environ.get("APP_SECRET_TOKEN", "my_super_secret_123")
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -366,6 +364,84 @@ bot_users_in_context {len(user_context)}
         except:
             pass
     return Response(content=text, media_type="text/plain")
+
+
+# ============================================================================
+# API ENDPOINT ДЛЯ ANDROID ПРИЛОЖЕНИЯ
+# ============================================================================
+
+@app.post("/api/dictate")
+async def api_dictate(
+    file: UploadFile = File(...),
+    x_app_token: str = Header(None)
+):
+    """
+    API для Android приложения:
+    - Принимает аудиофайл (m4a)
+    - Распознает речь (Whisper)
+    - Делает красивую обработку (Llama)
+    - Возвращает чистый текст
+    """
+    # Простейшая защита
+    if x_app_token != APP_SECRET_TOKEN:
+        logger.warning(f"API unauthorized attempt with token: {x_app_token}")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Проверяем наличие Groq клиентов
+    if not groq_clients:
+        logger.error("API Dictate error: No Groq clients available")
+        return {"status": "error", "text": "Сервис временно недоступен"}
+
+    try:
+        # Читаем файл
+        audio_bytes = await file.read()
+        
+        # Проверка размера (не больше 20 МБ)
+        if len(audio_bytes) > 20 * 1024 * 1024:
+            return {"status": "error", "text": "Файл слишком большой (макс. 20 МБ)"}
+        
+        # Логируем запрос
+        logger.info(f"API Dictate: file={file.filename}, size={len(audio_bytes)} bytes")
+        
+        # Транскрибация (Whisper через Groq)
+        raw_text = await processors.transcribe_voice(audio_bytes, groq_clients)
+        
+        # Проверка результата
+        if raw_text.startswith("❌"):
+            logger.error(f"API Dictate transcription error: {raw_text}")
+            return {"status": "error", "text": raw_text}
+            
+        if len(raw_text.strip()) < 2:
+            return {"status": "error", "text": "Ничего не расслышал"}
+        
+        # Делаем "Красиво" (Llama 70B)
+        corrected_text = await processors.correct_text_premium(raw_text, groq_clients)
+        
+        if corrected_text.startswith("❌"):
+            logger.error(f"API Dictate correction error: {corrected_text}")
+            return {"status": "error", "text": corrected_text}
+
+        # Чистим от маркдауна и лишних символов
+        clean_text = (corrected_text
+                     .replace("**", "")
+                     .replace("__", "")
+                     .replace("```", "")
+                     .replace("#", "")
+                     .strip())
+        
+        # Логируем успех
+        logger.info(f"API Dictate success: {len(raw_text)} → {len(clean_text)} chars")
+        
+        return {
+            "status": "success", 
+            "text": clean_text,
+            "original_length": len(raw_text),
+            "processed_length": len(clean_text)
+        }
+
+    except Exception as e:
+        logger.error(f"API Dictate error: {e}", exc_info=True)
+        return {"status": "error", "text": f"Ошибка сервера: {str(e)[:50]}"}
 
 
 # ============================================================================
