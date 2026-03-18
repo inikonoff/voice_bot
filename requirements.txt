@@ -6,6 +6,8 @@ pdfplumber
 reportlab
 python-docx
 
+python-multipart>=0.0.9
+
 # Веб-сервер
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
