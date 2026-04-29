@@ -62,6 +62,12 @@ TEMP_DIR = "/tmp"
 CLEANUP_TEMP_FILES = True
 TEMP_FILE_RETENTION = 300
 
+# === ПОЛЬЗОВАТЕЛЬСКОЕ ИМЯ ФАЙЛА ===
+# Лимит на пользовательскую часть имени (без префикса режима и даты)
+CUSTOM_FILENAME_MAX_LENGTH = 20
+# Сколько секунд ждём ввод имени, прежде чем откатиться на автоген
+CUSTOM_FILENAME_INPUT_TIMEOUT = 60
+
 # ============================================================================
 # ПРОМПТЫ
 # ============================================================================
@@ -272,6 +278,18 @@ MSG_TRANSLATING = "🌐 Перевожу на русский..."
 MSG_FETCHING_SUBTITLES = "📺 Получаю субтитры..."
 MSG_FORMATTING_SUBTITLES = "✍️ Форматирую диалог..."
 
+# Сообщения экспорта с пользовательским именем
+MSG_ASK_FILENAME = (
+    "📝 <b>Введите название файла</b>\n\n"
+    "До <b>{max_len}</b> символов. К нему автоматически добавится тип "
+    "и дата.\n\n"
+    "Допустимы: буквы (рус/англ), цифры, пробел, <code>_</code>, <code>-</code>.\n"
+    "Или нажмите <b>«Без названия»</b> — я сгенерирую имя сам."
+)
+MSG_FILENAME_TOO_LONG = "⚠️ Имя слишком длинное (макс. {max_len}). Попробуйте короче."
+MSG_FILENAME_EMPTY_AFTER_CLEAN = "⚠️ После очистки от запрещённых символов ничего не осталось. Попробуйте ещё раз."
+MSG_FILENAME_TIMEOUT = "⏰ Ввод отменён по таймауту — экспорт отменён. Нажмите кнопку формата ещё раз."
+
 STATUS_MESSAGE = """🤖 <b>Статус бота:</b>
 • Groq клиентов: {groq_count}
 • Пользователей в памяти: {users_count}
@@ -324,5 +342,12 @@ GROQ_MODELS = {
     "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
     "basic": "llama-3.1-8b-instant",
     "premium": "llama-3.3-70b-versatile",
+    # ВНИМАНИЕ: "reasoning" сейчас указывает на ту же модель, что и "vision"
+    # (llama-4-scout). Это временная заглушка — настоящая reasoning-модель
+    # пока не выбрана. При появлении подходящей модели (например,
+    # deepseek-r1-distill-llama-70b или openai/gpt-oss-120b с reasoning_effort)
+    # нужно заменить здесь и протестировать call-сайты в processors.py
+    # (там, где происходит Q&A по документу — stream_document_answer,
+    # explain_corrections, breakdown_corrections).
     "reasoning": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
