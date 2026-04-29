@@ -14,6 +14,7 @@ import subprocess
 import mimetypes
 import re
 import time
+import random
 from typing import Optional, Tuple, List, Dict, Any, AsyncGenerator
 from datetime import timedelta
 from openai import AsyncOpenAI
@@ -44,18 +45,35 @@ document_dialogues: Dict[int, Dict[int, Dict[str, Any]]] = {}
 # ============================================================================
 
 async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
-    """Делаем запрос с перебором ключей и улучшенной обработкой ошибок"""
+    """
+    Запрос с честной ротацией ключей.
+
+    Алгоритм:
+    1. Создаём перемешанный пул индексов всех клиентов.
+    2. Каждый клиент получает не более GROQ_RETRY_COUNT попыток.
+    3. Между раундами (когда пройдены все клиенты) — повторный shuffle,
+       чтобы упавший на rate-limit ключ не получил тот же слот в очереди.
+    """
     if not groq_clients:
         raise Exception("Нет доступных Groq клиентов")
 
     errors = []
     client_count = len(groq_clients)
+    total_attempts = client_count * config.GROQ_RETRY_COUNT
 
-    for attempt in range(client_count * config.GROQ_RETRY_COUNT):
-        client_index = attempt % client_count
+    # Стартовый перемешанный порядок индексов
+    order = list(range(client_count))
+    random.shuffle(order)
+
+    for attempt in range(total_attempts):
+        # На границе раунда — пересобираем порядок
+        if attempt > 0 and attempt % client_count == 0:
+            random.shuffle(order)
+
+        client_index = order[attempt % client_count]
         client = groq_clients[client_index]
         try:
-            logger.debug(f"Попытка {attempt + 1} с клиентом {client_index}")
+            logger.debug(f"Попытка {attempt + 1}/{total_attempts} с клиентом #{client_index}")
             return await func(client, *args, **kwargs)
         except Exception as e:
             error_msg = str(e)
