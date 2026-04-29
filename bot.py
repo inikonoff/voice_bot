@@ -94,6 +94,139 @@ def sanitize_for_db(text: str) -> str:
     """Убирает null-байты перед записью в Supabase."""
     return text.replace('\x00', '') if text else text
 
+
+# ============================================================================
+# УТИЛИТЫ: пользовательское имя файла
+# ============================================================================
+
+# Разрешённые символы в имени: буквы (рус/англ), цифры, пробел, _, -
+# Всё остальное вычищается. Пробелы потом заменим на _.
+_FILENAME_ALLOWED_RE = None  # инициализируется лениво в sanitize_filename
+
+
+def sanitize_filename(raw: str, max_len: int) -> str:
+    """
+    Чистит пользовательский ввод имени файла.
+
+    - Удаляет всё, кроме букв (рус/англ), цифр, пробела, _ и -
+    - Заменяет пробелы и серии _/- на одно _
+    - Обрезает до max_len символов
+    - Возвращает пустую строку, если после очистки ничего не осталось
+
+    Кириллица сохраняется как есть (Telegram и FS её корректно отображают;
+    транслитерация добавляет неоднозначность и не нужна).
+    """
+    import re
+    global _FILENAME_ALLOWED_RE
+    if _FILENAME_ALLOWED_RE is None:
+        _FILENAME_ALLOWED_RE = re.compile(r'[^A-Za-zА-Яа-яЁё0-9 _\-]')
+
+    if not raw:
+        return ""
+
+    # 1. Удаляем запрещённые символы
+    cleaned = _FILENAME_ALLOWED_RE.sub('', raw)
+    # 2. Сжимаем последовательности пробелов/подчёркиваний/дефисов
+    cleaned = re.sub(r'[\s_]+', '_', cleaned)
+    cleaned = re.sub(r'-+', '-', cleaned)
+    # 3. Убираем _ и - по краям
+    cleaned = cleaned.strip('_-')
+    # 4. Обрезаем по длине
+    cleaned = cleaned[:max_len].strip('_-')
+    return cleaned
+
+
+def build_export_filename(
+    user_id: int,
+    mode: str,
+    custom_name: Optional[str] = None,
+) -> str:
+    """
+    Строит итоговое имя файла (без расширения).
+
+    Формат:
+      [custom_name__]<mode>_<user_id>_<YYYYMMDD_HHMMSS>
+
+    user_id и timestamp обязательны — они защищают от race condition
+    при параллельных экспортах в общем /tmp.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"{mode}_{user_id}_{timestamp}"
+    if custom_name:
+        return f"{custom_name}__{base}"
+    return f"export_{base}"
+
+
+# ============================================================================
+# УТИЛИТЫ: персистентность user_context в Supabase
+# ============================================================================
+
+def _serialize_ctx(ctx_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Подготавливает запись user_context к записи в JSONB."""
+    payload = {
+        "original": ctx_data.get("original", ""),
+        "mode": ctx_data.get("mode"),
+        "available_modes": ctx_data.get("available_modes", []),
+        "cached_results": ctx_data.get("cached_results", {}),
+        "type": ctx_data.get("type", "text"),
+        "chat_id": ctx_data.get("chat_id"),
+        "filename": ctx_data.get("filename"),
+        "transcript_id": ctx_data.get("transcript_id"),
+        "is_translated": ctx_data.get("is_translated", False),
+    }
+    t = ctx_data.get("time")
+    if isinstance(t, datetime):
+        payload["time"] = t.isoformat()
+    elif isinstance(t, str):
+        payload["time"] = t
+    return payload
+
+
+def _deserialize_ctx(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Восстанавливает запись user_context из JSONB."""
+    text = payload.get("original", "")
+    t_raw = payload.get("time")
+    try:
+        t = datetime.fromisoformat(t_raw) if t_raw else datetime.now()
+    except (ValueError, TypeError):
+        t = datetime.now()
+
+    return {
+        "text": text,
+        "original": text,
+        "mode": payload.get("mode"),
+        "available_modes": payload.get("available_modes", ["basic"]),
+        "cached_results": payload.get("cached_results", {
+            "basic": None, "premium": None, "summary": None
+        }),
+        "type": payload.get("type", "text"),
+        "chat_id": payload.get("chat_id"),
+        "filename": payload.get("filename"),
+        "transcript_id": payload.get("transcript_id"),
+        "is_translated": payload.get("is_translated", False),
+        "time": t,
+    }
+
+
+async def _persist_ctx(user_id: int, msg_id: int):
+    """
+    Фоновая задача: сохраняет один user_context в Supabase.
+    Молча игнорирует ошибки — это не критичный путь.
+    """
+    try:
+        ctx = user_context.get(user_id, {}).get(msg_id)
+        if not ctx:
+            return
+        await database.save_user_context(user_id, msg_id, _serialize_ctx(ctx))
+    except Exception as e:
+        logger.debug(f"persist_ctx failed for {user_id}/{msg_id}: {e}")
+
+
+def schedule_persist(user_id: int, msg_id: int):
+    """Запускает persist в фоне без await (вызывается из любых хендлеров)."""
+    if database.is_available():
+        asyncio.create_task(_persist_ctx(user_id, msg_id))
+
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -139,6 +272,14 @@ active_dialogs: Dict[int, int] = {}
 
 # Rate limiting: user_id пользователей, у которых идёт обработка прямо сейчас
 processing_users: set = set()
+
+# Ожидание ввода имени файла перед экспортом
+# user_id -> {
+#   "mode": str, "msg_id": int, "format": str,
+#   "target_user_id": int, "prompt_msg_id": int,
+#   "task": asyncio.Task (таймаут),
+# }
+pending_filename_inputs: Dict[int, Dict[str, Any]] = {}
 
 groq_clients = []
 
@@ -195,8 +336,8 @@ class ErrorHandlingMiddleware(BaseMiddleware):
                     await event.message.answer("❌ Произошла внутренняя ошибка. Попробуйте позже.")
                 elif hasattr(event, "callback_query") and event.callback_query:
                     await event.callback_query.message.answer("❌ Произошла внутренняя ошибка.")
-            except:
-                pass
+            except Exception as notify_err:
+                logger.debug(f"Не смогли уведомить пользователя об ошибке: {notify_err}")
             raise
 
 
@@ -246,6 +387,23 @@ async def lifespan(app: FastAPI):
     db_ok = database.init_database()
     if db_ok:
         logger.info("✅ База данных подключена")
+        # Восстанавливаем активные user_contexts из БД (переживаем рестарт Render)
+        try:
+            records = await database.load_active_user_contexts(config.CACHE_TIMEOUT_SECONDS)
+            restored = 0
+            for rec in records:
+                uid = rec.get("user_id")
+                mid = rec.get("msg_id")
+                payload = rec.get("payload") or {}
+                if not uid or not mid:
+                    continue
+                if uid not in user_context:
+                    user_context[uid] = {}
+                user_context[uid][mid] = _deserialize_ctx(payload)
+                restored += 1
+            logger.info(f"♻️  Восстановлено {restored} user_context из БД")
+        except Exception as e:
+            logger.warning(f"⚠️  Не удалось восстановить user_context: {e}")
     else:
         logger.info("📦 Работаем без базы данных")
 
@@ -311,8 +469,8 @@ async def lifespan(app: FastAPI):
 
     try:
         await bot.session.close()
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"bot.session.close failed during shutdown: {e}")
 
     logger.info("✅ BOT STOPPED")
 
@@ -361,8 +519,8 @@ bot_users_in_context {len(user_context)}
         try:
             ram_mb = psutil.Process().memory_info().rss / 1024 / 1024
             text += f"bot_ram_mb {ram_mb:.2f}\n"
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"psutil RAM read failed: {e}")
     return Response(content=text, media_type="text/plain")
 
 
@@ -482,6 +640,8 @@ def save_to_history(user_id: int, msg_id: int, text: str, mode: str = "basic", a
         "type": "text", "chat_id": None, "filename": None,
         "transcript_id": None,   # для связи с БД
     }
+    # Бэкапим в Supabase, чтобы пережить рестарт Render
+    schedule_persist(user_id, msg_id)
 
 
 async def cleanup_old_contexts():
@@ -492,15 +652,25 @@ async def cleanup_old_contexts():
                 break
             current_time = datetime.now()
             users_to_clean = []
+            stale_keys: List[tuple] = []  # (user_id, msg_id) для удаления из БД
+
             for user_id, messages in user_context.items():
                 for msg_id, ctx in list(messages.items()):
                     age = (current_time - ctx.get("time", current_time)).total_seconds()
                     if age > config.CACHE_TIMEOUT_SECONDS:
                         messages.pop(msg_id, None)
+                        stale_keys.append((user_id, msg_id))
                 if not messages:
                     users_to_clean.append(user_id)
             for uid in users_to_clean:
                 user_context.pop(uid, None)
+
+            # Чистим устаревшее в БД (один общий sweep — дешевле, чем N запросов)
+            if database.is_available():
+                try:
+                    await database.cleanup_stale_user_contexts(config.CACHE_TIMEOUT_SECONDS)
+                except Exception as e:
+                    logger.debug(f"DB cleanup failed: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -524,8 +694,8 @@ async def cleanup_temp_files():
                         if current_time - os.path.getmtime(filepath) > config.TEMP_FILE_RETENTION:
                             os.remove(filepath)
                             deleted += 1
-                    except:
-                        pass
+                    except OSError as e:
+                        logger.debug(f"Не смогли удалить {filepath}: {e}")
             if deleted:
                 logger.debug(f"Cleaned up {deleted} temp files")
         except asyncio.CancelledError:
@@ -657,9 +827,23 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
 # СОХРАНЕНИЕ ФАЙЛОВ
 # ============================================================================
 
-async def save_to_file(user_id: int, text: str, format_type: str) -> Optional[str]:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"export_{user_id}_{timestamp}"
+async def save_to_file(
+    user_id: int,
+    text: str,
+    format_type: str,
+    mode: str = "export",
+    custom_name: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Сохраняет text в файл выбранного формата и возвращает путь.
+
+    Имя строится через build_export_filename:
+      [custom__]<mode>_<user_id>_<timestamp>.<ext>
+
+    user_id + timestamp в имени гарантируют уникальность при параллельных
+    экспортах в общем /tmp.
+    """
+    filename = build_export_filename(user_id, mode, custom_name)
 
     if format_type == "txt":
         filepath = f"{config.TEMP_DIR}/{filename}.txt"
@@ -728,8 +912,9 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
                         if len(display) > 4096:
                             display = display[:4093] + "..."
                         await placeholder.edit_text(display, reply_markup=create_dialog_keyboard(user_id))
-                    except:
-                        pass
+                    except Exception as e:
+                        # типичный кейс — "message is not modified"
+                        logger.debug(f"streaming edit_text skipped: {e}")
                     last_edit_length = len(accumulated)
 
         if is_shutting_down:
@@ -743,15 +928,15 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
     except asyncio.CancelledError:
         try:
             await placeholder.edit_text("🛑 Генерация прервана.")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"placeholder edit on cancel failed: {e}")
     except Exception as e:
         logger.error(f"Streaming error: {e}", exc_info=True)
         if not is_shutting_down:
             try:
                 await placeholder.edit_text(f"❌ Ошибка при генерации: {str(e)[:200]}")
-            except:
-                pass
+            except Exception as edit_err:
+                logger.debug(f"error placeholder edit failed: {edit_err}")
 
 
 # ============================================================================
@@ -934,8 +1119,8 @@ async def voice_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"Voice handler error: {e}")
@@ -1002,8 +1187,8 @@ async def video_note_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"Video note handler error: {e}")
@@ -1067,8 +1252,8 @@ async def audio_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"Audio handler error: {e}")
@@ -1139,6 +1324,7 @@ async def youtube_handler(message: types.Message):
             ctx["cached_results"]["summary"] = summary
             ctx["yt_lang"] = lang
             ctx["yt_url"] = url
+            schedule_persist(user_id, msg.message_id)
 
         asyncio.create_task(_bg_save_transcript(user_id, "youtube", dialogue_text, msg.message_id, message))
 
@@ -1155,8 +1341,8 @@ async def youtube_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"YouTube handler error: {e}")
@@ -1217,6 +1403,7 @@ async def url_handler(message: types.Message):
             user_context[user_id][msg.message_id]["chat_id"] = message.chat.id
             user_context[user_id][msg.message_id]["original"] = page_text
             user_context[user_id][msg.message_id]["cached_results"]["summary"] = summary
+            schedule_persist(user_id, msg.message_id)
 
         asyncio.create_task(_bg_save_transcript(user_id, "url", page_text, msg.message_id, message))
 
@@ -1230,8 +1417,8 @@ async def url_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"URL handler error: {e}")
@@ -1248,6 +1435,11 @@ async def text_handler(message: types.Message):
 
     user_id = message.from_user.id
     original_text = message.text.strip()
+
+    # Перехват: пользователь вводит имя файла для экспорта
+    if user_id in pending_filename_inputs:
+        await _handle_filename_input(message)
+        return
 
     # Диалоговый режим
     if user_id in active_dialogs:
@@ -1294,8 +1486,8 @@ async def text_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"Text handler error: {e}")
@@ -1393,8 +1585,8 @@ async def file_handler(message: types.Message):
         )
         try:
             await message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"message.delete() failed: {e}")
 
     except Exception as e:
         logger.error(f"File handler error: {e}")
@@ -1507,6 +1699,7 @@ async def process_callback(callback: types.CallbackQuery):
         result_clean = sanitize_llm_output(result)
         user_context[user_id][msg_id]["mode"] = mode
         user_context[user_id][msg_id]["cached_results"][mode] = result_clean
+        schedule_persist(user_id, msg_id)
 
         # Сохраняем результат в БД в фоне
         transcript_id = ctx_data.get("transcript_id")
@@ -1576,6 +1769,7 @@ async def mode_callback(callback: types.CallbackQuery):
         processed_clean = sanitize_llm_output(processed)
         user_context[user_id][msg_id]["mode"] = new_mode
         user_context[user_id][msg_id]["cached_results"][new_mode] = processed_clean
+        schedule_persist(user_id, msg_id)
 
         transcript_id = ctx_data.get("transcript_id")
         if transcript_id:
@@ -1642,6 +1836,7 @@ async def switch_callback(callback: types.CallbackQuery):
 
             result = sanitize_llm_output(result)
             user_context[target_user_id][msg_id]["cached_results"][target_mode] = result
+            schedule_persist(target_user_id, msg_id)
 
             transcript_id = ctx_data.get("transcript_id")
             if transcript_id:
@@ -1670,11 +1865,103 @@ async def switch_callback(callback: types.CallbackQuery):
 
 
 # ============================================================================
-# EXPORT CALLBACK
+# EXPORT CALLBACK — двухшаговый flow с пользовательским именем
 # ============================================================================
+
+async def _do_export(
+    callback_or_message,
+    target_user_id: int,
+    mode: str,
+    msg_id: int,
+    export_format: str,
+    custom_name: Optional[str],
+):
+    """
+    Создаёт файл и отправляет пользователю.
+    callback_or_message — types.CallbackQuery ИЛИ types.Message; нужен только
+    chat для answer_document/answer.
+    """
+    # Получаем chat для отправки
+    if hasattr(callback_or_message, "message"):
+        chat_msg = callback_or_message.message
+    else:
+        chat_msg = callback_or_message
+
+    ctx_data = user_context.get(target_user_id, {}).get(msg_id)
+    if not ctx_data:
+        await chat_msg.answer("❌ Текст не найден.")
+        return
+
+    text = ctx_data["cached_results"].get(mode) or ctx_data.get("original", ctx_data.get("text", ""))
+    if not text:
+        await chat_msg.answer("⚠️ Текст не найден")
+        return
+
+    format_labels = {"txt": "📄 TXT", "pdf": "📊 PDF", "docx": "📝 DOCX"}
+    status_msg = await chat_msg.answer(f"📁 Создаю {format_labels.get(export_format, 'файл')}...")
+
+    filepath = await save_to_file(
+        target_user_id, text, export_format, mode=mode, custom_name=custom_name,
+    )
+
+    if not filepath:
+        try:
+            await status_msg.edit_text("❌ Ошибка создания файла")
+        except Exception as e:
+            logger.debug(f"edit_text failed in export: {e}")
+        return
+
+    filename = os.path.basename(filepath)
+    caption_map = {"txt": "📄 Текстовый файл", "pdf": "📊 PDF файл", "docx": "📝 DOCX файл"}
+    caption = caption_map.get(export_format, "📁 Файл")
+
+    try:
+        document = FSInputFile(filepath, filename=filename)
+        await chat_msg.answer_document(document=document, caption=caption)
+        try:
+            await status_msg.delete()
+        except Exception as e:
+            logger.debug(f"status_msg delete failed: {e}")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError as e:
+            logger.debug(f"temp file cleanup failed: {e}")
+
+
+def _make_filename_prompt_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Клавиатура под промптом ввода имени: только 'Без названия' и 'Отмена'."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🏷️ Без названия", callback_data=f"noname_{token}"),
+        InlineKeyboardButton(text="✖️ Отмена",      callback_data=f"cancelexp_{token}"),
+    )
+    return builder.as_markup()
+
+
+async def _filename_input_timeout(user_id: int, prompt_msg_id: int, chat_id: int):
+    """Снимает запрос имени через таймаут, если пользователь молчит."""
+    try:
+        await asyncio.sleep(config.CUSTOM_FILENAME_INPUT_TIMEOUT)
+        if user_id not in pending_filename_inputs:
+            return
+        pending_filename_inputs.pop(user_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=prompt_msg_id,
+                text=config.MSG_FILENAME_TIMEOUT,
+            )
+        except Exception as e:
+            logger.debug(f"timeout edit_message failed: {e}")
+    except asyncio.CancelledError:
+        # Нормальный путь — пользователь успел ответить
+        pass
+
 
 @dp.callback_query(F.data.startswith("export_"))
 async def export_callback(callback: types.CallbackQuery):
+    """Шаг 1: спрашиваем имя файла. Реальное создание — в продолжении flow."""
     if is_shutting_down:
         await callback.answer("🛑 Бот останавливается", show_alert=True)
         return
@@ -1707,37 +1994,148 @@ async def export_callback(callback: types.CallbackQuery):
             await callback.message.answer("❌ Текст не найден.")
             return
 
-        text = ctx_data["cached_results"].get(mode) or ctx_data.get("original", ctx_data.get("text", ""))
-        if not text:
-            await callback.answer("⚠️ Текст не найден", show_alert=True)
-            return
+        # Если уже идёт ожидание имени — отменяем предыдущее
+        prev = pending_filename_inputs.pop(target_user_id, None)
+        if prev:
+            prev_task = prev.get("task")
+            if prev_task and not prev_task.done():
+                prev_task.cancel()
 
-        format_labels = {"txt": "📄 TXT", "pdf": "📊 PDF", "docx": "📝 DOCX"}
-        status_msg = await callback.message.answer(f"📁 Создаю {format_labels.get(export_format, 'файл')}...")
+        # Шаг 1: отправляем промпт с инлайн-клавиатурой
+        token = f"{mode}_{msg_id}_{export_format}"
+        prompt = config.MSG_ASK_FILENAME.format(max_len=config.CUSTOM_FILENAME_MAX_LENGTH)
+        prompt_msg = await callback.message.answer(
+            prompt,
+            parse_mode="HTML",
+            reply_markup=_make_filename_prompt_keyboard(token),
+        )
 
-        filepath = await save_to_file(target_user_id, text, export_format)
+        # Запускаем таймаут
+        timeout_task = asyncio.create_task(
+            _filename_input_timeout(target_user_id, prompt_msg.message_id, callback.message.chat.id)
+        )
 
-        if not filepath:
-            await status_msg.edit_text("❌ Ошибка создания файла")
-            return
-
-        filename = os.path.basename(filepath)
-        caption_map = {"txt": "📄 Текстовый файл", "pdf": "📊 PDF файл", "docx": "📝 DOCX файл"}
-        caption = caption_map.get(export_format, "📁 Файл")
-
-        document = FSInputFile(filepath, filename=filename)
-        await callback.message.answer_document(document=document, caption=caption)
-        await status_msg.delete()
-
-        try:
-            os.remove(filepath)
-        except:
-            pass
+        pending_filename_inputs[target_user_id] = {
+            "mode": mode,
+            "msg_id": msg_id,
+            "format": export_format,
+            "target_user_id": target_user_id,
+            "prompt_msg_id": prompt_msg.message_id,
+            "chat_id": callback.message.chat.id,
+            "task": timeout_task,
+        }
 
     except Exception as e:
         logger.error(f"Export callback error: {e}")
         if not is_shutting_down:
-            await callback.message.answer("❌ Ошибка создания файла")
+            await callback.message.answer("❌ Ошибка подготовки экспорта")
+
+
+@dp.callback_query(F.data.startswith("noname_"))
+async def export_noname_callback(callback: types.CallbackQuery):
+    """Пользователь нажал «Без названия» → экспорт с автогенерируемым именем."""
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+
+    await callback.answer()
+    user_id = callback.from_user.id
+    pending = pending_filename_inputs.pop(user_id, None)
+    if not pending:
+        try:
+            await callback.message.edit_text("⚠️ Запрос устарел. Нажмите кнопку формата ещё раз.")
+        except Exception as e:
+            logger.debug(f"noname edit_text failed: {e}")
+        return
+
+    task = pending.get("task")
+    if task and not task.done():
+        task.cancel()
+
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        logger.debug(f"noname prompt delete failed: {e}")
+
+    await _do_export(
+        callback,
+        target_user_id=pending["target_user_id"],
+        mode=pending["mode"],
+        msg_id=pending["msg_id"],
+        export_format=pending["format"],
+        custom_name=None,
+    )
+
+
+@dp.callback_query(F.data.startswith("cancelexp_"))
+async def export_cancel_callback(callback: types.CallbackQuery):
+    """Отмена ввода имени."""
+    await callback.answer("Отменено")
+    user_id = callback.from_user.id
+    pending = pending_filename_inputs.pop(user_id, None)
+    if pending:
+        task = pending.get("task")
+        if task and not task.done():
+            task.cancel()
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        logger.debug(f"cancel prompt delete failed: {e}")
+
+
+async def _handle_filename_input(message: types.Message):
+    """
+    Обработка текста-ответа на запрос имени файла.
+    Вызывается из text_handler, когда user_id есть в pending_filename_inputs.
+    """
+    user_id = message.from_user.id
+    pending = pending_filename_inputs.get(user_id)
+    if not pending:
+        return  # на всякий случай, race protection
+
+    raw = (message.text or "").strip()
+
+    # Проверка длины ДО санитизации (чтобы предупредить пользователя честно)
+    if len(raw) > config.CUSTOM_FILENAME_MAX_LENGTH:
+        await message.answer(
+            config.MSG_FILENAME_TOO_LONG.format(max_len=config.CUSTOM_FILENAME_MAX_LENGTH)
+        )
+        return  # pending не убираем — даём пользователю ещё попытку
+
+    # Чистим
+    custom = sanitize_filename(raw, config.CUSTOM_FILENAME_MAX_LENGTH)
+    if not custom:
+        await message.answer(config.MSG_FILENAME_EMPTY_AFTER_CLEAN)
+        return
+
+    # Принимаем — снимаем pending и таймаут
+    pending_filename_inputs.pop(user_id, None)
+    task = pending.get("task")
+    if task and not task.done():
+        task.cancel()
+
+    # Удаляем сообщение пользователя с именем — чисто косметика
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"user filename msg delete failed: {e}")
+
+    # Удаляем промпт
+    try:
+        await bot.delete_message(
+            chat_id=pending["chat_id"], message_id=pending["prompt_msg_id"]
+        )
+    except Exception as e:
+        logger.debug(f"prompt delete failed: {e}")
+
+    await _do_export(
+        message,
+        target_user_id=pending["target_user_id"],
+        mode=pending["mode"],
+        msg_id=pending["msg_id"],
+        export_format=pending["format"],
+        custom_name=custom,
+    )
 
 
 
