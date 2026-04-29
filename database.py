@@ -180,3 +180,107 @@ async def get_user_history(user_id: int, limit: int = 10) -> List[Dict[str, Any]
     if result and result.data:
         return result.data
     return []
+
+
+# ============================================================================
+# USER CONTEXTS — персистентность активных сессий
+# ============================================================================
+#
+# Назначение: пережить рестарт Render. Когда бот падает/перезапускается,
+# in-memory user_context теряется, и пользователь видит «❌ Данные устарели».
+# Эта таблица — backing store: при старте читаем активные контексты обратно
+# в память, при изменениях — пишем фоном.
+#
+# SQL для создания таблицы в Supabase:
+#
+# CREATE TABLE user_contexts (
+#     user_id BIGINT NOT NULL,
+#     msg_id  BIGINT NOT NULL,
+#     payload JSONB  NOT NULL,
+#     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+#     PRIMARY KEY (user_id, msg_id)
+# );
+# CREATE INDEX idx_user_contexts_updated ON user_contexts(updated_at);
+#
+# Поле payload содержит сериализованное состояние одной записи user_context:
+# {original, mode, available_modes, cached_results, type, chat_id,
+#  filename, transcript_id, is_translated, time}
+# (text не дублируем — он совпадает с original).
+# ============================================================================
+
+
+async def save_user_context(user_id: int, msg_id: int, payload: Dict[str, Any]) -> bool:
+    """
+    Upsert одной записи контекста. Тихо возвращает False, если БД недоступна.
+    payload должен быть JSON-сериализуемым (datetime → isoformat снаружи).
+    """
+    if not _available:
+        return False
+    result = await _run(lambda: _client.table("user_contexts").upsert({
+        "user_id": user_id,
+        "msg_id": msg_id,
+        "payload": payload,
+        "updated_at": datetime.utcnow().isoformat(),
+    }, on_conflict="user_id,msg_id").execute())
+    return result is not None
+
+
+async def delete_user_context(user_id: int, msg_id: int) -> bool:
+    """Удалить одну запись контекста (например, при cleanup по таймауту)."""
+    if not _available:
+        return False
+    result = await _run(lambda: (
+        _client.table("user_contexts")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("msg_id", msg_id)
+        .execute()
+    ))
+    return result is not None
+
+
+async def load_active_user_contexts(max_age_seconds: int) -> List[Dict[str, Any]]:
+    """
+    Загрузить контексты не старше max_age_seconds.
+    Используется при старте бота, чтобы восстановить активные сессии после рестарта.
+
+    Возвращает список dict-ов: {user_id, msg_id, payload, updated_at}.
+    """
+    if not _available:
+        return []
+
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(seconds=max_age_seconds)).isoformat()
+
+    result = await _run(lambda: (
+        _client.table("user_contexts")
+        .select("user_id, msg_id, payload, updated_at")
+        .gte("updated_at", cutoff)
+        .execute()
+    ))
+    if result and result.data:
+        return result.data
+    return []
+
+
+async def cleanup_stale_user_contexts(max_age_seconds: int) -> int:
+    """
+    Удалить из БД контексты старше max_age_seconds.
+    Возвращает количество удалённых записей (приблизительно — Supabase не
+    всегда возвращает точный count).
+    """
+    if not _available:
+        return 0
+
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(seconds=max_age_seconds)).isoformat()
+
+    result = await _run(lambda: (
+        _client.table("user_contexts")
+        .delete()
+        .lt("updated_at", cutoff)
+        .execute()
+    ))
+    if result and result.data:
+        return len(result.data)
+    return 0
