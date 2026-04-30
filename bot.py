@@ -602,6 +602,67 @@ async def api_dictate(
         return {"status": "error", "text": f"Ошибка сервера: {str(e)[:50]}"}
 
 
+@app.post("/api/correct")
+async def api_correct(
+    request: Request,
+    x_app_token: str = Header(None)
+):
+    """
+    API для обработки текста из буфера обмена в Android приложении:
+    - Принимает JSON {"text": "..."}
+    - Делает красивую обработку (Llama)
+    - Возвращает чистый текст
+    """
+    # Простейшая защита
+    if x_app_token != APP_SECRET_TOKEN:
+        logger.warning(f"API /correct unauthorized attempt with token: {x_app_token}")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not groq_clients:
+        logger.error("API Correct error: No Groq clients available")
+        return {"status": "error", "text": "Сервис временно недоступен"}
+
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+
+        # Проверки
+        if len(text) < 3:
+            return {"status": "error", "text": "Текст слишком короткий"}
+        if len(text) > 20000:
+            return {"status": "error", "text": "Текст слишком большой (макс. 20000 символов)"}
+
+        logger.info(f"API Correct: {len(text)} chars")
+
+        # Делаем "Красиво"
+        corrected_text = await processors.correct_text_premium(text, groq_clients)
+
+        if corrected_text.startswith("❌"):
+            logger.error(f"API Correct error: {corrected_text}")
+            return {"status": "error", "text": corrected_text}
+
+        # Чистим от маркдауна
+        clean_text = (corrected_text
+                      .replace("**", "")
+                      .replace("__", "")
+                      .replace("```", "")
+                      .replace("#", "")
+                      .strip())
+
+        logger.info(f"API Correct success: {len(text)} → {len(clean_text)} chars")
+
+        return {
+            "status": "success",
+            "text": clean_text,
+            "original_length": len(text),
+            "processed_length": len(clean_text)
+        }
+
+    except Exception as e:
+        logger.error(f"API Correct error: {e}", exc_info=True)
+        return {"status": "error", "text": f"Ошибка сервера: {str(e)[:50]}"}
+
+
 # ============================================================================
 # GROQ КЛИЕНТЫ
 # ============================================================================
