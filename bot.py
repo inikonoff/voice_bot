@@ -239,6 +239,10 @@ load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEYS = os.environ.get("GROQ_API_KEYS", "")
 APP_SECRET_TOKEN = os.environ.get("APP_SECRET_TOKEN", "my_super_secret_123")
+# Стиль коррекции для Android API: "basic" или "premium" (по умолчанию premium)
+APP_CORR_STYLE = os.environ.get("APP_CORR_STYLE", "premium").strip().lower()
+if APP_CORR_STYLE not in ("basic", "premium"):
+    APP_CORR_STYLE = "premium"
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -572,8 +576,11 @@ async def api_dictate(
         if len(raw_text.strip()) < 2:
             return {"status": "error", "text": "Ничего не расслышал"}
         
-        # Делаем "Красиво" (Llama 70B)
-        corrected_text = await processors.correct_text_premium(raw_text, groq_clients)
+        # Делаем коррекцию выбранным стилем (APP_CORR_STYLE: basic или premium)
+        if APP_CORR_STYLE == "basic":
+            corrected_text = await processors.correct_text_basic(raw_text, groq_clients)
+        else:
+            corrected_text = await processors.correct_text_premium(raw_text, groq_clients)
         
         if corrected_text.startswith("❌"):
             logger.error(f"API Dictate correction error: {corrected_text}")
@@ -634,8 +641,11 @@ async def api_correct(
 
         logger.info(f"API Correct: {len(text)} chars")
 
-        # Делаем "Красиво"
-        corrected_text = await processors.correct_text_premium(text, groq_clients)
+        # Делаем коррекцию выбранным стилем (APP_CORR_STYLE: basic или premium)
+        if APP_CORR_STYLE == "basic":
+            corrected_text = await processors.correct_text_basic(text, groq_clients)
+        else:
+            corrected_text = await processors.correct_text_premium(text, groq_clients)
 
         if corrected_text.startswith("❌"):
             logger.error(f"API Correct error: {corrected_text}")
@@ -681,6 +691,7 @@ def init_groq_clients():
         except Exception as e:
             logger.error(f"❌ Error init client {key[:8]}...: {e}")
     logger.info(f"✅ Total Groq clients: {len(groq_clients)}")
+    logger.info(f"🎨 APP_CORR_STYLE = {APP_CORR_STYLE}")
 
 
 # ============================================================================
