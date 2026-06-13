@@ -284,3 +284,126 @@ async def cleanup_stale_user_contexts(max_age_seconds: int) -> int:
     if result and result.data:
         return len(result.data)
     return 0
+
+
+# ============================================================================
+# YOUTUBE CACHE — персистентный кэш субтитров и форматирования
+# ============================================================================
+#
+# Назначение: не загружать субтитры с YouTube и не гонять LLM-форматирование
+# повторно для одного и того же видео. Кэш переживает рестарт Render.
+#
+# SQL для создания таблицы — см. sql/youtube_cache.sql
+#
+# Поле segments хранит сырые сегменты с таймкодами (JSONB):
+#   [{"text": "...", "start": 0.0, "duration": 2.3}, ...]
+# Это позволяет восстановить и сплошной текст, и таймкоды для экспорта.
+# ============================================================================
+
+
+async def get_youtube_cache(video_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Получить закэшированные данные YouTube видео.
+    Возвращает dict с полями {segments, lang, dialogue_text, timecoded_text}
+    или None, если в кэше нет / БД недоступна.
+    Побочно обновляет last_accessed.
+    """
+    if not _available:
+        return None
+
+    result = await _run(lambda: (
+        _client.table("youtube_cache")
+        .select("segments, lang, dialogue_text, timecoded_text")
+        .eq("video_id", video_id)
+        .limit(1)
+        .execute()
+    ))
+
+    if not (result and result.data):
+        return None
+
+    row = result.data[0]
+
+    # Обновляем last_accessed фоном (не блокируем чтение)
+    asyncio.create_task(_touch_youtube_cache(video_id))
+
+    return {
+        "segments": row.get("segments") or [],
+        "lang": row.get("lang") or "unknown",
+        "dialogue_text": row.get("dialogue_text"),
+        "timecoded_text": row.get("timecoded_text"),
+    }
+
+
+async def _touch_youtube_cache(video_id: str) -> None:
+    """Обновляет last_accessed для записи (LRU-учёт)."""
+    if not _available:
+        return
+    await _run(lambda: (
+        _client.table("youtube_cache")
+        .update({"last_accessed": datetime.utcnow().isoformat()})
+        .eq("video_id", video_id)
+        .execute()
+    ))
+
+
+async def save_youtube_subtitles(video_id: str, segments: list, lang: str) -> bool:
+    """
+    Сохранить сырые субтитры (segments + lang) в кэш.
+    Форматирование (dialogue/timecoded) добавится позже через
+    update_youtube_formatted. Тихо возвращает False если БД недоступна.
+    """
+    if not _available:
+        return False
+    result = await _run(lambda: _client.table("youtube_cache").upsert({
+        "video_id": video_id,
+        "segments": segments,
+        "lang": lang,
+        "last_accessed": datetime.utcnow().isoformat(),
+    }, on_conflict="video_id").execute())
+    return result is not None
+
+
+async def update_youtube_formatted(
+    video_id: str,
+    dialogue_text: str,
+    timecoded_text: str,
+) -> bool:
+    """
+    Дописать форматированный диалог и таймкод-текст в существующую запись кэша.
+    """
+    if not _available:
+        return False
+    result = await _run(lambda: (
+        _client.table("youtube_cache")
+        .update({
+            "dialogue_text": dialogue_text,
+            "timecoded_text": timecoded_text,
+            "last_accessed": datetime.utcnow().isoformat(),
+        })
+        .eq("video_id", video_id)
+        .execute()
+    ))
+    return result is not None
+
+
+async def cleanup_stale_youtube_cache(max_age_days: int = 30) -> int:
+    """
+    Удалить записи YouTube-кэша, к которым не обращались дольше max_age_days.
+    Возвращает количество удалённых записей.
+    """
+    if not _available:
+        return 0
+
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+
+    result = await _run(lambda: (
+        _client.table("youtube_cache")
+        .delete()
+        .lt("last_accessed", cutoff)
+        .execute()
+    ))
+    if result and result.data:
+        return len(result.data)
+    return 0
