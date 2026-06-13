@@ -549,6 +549,201 @@ async def format_subtitles_as_dialogue(raw_text: str, groq_clients: list) -> str
 
 
 # ============================================================================
+# YOUTUBE КЭШИРОВАНИЕ (in-memory + опциональный Supabase)
+# ============================================================================
+#
+# Двухуровневый кэш:
+#   L1 — память процесса (мгновенно, теряется при рестарте)
+#   L2 — Supabase (переживает рестарт, общий для всех воркеров)
+#
+# Кэшируем И сырые субтитры, И результат LLM-форматирования, чтобы повторный
+# запрос того же видео не дёргал ни YouTube, ни Groq.
+# ============================================================================
+
+# L1: video_id → {"segments": [...], "lang": str, "ts": float}
+_yt_subs_cache: Dict[str, Dict[str, Any]] = {}
+# L1: video_id → {"dialogue": str, "timecoded": str, "ts": float}
+_yt_fmt_cache: Dict[str, Dict[str, Any]] = {}
+
+YT_SUBS_TTL = 86400        # сырые субтитры живут в памяти 24 ч
+YT_FMT_TTL = 604800        # форматирование живёт 7 дней
+YT_MEM_CACHE_MAX = 200     # максимум видео в каждом in-memory словаре
+
+
+def _yt_cache_valid(ts: float, ttl: int) -> bool:
+    return (time.time() - ts) < ttl
+
+
+def _yt_cache_evict(cache: Dict[str, Dict[str, Any]]):
+    """LRU-подобная очистка: если словарь переполнен, удаляем самые старые."""
+    if len(cache) <= YT_MEM_CACHE_MAX:
+        return
+    # сортируем по ts (старые первыми), удаляем избыток + запас
+    overflow = len(cache) - YT_MEM_CACHE_MAX + 20
+    oldest = sorted(cache.items(), key=lambda kv: kv[1].get("ts", 0))[:overflow]
+    for vid, _ in oldest:
+        cache.pop(vid, None)
+
+
+async def get_cached_youtube(video_id: str, database=None) -> Optional[Dict[str, Any]]:
+    """
+    Достать видео из кэша (L1 → L2). Возвращает dict вида:
+      {"segments": [...], "lang": str,
+       "dialogue": Optional[str], "timecoded": Optional[str],
+       "source": "memory" | "supabase"}
+    либо None, если нигде нет.
+
+    database — модуль database (передаётся из bot.py), может быть None.
+    """
+    # --- L1: память ---
+    subs = _yt_subs_cache.get(video_id)
+    if subs and _yt_cache_valid(subs["ts"], YT_SUBS_TTL):
+        fmt = _yt_fmt_cache.get(video_id)
+        fmt_valid = fmt and _yt_cache_valid(fmt["ts"], YT_FMT_TTL)
+        logger.debug(f"YouTube {video_id}: L1 hit (fmt={'yes' if fmt_valid else 'no'})")
+        return {
+            "segments": subs["segments"],
+            "lang": subs["lang"],
+            "dialogue": fmt["dialogue"] if fmt_valid else None,
+            "timecoded": fmt["timecoded"] if fmt_valid else None,
+            "source": "memory",
+        }
+
+    # --- L2: Supabase ---
+    if database is not None and database.is_available():
+        row = await database.get_youtube_cache(video_id)
+        if row and row.get("segments"):
+            # прогреваем L1
+            _yt_subs_cache[video_id] = {
+                "segments": row["segments"],
+                "lang": row["lang"],
+                "ts": time.time(),
+            }
+            _yt_cache_evict(_yt_subs_cache)
+            if row.get("dialogue_text"):
+                _yt_fmt_cache[video_id] = {
+                    "dialogue": row["dialogue_text"],
+                    "timecoded": row.get("timecoded_text") or "",
+                    "ts": time.time(),
+                }
+                _yt_cache_evict(_yt_fmt_cache)
+            logger.debug(f"YouTube {video_id}: L2 (Supabase) hit")
+            return {
+                "segments": row["segments"],
+                "lang": row["lang"],
+                "dialogue": row.get("dialogue_text"),
+                "timecoded": row.get("timecoded_text"),
+                "source": "supabase",
+            }
+
+    return None
+
+
+async def fetch_youtube_subtitles_cached(video_id: str, database=None) -> dict:
+    """
+    Обёртка над fetch_youtube_subtitles с кэшем сырых субтитров.
+
+    Возвращает то же, что fetch_youtube_subtitles:
+      {"raw": segments, "lang": str, "error": None}
+    плюс служебное поле "source" ("memory" | "supabase" | "youtube").
+    На ошибке: {"error": "..."} без "source".
+    """
+    cached = await get_cached_youtube(video_id, database)
+    if cached:
+        return {
+            "raw": cached["segments"],
+            "lang": cached["lang"],
+            "error": None,
+            "source": cached["source"],
+            # пробрасываем готовое форматирование, если оно было в кэше
+            "_cached_dialogue": cached.get("dialogue"),
+            "_cached_timecoded": cached.get("timecoded"),
+        }
+
+    # промах кэша — реальный запрос к YouTube
+    result = await fetch_youtube_subtitles(video_id)
+    if result.get("error"):
+        return result
+
+    segments = result["raw"]
+    lang = result["lang"]
+
+    # пишем в L1
+    _yt_subs_cache[video_id] = {"segments": segments, "lang": lang, "ts": time.time()}
+    _yt_cache_evict(_yt_subs_cache)
+
+    # пишем в L2 фоном
+    if database is not None and database.is_available():
+        asyncio.create_task(database.save_youtube_subtitles(video_id, segments, lang))
+
+    result["source"] = "youtube"
+    return result
+
+
+async def format_subtitles_cached(
+    video_id: str,
+    raw_text: str,
+    segments: list,
+    groq_clients: list,
+    database=None,
+    precomputed_dialogue: Optional[str] = None,
+    precomputed_timecoded: Optional[str] = None,
+) -> dict:
+    """
+    Форматирование субтитров в диалог с кэшем результата LLM.
+
+    Если precomputed_* переданы (пришли из кэша субтитров) — используем их
+    без обращения к Groq.
+
+    Возвращает: {"dialogue": str, "timecoded": str, "source": "memory"|"supabase"|"llm"}
+    """
+    # 0) форматирование уже пришло вместе с субтитрами из кэша
+    if precomputed_dialogue:
+        return {
+            "dialogue": precomputed_dialogue,
+            "timecoded": precomputed_timecoded or _segments_to_timecoded(segments),
+            "source": "cache",
+        }
+
+    # 1) L1
+    fmt = _yt_fmt_cache.get(video_id)
+    if fmt and _yt_cache_valid(fmt["ts"], YT_FMT_TTL):
+        logger.debug(f"YouTube {video_id}: format L1 hit")
+        return {"dialogue": fmt["dialogue"], "timecoded": fmt["timecoded"], "source": "memory"}
+
+    # 2) LLM
+    dialogue_text = await format_subtitles_as_dialogue(raw_text, groq_clients)
+    timecoded_text = _segments_to_timecoded(segments)
+
+    # пишем в L1
+    _yt_fmt_cache[video_id] = {
+        "dialogue": dialogue_text,
+        "timecoded": timecoded_text,
+        "ts": time.time(),
+    }
+    _yt_cache_evict(_yt_fmt_cache)
+
+    # пишем в L2 фоном
+    if database is not None and database.is_available():
+        asyncio.create_task(
+            database.update_youtube_formatted(video_id, dialogue_text, timecoded_text)
+        )
+
+    return {"dialogue": dialogue_text, "timecoded": timecoded_text, "source": "llm"}
+
+
+def clear_youtube_cache(video_id: Optional[str] = None):
+    """Очистка in-memory кэша (одно видео или всё)."""
+    if video_id:
+        _yt_subs_cache.pop(video_id, None)
+        _yt_fmt_cache.pop(video_id, None)
+    else:
+        _yt_subs_cache.clear()
+        _yt_fmt_cache.clear()
+    logger.info(f"YouTube in-memory cache cleared: {video_id or 'all'}")
+
+
+# ============================================================================
 # URL SCRAPING
 # ============================================================================
 
@@ -1193,7 +1388,13 @@ __all__ = [
     'is_youtube_url',
     'extract_youtube_video_id',
     'fetch_youtube_subtitles',
+    'fetch_youtube_subtitles_cached',
     'format_subtitles_as_dialogue',
+    'format_subtitles_cached',
+    'get_cached_youtube',
+    'clear_youtube_cache',
+    '_segments_to_plain_text',
+    '_segments_to_timecoded',
     'YT_TRANSCRIPT_AVAILABLE',
     'detect_language',
     'is_non_russian',
