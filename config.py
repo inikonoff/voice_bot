@@ -339,15 +339,18 @@ BREAKDOWN_PROMPT = """Ты — внимательный редактор-пед�
 
 GROQ_MODELS = {
     "transcription": "whisper-large-v3-turbo",
-    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "basic": "llama-3.1-8b-instant",
-    "premium": "llama-3.3-70b-versatile",
-    # ВНИМАНИЕ: "reasoning" сейчас указывает на ту же модель, что и "vision"
-    # (llama-4-scout). Это временная заглушка — настоящая reasoning-модель
-    # пока не выбрана. При появлении подходящей модели (например,
-    # deepseek-r1-distill-llama-70b или openai/gpt-oss-120b с reasoning_effort)
-    # нужно заменить здесь и протестировать call-сайты в processors.py
-    # (там, где происходит Q&A по документу — stream_document_answer,
+    # llama-4-scout был отключён Groq 17.07.2026 (404). Единственная
+    # действующая vision-модель на Groq сейчас — qwen3.6-27b.
+    "vision": "qwen/qwen3.6-27b",
+    # llama-3.1-8b-instant и llama-3.3-70b-versatile объявлены deprecated
+    # (email от Groq 17.06.2026), отключение — 16.08.2026. Переезжаем
+    # заранее на рекомендованную замену: gpt-oss заметно лучше держит
+    # русский язык, чем старые Llama 3.x.
+    "basic": "openai/gpt-oss-20b",
+    "premium": "openai/gpt-oss-120b",
+    # "reasoning" использовался как заглушка на llama-4-scout — модель
+    # уже отключена, отсюда 404 при саммаризации. gpt-oss-120b поддерживает
+    # reasoning_effort и совместим по вызовам (stream_document_answer,
     # explain_corrections, breakdown_corrections).
-    "reasoning": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "reasoning": "openai/gpt-oss-120b",
 }
