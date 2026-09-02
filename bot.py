@@ -1,7 +1,7 @@
 # bot.py
 """
 Главный файл бота
-Версия 4.1 — убраны видеоплатформы, добавлена транскрибация субтитров youtube, добавлен DOCX, Supabase с fallback,
+Версия 4.0 — убраны видеоплатформы, добавлен DOCX, Supabase с fallback,
 /history, подпись автора, rate limiting, кнопка "Задать вопрос" только в саммари
 """
 
@@ -741,8 +741,6 @@ async def cleanup_old_contexts():
             if database.is_available():
                 try:
                     await database.cleanup_stale_user_contexts(config.CACHE_TIMEOUT_SECONDS)
-                    # YouTube-кэш чистим раз в сутки по last_accessed
-                    await database.cleanup_stale_youtube_cache(max_age_days=30)
                 except Exception as e:
                     logger.debug(f"DB cleanup failed: {e}")
         except asyncio.CancelledError:
@@ -1018,7 +1016,24 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
 # ============================================================================
 
 def get_author_label(message: types.Message) -> str:
-    """Возвращает строку вида '👤 Имя:' для подписи транскрипта."""
+    """
+    Возвращает строку вида '👤 Имя:' для подписи транскрипта.
+    Приоритет: forward_from → forward_sender_name → from_user.
+    Если голосовое пересланное — показываем оригинального автора.
+    """
+    # Пересланное сообщение с открытым профилем
+    if message.forward_from:
+        user = message.forward_from
+        name = user.first_name or ""
+        if user.last_name:
+            name += f" {user.last_name}"
+        return f"👤 {name}:\n" if name else ""
+
+    # Пересланное сообщение с закрытым профилем (скрыл пересылки)
+    if message.forward_sender_name:
+        return f"👤 {message.forward_sender_name}:\n"
+
+    # Обычное сообщение — автор тот кто прислал боту
     user = message.from_user
     if not user:
         return ""
@@ -1363,8 +1378,7 @@ async def youtube_handler(message: types.Message):
     msg = await message.answer(config.MSG_FETCHING_SUBTITLES)
 
     try:
-        # Субтитры через кэш (L1 память → L2 Supabase → YouTube API)
-        result = await processors.fetch_youtube_subtitles_cached(video_id, database=database)
+        result = await processors.fetch_youtube_subtitles(video_id)
 
         if result["error"]:
             await msg.edit_text(result["error"])
@@ -1372,29 +1386,15 @@ async def youtube_handler(message: types.Message):
 
         segments = result["raw"]
         lang = result["lang"]
-        subs_source = result.get("source", "youtube")
         raw_text = processors._segments_to_plain_text(segments)
+        timecoded_text = processors._segments_to_timecoded(segments)
 
-        # Если форматирование уже лежало в кэше — не дёргаем LLM
-        precomputed_dialogue = result.get("_cached_dialogue")
-        precomputed_timecoded = result.get("_cached_timecoded")
+        await msg.edit_text(config.MSG_FORMATTING_SUBTITLES)
 
-        if precomputed_dialogue:
-            dialogue_text = precomputed_dialogue
-            timecoded_text = precomputed_timecoded or processors._segments_to_timecoded(segments)
-            fmt_source = "cache"
-        else:
-            await msg.edit_text(config.MSG_FORMATTING_SUBTITLES)
-            fmt_result = await processors.format_subtitles_cached(
-                video_id, raw_text, segments, groq_clients, database=database
-            )
-            dialogue_text = fmt_result["dialogue"]
-            timecoded_text = fmt_result["timecoded"]
-            fmt_source = fmt_result["source"]
+        # Форматируем в диалог через LLM (убираем рекламу, группируем)
+        dialogue_text = await processors.format_subtitles_as_dialogue(raw_text, groq_clients)
 
-        logger.info(f"YouTube {video_id}: subs={subs_source}, fmt={fmt_source}")
-
-        # Саммари
+        # Делаем саммари параллельно — уже есть готовый dialogue_text
         await msg.edit_text("📊 Делаю саммари...")
         summary = await processors.summarize_text(dialogue_text, groq_clients)
         if summary.startswith("❌"):
@@ -1418,12 +1418,10 @@ async def youtube_handler(message: types.Message):
         asyncio.create_task(_bg_save_transcript(user_id, "youtube", dialogue_text, msg.message_id, message))
 
         lang_flag = "🇷🇺" if lang == "ru" else "🌐"
-        # Иконка источника: 💾 память, 🗄️ БД, 🌐 свежая загрузка
-        cache_icon = {"memory": "💾", "supabase": "🗄️"}.get(subs_source, "🌐")
         display = summary if len(summary) <= 4000 else summary[:3997] + "..."
 
         await msg.edit_text(
-            f"📺 <b>YouTube</b> {lang_flag} {cache_icon}\n"
+            f"📺 <b>YouTube</b> {lang_flag}\n"
             f"<a href='{url}'>youtu.be/{video_id}</a>\n\n"
             f"{display}",
             parse_mode="HTML",
