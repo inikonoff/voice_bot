@@ -38,6 +38,7 @@ from aiogram.client.default import DefaultBotProperties
 import config
 import processors
 import database
+import link
 
 
 # ============================================================================
@@ -481,6 +482,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
+# CORS — раньше не требовался: /api/dictate и /api/correct дёргает Android-
+# приложение (не браузер), а на него CORS не распространяется. LINK —
+# браузерная страница с другого домена (GitHub Pages), поэтому без этого
+# fetch() из LINK будет падать по CORS независимо от того, что отвечает сервер.
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://ilsoft-dev.github.io"],
+    allow_methods=["POST"],
+    allow_headers=["Content-Type"],
+)
+
+app.include_router(link.router)
+
 
 @app.middleware("http")
 async def monitor_requests(request: Request, call_next):
@@ -546,7 +561,7 @@ async def api_dictate(
     """
     # Простейшая защита
     if x_app_token != APP_SECRET_TOKEN:
-        logger.warning(f"API unauthorized attempt with token: {x_app_token}")
+        logger.warning(f"API unauthorized attempt with token: {'***' if x_app_token else None}")
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # Проверяем наличие Groq клиентов
@@ -622,7 +637,7 @@ async def api_correct(
     """
     # Простейшая защита
     if x_app_token != APP_SECRET_TOKEN:
-        logger.warning(f"API /correct unauthorized attempt with token: {x_app_token}")
+        logger.warning(f"API /correct unauthorized attempt with token: {'***' if x_app_token else None}")
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if not groq_clients:

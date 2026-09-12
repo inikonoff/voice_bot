@@ -313,13 +313,27 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 
     text = _truncate_text_for_model(text, "reasoning")
 
-    async def summarize(client):
+    # openai/gpt-oss-120b на Groq — reasoning-модель: без явного reasoning_effort
+    # она иногда тратит весь токен-бюджет на "размышление" и возвращает ПУСТОЙ
+    # message.content — без ошибки, API формально отвечает 200. Раньше это
+    # тихо приходило как пустое саммари. reasoning_effort="low" + запас
+    # max_tokens снижают шанс, а ретрай ниже подстраховывает, если всё же
+    # случится.
+    async def summarize(client, busted=False):
+        prompt = config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{text}"
+        if busted:
+            prompt += f"\n\n(intent-id: {int(time.time() * 1000)})"
         response = await client.chat.completions.create(
             model=config.GROQ_MODELS["reasoning"],
-            messages=[{"role": "user", "content": config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{text}"}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=config.MODEL_TEMPERATURES["reasoning"],
+            max_tokens=2000,
+            reasoning_effort="low",
         )
-        return response.choices[0].message.content.strip()
+        content = (response.choices[0].message.content or "").strip()
+        if not content:
+            raise Exception("empty_content")
+        return content
 
     try:
         return await _make_groq_request(groq_clients, summarize)
@@ -332,9 +346,16 @@ async def summarize_text(text: str, groq_clients: list) -> str:
                     model=config.GROQ_MODELS["reasoning"],
                     messages=[{"role": "user", "content": config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{shorter}"}],
                     temperature=config.MODEL_TEMPERATURES["reasoning"],
+                    max_tokens=2000,
+                    reasoning_effort="low",
                 )
-                return r.choices[0].message.content.strip()
+                content = (r.choices[0].message.content or "").strip()
+                if not content:
+                    raise Exception("empty_content")
+                return content
             return await _make_groq_request(groq_clients, retry)
+        if str(e) == "empty_content":
+            return "❌ Модель дважды вернула пустой ответ (известная особенность gpt-oss-120b на Groq). Попробуйте ещё раз чуть позже."
         return f"❌ Ошибка создания саммари: {str(e)[:100]}"
 
 
@@ -1040,16 +1061,22 @@ async def stream_document_answer(
 
     client = groq_clients[0 % len(groq_clients)]
 
-    try:
-        stream = await client.chat.completions.create(
+    async def _ask_once(busted=False):
+        p = prompt if not busted else prompt + f"\n\n(intent-id: {int(time.time() * 1000)})"
+        return await client.chat.completions.create(
             model=config.GROQ_MODELS["reasoning"],
             messages=[
                 {"role": "system", "content": "Ты отвечаешь строго по документу."},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": p},
             ],
             temperature=0.2,
+            max_tokens=2000,
+            reasoning_effort="low",
             stream=True,
         )
+
+    try:
+        stream = await _ask_once()
 
         full_answer = ""
         async for chunk in stream:
@@ -1057,6 +1084,23 @@ async def stream_document_answer(
                 piece = chunk.choices[0].delta.content
                 full_answer += piece
                 yield piece
+
+        # Та же особенность gpt-oss-120b, что и в саммари: иногда весь
+        # бюджет токенов уходит на "размышление", а видимый ответ пуст.
+        # Стрим уже закончился, повторить его нельзя — делаем один
+        # ретрай с нуля (тоже стримом, с меткой против кэша Groq).
+        if not full_answer.strip():
+            logger.warning("Stream Q&A: пустой ответ, повторяю попытку")
+            stream = await _ask_once(busted=True)
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    piece = chunk.choices[0].delta.content
+                    full_answer += piece
+                    yield piece
+
+        if not full_answer.strip():
+            full_answer = "❌ Модель дважды вернула пустой ответ. Попробуйте переформулировать вопрос или повторить чуть позже."
+            yield full_answer
 
         history.append({
             "question": question, "answer": full_answer,
