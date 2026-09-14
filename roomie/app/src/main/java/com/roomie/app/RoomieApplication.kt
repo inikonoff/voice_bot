@@ -15,6 +15,7 @@ class RoomieApplication : Application(), SingletonImageLoader.Factory {
 
     override fun onCreate() {
         super.onCreate()
+        CrashReporter.install(this)
         container = AppContainer(this)
         TrashCleanupWorker.schedule(this)
     }
