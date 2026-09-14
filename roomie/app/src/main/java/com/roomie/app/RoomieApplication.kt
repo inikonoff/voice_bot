@@ -1,6 +1,7 @@
 package com.roomie.app
 
 import android.app.Application
+import android.content.Context
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
@@ -13,9 +14,15 @@ class RoomieApplication : Application(), SingletonImageLoader.Factory {
     lateinit var container: AppContainer
         private set
 
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(base)
+        // Earliest available hook: a crash inside a library's own startup (WorkManager, DataStore,
+        // Room, ...) runs as part of process/ContentProvider init, before onCreate ever fires.
+        CrashReporter.install(this)
+    }
+
     override fun onCreate() {
         super.onCreate()
-        CrashReporter.install(this)
         container = AppContainer(this)
         TrashCleanupWorker.schedule(this)
     }

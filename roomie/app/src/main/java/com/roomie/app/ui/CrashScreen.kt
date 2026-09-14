@@ -1,5 +1,8 @@
 package com.roomie.app.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -20,16 +24,23 @@ import androidx.compose.ui.unit.dp
 
 /**
  * Shown once, on the launch right after a crash, so the stack trace can be read (and shared)
- * directly from the device instead of needing adb/logcat access.
+ * directly from the device instead of needing adb/logcat access. Also copies it to the clipboard
+ * as soon as this screen appears — belt-and-suspenders alongside the copy [CrashReporter] already
+ * does at crash time, in case that one didn't survive the dying process.
  */
 @Composable
 fun CrashScreen(stackTrace: String, onContinue: () -> Unit) {
     val context = LocalContext.current
 
+    LaunchedEffect(stackTrace) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText("Roomie crash", stackTrace))
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("Roomie crashed last time", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Here is the full error. Tap Share to send it, or Continue to use the app.",
+            "The error is already copied to your clipboard — just paste it. You can also Share it below.",
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
         )
