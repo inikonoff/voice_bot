@@ -60,7 +60,14 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material3:material3") {
+        // Pulls in a native lib (libandroidx.graphics.path.so) for shape-morphing APIs
+        // (MaterialShapes/RoundedPolygon) that Roomie's own UI never uses. That native lib has
+        // caused 16 KB page-size crashes on newer Android 15 devices; drop it rather than carry
+        // dead weight that can crash the app before a single line of our code even runs.
+        exclude(group = "androidx.graphics", module = "graphics-shapes")
+        exclude(group = "androidx.graphics", module = "graphics-path")
+    }
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.0")
 
@@ -72,8 +79,11 @@ dependencies {
     // WorkManager
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 
-    // DataStore
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // DataStore. Pinned to 1.0.0 (pre-dating the 1.1.0 multi-process "shared counter" feature,
+    // which ships as a native lib, libdatastore_shared_counter.so) — Roomie is single-process and
+    // never needed that guarantee, and that native lib is a second suspect in 16 KB page-size
+    // crashes on newer Android 15 devices.
+    implementation("androidx.datastore:datastore-preferences:1.0.0")
 
     // Coil 3 for MediaStore image loading with downsampling
     implementation("io.coil-kt.coil3:coil-compose:3.0.0")
