@@ -16,9 +16,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.Settings
@@ -165,7 +166,7 @@ private fun FolderGrid(
                     onClick = { onOpenFolder(null, "All photos", period) },
                 )
             }
-            items(folders, key = { it.bucketId }) { folder ->
+            gridItems(folders, key = { it.bucketId }) { folder ->
                 FolderCard(
                     folder = folder,
                     onClick = { onOpenFolder(folder.bucketId, folder.displayName, period) },
