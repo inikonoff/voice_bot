@@ -19,6 +19,33 @@ import java.io.File
  */
 object CrashReporter {
     private const val FILE_NAME = "last_crash.txt"
+    private const val CHECKPOINT_FILE_NAME = "last_checkpoint.txt"
+
+    /**
+     * Records "we got this far" before each risky startup step, fsync'd immediately so it
+     * survives even a crash that happens on the very next line. If [RoomieApplication.onCreate]
+     * crashes the same way on every launch, MainActivity (which shows the crash screen) never
+     * gets a chance to run on ANY attempt — Android always finishes Application init before
+     * starting an Activity — so this file, like the crash file, is meant to be pulled directly:
+     * `adb shell run-as com.roomie.app cat files/last_checkpoint.txt`
+     */
+    fun mark(context: Context, checkpoint: String) {
+        try {
+            java.io.FileOutputStream(File(context.applicationContext.filesDir, CHECKPOINT_FILE_NAME)).use { out ->
+                out.write(checkpoint.toByteArray())
+                out.flush()
+                out.fd.sync()
+            }
+        } catch (_: Throwable) {
+            // Best-effort only.
+        }
+    }
+
+    fun readCheckpoint(context: Context): String? {
+        val file = File(context.applicationContext.filesDir, CHECKPOINT_FILE_NAME)
+        if (!file.exists()) return null
+        return file.readText()
+    }
 
     fun install(context: Context) {
         val appContext = context.applicationContext

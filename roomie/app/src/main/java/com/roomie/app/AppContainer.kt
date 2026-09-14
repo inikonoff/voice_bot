@@ -15,11 +15,28 @@ import com.roomie.app.data.trash.TrashRepository
  */
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
-    private val database = RoomieDatabase.getInstance(appContext)
 
-    val mediaRepository = MediaRepository(appContext)
-    val settingsRepository = SettingsRepository(appContext)
-    val trashRepository = TrashRepository(appContext, database.trashDao(), database.favoriteDao())
+    init {
+        CrashReporter.mark(appContext, "AppContainer:before RoomieDatabase.getInstance()")
+    }
+
+    private val database = RoomieDatabase.getInstance(appContext).also {
+        CrashReporter.mark(appContext, "AppContainer:after RoomieDatabase.getInstance()")
+    }
+
+    val mediaRepository = MediaRepository(appContext).also {
+        CrashReporter.mark(appContext, "AppContainer:after MediaRepository")
+    }
+    val settingsRepository = SettingsRepository(appContext).also {
+        CrashReporter.mark(appContext, "AppContainer:after SettingsRepository")
+    }
+    val trashRepository = TrashRepository(appContext, database.trashDao(), database.favoriteDao()).also {
+        CrashReporter.mark(appContext, "AppContainer:after TrashRepository")
+    }
     val emptyFolderCleaner = EmptyFolderCleaner()
     val monetizationGateway: MonetizationGateway = NoOpMonetizationGateway()
+
+    init {
+        CrashReporter.mark(appContext, "AppContainer:done")
+    }
 }
