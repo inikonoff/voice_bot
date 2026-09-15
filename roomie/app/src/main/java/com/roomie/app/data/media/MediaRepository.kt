@@ -61,6 +61,8 @@ class MediaRepository(private val context: Context) {
             add(MediaStore.Images.Media.DATE_TAKEN)
             add(MediaStore.Images.Media.DATE_ADDED)
             add(MediaStore.Images.Media.SIZE)
+            add(MediaStore.Images.Media.WIDTH)
+            add(MediaStore.Images.Media.HEIGHT)
             @Suppress("DEPRECATION")
             add(MediaStore.Images.Media.DATA)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -90,6 +92,8 @@ class MediaRepository(private val context: Context) {
                     false
                 },
                 filePath = cursor.getStringOrEmpty(MediaStore.Images.Media.DATA).ifBlank { null },
+                width = cursor.getInt(MediaStore.Images.Media.WIDTH),
+                height = cursor.getInt(MediaStore.Images.Media.HEIGHT),
             )
         }
     }
@@ -104,6 +108,8 @@ class MediaRepository(private val context: Context) {
             add(MediaStore.Video.Media.DATE_ADDED)
             add(MediaStore.Video.Media.SIZE)
             add(MediaStore.Video.Media.DURATION)
+            add(MediaStore.Video.Media.WIDTH)
+            add(MediaStore.Video.Media.HEIGHT)
             @Suppress("DEPRECATION")
             add(MediaStore.Video.Media.DATA)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -134,6 +140,8 @@ class MediaRepository(private val context: Context) {
                     false
                 },
                 filePath = cursor.getStringOrEmpty(MediaStore.Video.Media.DATA).ifBlank { null },
+                width = cursor.getInt(MediaStore.Video.Media.WIDTH),
+                height = cursor.getInt(MediaStore.Video.Media.HEIGHT),
             )
         }
     }

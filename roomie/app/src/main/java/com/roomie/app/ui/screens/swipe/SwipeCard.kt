@@ -40,7 +40,10 @@ fun SwipeCard(
         AsyncImage(
             model = group.cover.uri,
             contentDescription = group.cover.displayName,
-            contentScale = ContentScale.Crop,
+            // The card is already sized to this item's own aspect ratio by the caller, so Fit
+            // fills it exactly — showing photos in their native orientation instead of cropping
+            // portrait/landscape shots to a fixed card shape.
+            contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
         )
 

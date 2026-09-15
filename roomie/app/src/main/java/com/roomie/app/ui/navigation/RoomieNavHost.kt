@@ -101,6 +101,7 @@ fun RoomieNavHost(viewModelFactory: ViewModelFactory) {
                 onBack = { navController.popBackStack() },
                 onStackExhausted = { navController.navigate(Routes.TRASH_PREVIEW) },
                 onLimitReached = { navController.navigate(Routes.SWIPE_LIMIT) },
+                onOpenTrashPreview = { navController.navigate(Routes.TRASH_PREVIEW) },
             )
         }
 
@@ -156,6 +157,7 @@ private fun SwipeSessionEntry(
     onBack: () -> Unit,
     onStackExhausted: () -> Unit,
     onLimitReached: () -> Unit,
+    onOpenTrashPreview: () -> Unit,
 ) {
     LaunchedEffect(bucketId, displayName, period) {
         viewModel.loadFolder(bucketId, displayName, period)
@@ -165,5 +167,6 @@ private fun SwipeSessionEntry(
         onBack = onBack,
         onStackExhausted = onStackExhausted,
         onLimitReached = onLimitReached,
+        onOpenTrashPreview = onOpenTrashPreview,
     )
 }

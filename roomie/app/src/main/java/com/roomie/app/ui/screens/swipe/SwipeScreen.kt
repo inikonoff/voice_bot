@@ -8,16 +8,20 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -44,6 +48,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.roomie.app.data.media.MediaGroup
 import kotlinx.coroutines.launch
@@ -58,8 +63,10 @@ fun SwipeScreen(
     onBack: () -> Unit,
     onStackExhausted: () -> Unit,
     onLimitReached: () -> Unit,
+    onOpenTrashPreview: () -> Unit,
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val pendingTrash by viewModel.pendingTrash.collectAsState()
 
     LaunchedEffect(uiState.hasReachedLimit) {
         if (uiState.hasReachedLimit) onLimitReached()
@@ -76,6 +83,15 @@ fun SwipeScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    if (pendingTrash.isNotEmpty()) {
+                        IconButton(onClick = onOpenTrashPreview) {
+                            BadgedBox(badge = { Badge { Text(pendingTrash.size.toString()) } }) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Review trash")
+                            }
+                        }
                     }
                 },
             )
@@ -137,6 +153,23 @@ private fun BottomActionBar(canUndo: Boolean, onUndo: () -> Unit) {
     }
 }
 
+/** The card that just left the stack, still flying off-screen on its own timeline so the newly
+ *  promoted top card underneath is interactive immediately instead of waiting for this to finish. */
+private data class ExitingCardState(
+    val group: MediaGroup,
+    val isFavorited: Boolean,
+    val startOffset: Offset,
+    val direction: SwipeDirection,
+)
+
+/** Fits a card of [ratio] (width/height) inside a [maxWidth] x [maxHeight] box, like
+ *  [androidx.compose.ui.layout.ContentScale.Fit] but sizing the composable itself rather than
+ *  its content — so differently-oriented photos each get their own natural size on screen. */
+private fun fitSize(ratio: Float, maxWidth: Dp, maxHeight: Dp): Pair<Dp, Dp> {
+    val containerRatio = maxWidth / maxHeight
+    return if (containerRatio > ratio) (maxHeight * ratio) to maxHeight else maxWidth to (maxWidth / ratio)
+}
+
 @Composable
 private fun CardStack(
     stack: List<MediaGroup>,
@@ -144,25 +177,50 @@ private fun CardStack(
     onSwiped: (SwipeDirection) -> Unit,
     onDoubleTap: (MediaGroup) -> Unit,
 ) {
+    var exiting by remember { mutableStateOf<ExitingCardState?>(null) }
+
     val top = stack.getOrNull(0)
     val behind = stack.getOrNull(1)
 
-    Box(modifier = Modifier.fillMaxWidth().aspectRatio(0.72f), contentAlignment = Alignment.Center) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         if (behind != null) {
+            val (w, h) = fitSize(behind.cover.aspectRatio, maxWidth, maxHeight)
             SwipeCard(
                 group = behind,
                 isFavorited = behind.cover.stableId in favoritedKeys,
                 modifier = Modifier
-                    .fillMaxSize()
+                    .size(w, h)
                     .graphicsLayer { scaleX = 0.94f; scaleY = 0.94f; alpha = 0.6f },
             )
         }
+
         if (top != null) {
+            val (w, h) = fitSize(top.cover.aspectRatio, maxWidth, maxHeight)
             DraggableCard(
                 group = top,
                 isFavorited = top.cover.stableId in favoritedKeys,
-                onSwiped = onSwiped,
+                cardWidth = w,
+                cardHeight = h,
+                onSwiped = { direction, releaseOffset ->
+                    exiting = ExitingCardState(
+                        group = top,
+                        isFavorited = top.cover.stableId in favoritedKeys,
+                        startOffset = releaseOffset,
+                        direction = direction,
+                    )
+                    onSwiped(direction)
+                },
                 onDoubleTap = { onDoubleTap(top) },
+            )
+        }
+
+        exiting?.let { ex ->
+            val (w, h) = fitSize(ex.group.cover.aspectRatio, maxWidth, maxHeight)
+            ExitingCard(
+                state = ex,
+                cardWidth = w,
+                cardHeight = h,
+                onFinished = { exiting = null },
             )
         }
     }
@@ -174,10 +232,41 @@ private val SWIPE_SPRING = spring<Offset>(
 )
 
 @Composable
+private fun ExitingCard(
+    state: ExitingCardState,
+    cardWidth: Dp,
+    cardHeight: Dp,
+    onFinished: () -> Unit,
+) {
+    val offset = remember(state) { Animatable(state.startOffset, Offset.VectorConverter) }
+    val thresholdPx = with(LocalDensity.current) { SWIPE_THRESHOLD_DP.dp.toPx() }
+
+    LaunchedEffect(state) {
+        val flingX = if (state.direction == SwipeDirection.RIGHT) 1600f else -1600f
+        offset.animateTo(Offset(flingX, state.startOffset.y), SWIPE_SPRING)
+        onFinished()
+    }
+
+    SwipeCard(
+        group = state.group,
+        isFavorited = state.isFavorited,
+        modifier = Modifier
+            .size(cardWidth, cardHeight)
+            .graphicsLayer {
+                translationX = offset.value.x
+                translationY = offset.value.y * 0.2f
+                rotationZ = (offset.value.x / thresholdPx) * 12f
+            },
+    )
+}
+
+@Composable
 private fun DraggableCard(
     group: MediaGroup,
     isFavorited: Boolean,
-    onSwiped: (SwipeDirection) -> Unit,
+    cardWidth: Dp,
+    cardHeight: Dp,
+    onSwiped: (SwipeDirection, Offset) -> Unit,
     onDoubleTap: () -> Unit,
 ) {
     val offset = remember(group.key) { Animatable(Offset.Zero, Offset.VectorConverter) }
@@ -190,7 +279,7 @@ private fun DraggableCard(
         group = group,
         isFavorited = isFavorited,
         modifier = Modifier
-            .fillMaxSize()
+            .size(cardWidth, cardHeight)
             .graphicsLayer {
                 translationX = offset.value.x
                 translationY = offset.value.y * 0.2f
@@ -211,12 +300,11 @@ private fun DraggableCard(
                     onDragEnd = {
                         val current = offset.value
                         if (abs(current.x) > thresholdPx) {
+                            // Hand off to the caller immediately — advancing to the next card
+                            // doesn't wait on this card's own fly-out animation, which continues
+                            // independently as an overlay (see ExitingCard).
                             val direction = if (current.x > 0) SwipeDirection.RIGHT else SwipeDirection.LEFT
-                            val flingX = if (direction == SwipeDirection.RIGHT) 1600f else -1600f
-                            scope.launch {
-                                offset.animateTo(Offset(flingX, current.y), SWIPE_SPRING)
-                                onSwiped(direction)
-                            }
+                            onSwiped(direction, current)
                         } else {
                             scope.launch { offset.animateTo(Offset.Zero, SWIPE_SPRING) }
                         }

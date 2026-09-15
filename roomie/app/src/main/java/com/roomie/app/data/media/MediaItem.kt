@@ -19,9 +19,16 @@ data class MediaItem(
     /** Absolute path, when readable (needs All Files Access on API 29+); used only for the
      *  optional empty-folder cleanup, never for reading/writing the file itself. */
     val filePath: String? = null,
+    /** Pixel dimensions as MediaStore reports them (already EXIF-orientation-corrected), used to
+     *  show each card at its own native aspect ratio instead of cropping to a fixed shape. */
+    val width: Int = 0,
+    val height: Int = 0,
 ) {
     /** Stable identity across image/video tables, since raw `_ID` can collide between them. */
     val stableId: String get() = if (isVideo) "v$id" else "i$id"
+
+    /** Falls back to a typical portrait ratio when MediaStore didn't report real dimensions. */
+    val aspectRatio: Float get() = if (width > 0 && height > 0) width.toFloat() / height.toFloat() else 3f / 4f
 }
 
 /**
