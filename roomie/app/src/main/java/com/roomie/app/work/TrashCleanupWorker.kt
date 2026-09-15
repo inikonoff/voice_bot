@@ -1,14 +1,12 @@
 package com.roomie.app.work
 
 import android.content.Context
-import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
-import androidx.work.WorkRequest
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.roomie.app.RoomieApplication
@@ -39,7 +37,7 @@ class TrashCleanupWorker(
 
             Result.success(workDataOf(KEY_FREED_BYTES to cleanup.freedBytes))
         } catch (_: Throwable) {
-            // Exponential backoff (configured below) handles transient I/O failures.
+            // WorkManager's default backoff policy handles transient I/O failures.
             Result.retry()
         }
     }
@@ -55,13 +53,12 @@ class TrashCleanupWorker(
                 .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                 .build()
 
+            // No explicit backoff criteria: WorkManager throws IllegalArgumentException ("Cannot
+            // set backoff criteria on an idle mode job") when combined with setRequiresDeviceIdle
+            // — this crashed every launch on every device. WorkManager still retries a Result.retry()
+            // with its own default backoff even without an explicit policy here.
             val request = PeriodicWorkRequestBuilder<TrashCleanupWorker>(6, TimeUnit.HOURS)
                 .setConstraints(constraints)
-                .setBackoffCriteria(
-                    BackoffPolicy.EXPONENTIAL,
-                    WorkRequest.MIN_BACKOFF_MILLIS,
-                    TimeUnit.MILLISECONDS,
-                )
                 .build()
 
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
