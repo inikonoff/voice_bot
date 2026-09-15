@@ -1,0 +1,6 @@
+<resources>
+    <!-- Compose owns theming; this is the minimal window-level theme Android needs before Compose attaches. -->
+    <style name="Theme.Roomie" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
