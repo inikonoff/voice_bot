@@ -131,8 +131,16 @@ class VisionProcessor:
                 }],
                 temperature=config.VISION_TEMPERATURE,
                 max_tokens=config.VISION_MAX_TOKENS,
+                # OCR не требует рассуждений; instruct mode также
+                # предотвращает попадание reasoning в основной текст ответа.
+                reasoning_effort="none",
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content or ""
+            # Дополнительная защита: некоторые модели/режимы могут вернуть
+            # reasoning прямо в content в виде <think>...</think>.
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r"<analysis>.*?</analysis>", "", content, flags=re.DOTALL | re.IGNORECASE)
+            return content.strip()
 
         try:
             return await _make_groq_request(self.groq_clients, extract)

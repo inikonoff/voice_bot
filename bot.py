@@ -61,8 +61,13 @@ def sanitize_llm_output(text: str) -> str:
     """
     import re
 
-    # 1. Null-байты
+    # 1. Null-байты и reasoning-теги.
+    # Groq reasoning-модели в raw-режиме могут вернуть <think>...</think>.
+    # Telegram HTML parse mode воспринимает <think> как HTML-тег и падает
+    # с "Unsupported start tag". Удаляем служебные блоки до HTML-экранирования.
     text = text.replace('\x00', '')
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<analysis>.*?</analysis>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
     # 2. Экранируем HTML-спецсимволы в сыром тексте
     text = text.replace('&', '&amp;')

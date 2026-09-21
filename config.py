@@ -339,9 +339,9 @@ BREAKDOWN_PROMPT = """Ты — внимательный редактор-пед�
 
 GROQ_MODELS = {
     "transcription": "whisper-large-v3-turbo",
-    # llama-4-scout был отключён Groq 17.07.2026 (404). Единственная
-    # действующая vision-модель на Groq сейчас — qwen3.6-27b.
-    "vision": "qwen/qwen3.6-27b",
+    # Qwen 3.8 27B — актуальная multimodal/Vision-модель Groq.
+    # Qwen 3.6 27B отключён 14.09.2026.
+    "vision": "qwen/qwen3.8-27b",
     # llama-3.1-8b-instant и llama-3.3-70b-versatile объявлены deprecated
     # (email от Groq 17.06.2026), отключение — 16.08.2026. Переезжаем
     # заранее на рекомендованную замену: gpt-oss заметно лучше держит
