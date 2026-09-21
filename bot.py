@@ -61,13 +61,8 @@ def sanitize_llm_output(text: str) -> str:
     """
     import re
 
-    # 1. Null-байты и reasoning-теги.
-    # Groq reasoning-модели в raw-режиме могут вернуть <think>...</think>.
-    # Telegram HTML parse mode воспринимает <think> как HTML-тег и падает
-    # с "Unsupported start tag". Удаляем служебные блоки до HTML-экранирования.
+    # 1. Null-байты
     text = text.replace('\x00', '')
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<analysis>.*?</analysis>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
     # 2. Экранируем HTML-спецсимволы в сыром тексте
     text = text.replace('&', '&amp;')
@@ -92,6 +87,11 @@ def sanitize_llm_output(text: str) -> str:
 
     # Заголовки Markdown (### / ## / #) → bold
     text = re.sub(r'^#{1,6}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    # Telegram rejects an empty message. This can happen when a reasoning-only
+    # response is stripped completely (for example, <think>...</think>).
+    if not text.strip():
+        return '❌ Модель не вернула текст.'
 
     return text
 
@@ -1213,6 +1213,7 @@ async def voice_handler(message: types.Message):
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
             preview += "..."
+        preview = sanitize_llm_output(preview)
 
         modes_text = "📝 Как есть, ✨ Красиво"
         if "summary" in available_modes:

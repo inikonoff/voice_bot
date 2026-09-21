@@ -339,8 +339,8 @@ BREAKDOWN_PROMPT = """Ты — внимательный редактор-пед�
 
 GROQ_MODELS = {
     "transcription": "whisper-large-v3-turbo",
-    # Qwen 3.8 27B — актуальная multimodal/Vision-модель Groq.
-    # Qwen 3.6 27B отключён 14.09.2026.
+    # llama-4-scout был отключён Groq 17.07.2026 (404). Единственная
+    # Актуальная multimodal/Vision-модель Groq: Qwen 3.8 27B.
     "vision": "qwen/qwen3.8-27b",
     # llama-3.1-8b-instant и llama-3.3-70b-versatile объявлены deprecated
     # (email от Groq 17.06.2026), отключение — 16.08.2026. Переезжаем
@@ -348,8 +348,7 @@ GROQ_MODELS = {
     # русский язык, чем старые Llama 3.x.
     "basic": "openai/gpt-oss-20b",
     "premium": "openai/gpt-oss-120b",
-    # "reasoning" использовался как заглушка на llama-4-scout — модель
-    # уже отключена, отсюда 404 при саммаризации. gpt-oss-120b поддерживает
+    # Для reasoning используем gpt-oss-120b; он поддерживает
     # reasoning_effort и совместим по вызовам (stream_document_answer,
     # explain_corrections, breakdown_corrections).
     "reasoning": "openai/gpt-oss-120b",

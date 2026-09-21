@@ -39,7 +39,7 @@
 |---|---|
 | Bot Framework | [aiogram 3.x](https://docs.aiogram.dev/) |
 | Web Server | [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) |
-| LLM / STT | [Groq Cloud](https://groq.com/) — Qwen 3.8 27B, GPT-OSS 20B/120B, Whisper large-v3-turbo |
+| LLM / STT | [Groq Cloud](https://groq.com/) — Llama 4 Scout, Llama 3.3 70B, Whisper large-v3-turbo |
 | OCR | Groq Vision (Qwen 3.8 27B) |
 | PDF | pdfplumber (чтение), reportlab (запись) |
 | DOCX | python-docx |
