@@ -62,7 +62,10 @@ PROVIDERS = {
         "base_url": "https://openrouter.ai/api/v1",
         # Список бесплатных моделей у OpenRouter ротируется — если начнёт
         # 404/400, проверить актуальный ID на openrouter.ai/models?max_price=0
-        "default_model": "openai/gpt-oss-20b:free",
+        # 120b, а не 20b: 20b на бесплатном тарифе галлюцинировала в «Ранее в
+        # книге» — если клиент не прислал модель (или прислал не из списка),
+        # откат должен идти на более сильную.
+        "default_model": "openai/gpt-oss-120b:free",
         # SEC: официальный префикс ключей OpenRouter.
         "key_prefix": "sk-or-v1-",
     },
@@ -72,7 +75,10 @@ PROVIDERS = {
 # даём подставить в chat.completions произвольную дорогую модель.
 ALLOWED_MODELS = {
     "groq": {"openai/gpt-oss-120b", "openai/gpt-oss-20b"},
-    "openrouter": {"openai/gpt-oss-20b:free", "openai/gpt-oss-120b:free"},
+    # "openrouter/free" — роутер OpenRouter: сам выбирает живую бесплатную
+    # модель; LINK использует его как запасной, когда конкретный :free-id
+    # снят с раздачи.
+    "openrouter": {"openai/gpt-oss-20b:free", "openai/gpt-oss-120b:free", "openrouter/free"},
 }
 
 MAX_MESSAGES_CHARS = 60_000  # грубый защитный лимит суммарного размера messages
@@ -249,4 +255,10 @@ async def _link_chat_impl(request: Request):
         # бэкенда.
         err_full = _scrub(str(e))
         logger.warning(f"LINK relay ({provider_name}) error: {err_full[:500]}")
+        # Ключ не принят — отдельный ответ: клиенту важно отличить это от
+        # «модель недоступна» (404/400/429), чтобы не перебирать запасные
+        # модели с заведомо плохим ключом.
+        status = getattr(e, "status_code", None)
+        if status in (401, 403):
+            return {"status": "error", "error": f"Ключ не принят провайдером (HTTP {status}). Проверьте ключ."}
         return {"status": "error", "error": "Ошибка провайдера. Проверьте ключ и попробуйте снова."}
