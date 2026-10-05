@@ -8,6 +8,7 @@
 import os
 import io
 import sys
+import math
 import signal
 import logging
 import asyncio
@@ -29,6 +30,7 @@ from aiogram.types import (
     FSInputFile,
     TelegramObject,
     BotCommand,
+    BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
@@ -36,6 +38,8 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 import config
+import html
+import access
 import processors
 import database
 import link
@@ -355,6 +359,64 @@ dp.message.middleware(ErrorHandlingMiddleware())
 dp.callback_query.middleware(ErrorHandlingMiddleware())
 
 
+class AccessMiddleware(BaseMiddleware):
+    """
+    Лимиты для обычных пользователей. Админ (ADMIN_IDS) проходит без проверок.
+    Здесь — только входные проверки (пауза, размеры, остаток); сама единица
+    списывается позже, в processors, в момент реального обращения к ИИ.
+    """
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+
+        uid = user.id
+        access.remember_user(user)
+        token = access.current_user_id.set(uid)
+        try:
+            if not access.is_admin(uid):
+                await access.ensure_loaded(uid)
+                if isinstance(event, types.Message):
+                    deny = self._check_message(event, uid)
+                    if deny is not None:
+                        if deny:   # пустая строка — отказать молча (например, альбом фото)
+                            try:
+                                await event.answer(deny)
+                            except Exception as e:
+                                logger.debug(f"Не смогли отправить отказ по лимиту: {e}")
+                        return None
+            return await handler(event, data)
+        finally:
+            access.current_user_id.reset(token)
+
+    @staticmethod
+    def _check_message(message: types.Message, uid: int) -> Optional[str]:
+        text = message.text or ""
+        if text.startswith("/"):              # команды бесплатны
+            return None
+        if uid in pending_filename_inputs:    # ввод имени файла для экспорта
+            return None
+
+        wait = access.cooldown_left(uid)
+        if wait > 0:
+            if message.media_group_id:        # альбом: не засыпаем пользователя ответами
+                return ""
+            return f"⏳ Не так быстро — подождите {math.ceil(wait)} с."
+
+        caps = access.check_message_caps(message)
+        if caps:
+            return caps
+
+        if access.remaining(uid) <= 0:
+            return access.limit_exhausted_message(uid)
+        return None
+
+
+dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
+
+
 # ============================================================================
 # POLLING TASK
 # ============================================================================
@@ -419,6 +481,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("📦 Работаем без базы данных")
 
+    # Администраторы, лимиты и выбор модели
+    if access.ADMIN_IDS:
+        logger.info(f"👑 Админы: {sorted(access.ADMIN_IDS)}")
+    else:
+        logger.warning("⚠️ ADMIN_IDS не задан: лимиты действуют на ВСЕХ, включая вас, "
+                       "а /model и /admin недоступны. Задайте ADMIN_IDS=<ваш Telegram ID>")
+    try:
+        await access.load_settings()
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось загрузить настройки модели: {e}")
+
     # Сброс вебхука
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -428,11 +501,23 @@ async def lifespan(app: FastAPI):
 
     # Меню команд (кнопка «Меню» в интерфейсе Telegram)
     try:
-        await bot.set_my_commands([
+        user_commands = [
             BotCommand(command="start",   description="👋 О боте"),
             BotCommand(command="help",    description="📋 Инструкция"),
             BotCommand(command="history", description="📜 История обработок"),
-        ])
+            BotCommand(command="limit",   description="📊 Мой дневной лимит"),
+        ]
+        await bot.set_my_commands(user_commands)
+        admin_commands = user_commands + [
+            BotCommand(command="model",  description="🧠 Выбор модели"),
+            BotCommand(command="admin",  description="👑 Статистика и лимиты"),
+            BotCommand(command="status", description="🛠 Состояние бота"),
+        ]
+        for admin_id in access.ADMIN_IDS:
+            try:
+                await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception as e:
+                logger.debug(f"Админское меню для {admin_id} не задано (бот ещё не запускали?): {e}")
         logger.info("✅ Bot commands menu set")
     except Exception as e:
         logger.warning(f"⚠️ Could not set bot commands: {e}")
@@ -1107,6 +1192,9 @@ async def help_handler(message: types.Message):
 @dp.message(Command("status"))
 async def status_handler(message: types.Message):
     stats["processed_messages"] += 1
+    if not access.is_admin(message.from_user.id):
+        await message.answer(access.limits_text(message.from_user.id), parse_mode="HTML")
+        return
     docx_status = "✅" if processors.DOCX_AVAILABLE else "❌"
     db_status = "✅ Supabase" if database.is_available() else "❌ нет БД"
     temp_files = len([
@@ -1123,8 +1211,156 @@ async def status_handler(message: types.Message):
         temp_files=temp_files,
     )
     status_text += f"\n🧠 Текстовая LLM: {processors.text_llm_label()}"
+    status_text += f"\n🎛 Модель для всех: {config.LLM_PROFILES[access.global_profile_key()]['label']}"
     status_text += f"\n\n💬 Активных диалогов: {len(active_dialogs)}"
     await message.answer(status_text, parse_mode="HTML")
+
+
+@dp.message(Command("limit"))
+async def limit_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    await message.answer(access.limits_text(message.from_user.id), parse_mode="HTML")
+
+
+# ============================================================================
+# ВЫБОР МОДЕЛИ (только администратор)
+# ============================================================================
+
+def _model_menu_text(uid: int) -> str:
+    profiles = config.LLM_PROFILES
+    personal = access.personal_profile_key(uid)
+    mine_key = access.profile_key_for(uid)
+    mine = profiles[mine_key]["label"] + (" (личный выбор)" if personal else " (общая)")
+    return (
+        "🧠 <b>Модель текстовой обработки</b>\n"
+        "Коррекция, «Красиво», саммари, перевод, разбор правок, вопросы по документу, "
+        "субтитры. Whisper и OCR остаются на Groq.\n\n"
+        f"Сейчас у вас: <b>{mine}</b>\n"
+        f"Для всех пользователей: <b>{profiles[access.global_profile_key()]['label']}</b>\n\n"
+        "<i>Конкретная модель работает строго: если она недоступна, вы увидите "
+        "ошибку, а не тихую подмену. «Авто» сама переключается между моделями и Groq.</i>"
+    )
+
+
+def _model_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    current = access.profile_key_for(uid)
+    personal = access.personal_profile_key(uid)
+    rows, row = [], []
+    for key, prof in config.LLM_PROFILES.items():
+        mark = "✅ " if key == current else ""
+        row.append(InlineKeyboardButton(text=mark + prof["label"], callback_data=f"llm_set_{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if personal and personal != access.global_profile_key():
+        rows.append([InlineKeyboardButton(text="📌 Сделать общей для всех", callback_data="llm_global")])
+    if personal:
+        rows.append([InlineKeyboardButton(text="↩️ Сбросить личный выбор", callback_data="llm_reset")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("model"))
+async def model_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    uid = message.from_user.id
+    if not access.is_admin(uid):
+        await message.answer("🧠 Модель подбирается автоматически. Выбирать её может только администратор.")
+        return
+    await message.answer(_model_menu_text(uid), parse_mode="HTML", reply_markup=_model_menu_kb(uid))
+
+
+@dp.callback_query(F.data.startswith("llm_"))
+async def model_callback(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if not access.is_admin(uid):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+
+    data = callback.data
+    note = ""
+    if data.startswith("llm_set_"):
+        key = data[len("llm_set_"):]
+        if key in config.LLM_PROFILES:
+            await access.set_personal_profile(uid, key)
+            note = f"Выбрано: {config.LLM_PROFILES[key]['label']}"
+    elif data == "llm_global":
+        key = access.profile_key_for(uid)
+        await access.set_global_profile(key)
+        note = f"Для всех: {config.LLM_PROFILES[key]['label']}"
+    elif data == "llm_reset":
+        await access.reset_personal_profile(uid)
+        note = "Личный выбор сброшен"
+    await callback.answer(note)
+
+    try:
+        await callback.message.edit_text(_model_menu_text(uid), parse_mode="HTML", reply_markup=_model_menu_kb(uid))
+    except Exception as e:
+        logger.debug(f"model menu edit skipped: {e}")
+
+
+# ============================================================================
+# АДМИН-ПАНЕЛЬ
+# ============================================================================
+
+@dp.message(Command("admin"))
+async def admin_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    if not access.is_admin(message.from_user.id):
+        return
+    day, active, total, top = await access.usage_snapshot()
+    lines = [
+        "👑 <b>Админ-панель</b>",
+        f"📅 {day} ({config.LIMITS_TZ_LABEL})",
+        f"👥 Активных пользователей сегодня: <b>{active}</b>",
+        f"🧮 Потрачено единиц: <b>{total}</b>",
+    ]
+    if top:
+        lines.append("\n🏆 <b>Больше всего за сегодня:</b>")
+        for uid, name, n in top:
+            lines.append(f"• {html.escape(name)} (<code>{uid}</code>) — {n}")
+    lines += [
+        "\n⚙️ <b>Лимиты для пользователей:</b>",
+        f"• {config.USER_DAILY_LIMIT} единиц в сутки",
+        f"• файл ≤ {config.USER_MAX_FILE_MB} МБ, голос ≤ {config.USER_MAX_AUDIO_SEC} с, "
+        f"текст ≤ {config.USER_MAX_TEXT_CHARS} симв., пауза {config.USER_COOLDOWN_SEC} с",
+        f"\n🎛 Модель для всех: <b>{config.LLM_PROFILES[access.global_profile_key()]['label']}</b>",
+        f"🗄 БД: {'✅ Supabase (счётчики сохраняются)' if database.is_available() else '❌ нет (счётчики сбросятся при рестарте)'}",
+        "\n<b>Команды:</b>",
+        "/model — выбор модели",
+        "/setlimit <code>ID число</code> — индивидуальный лимит (0 — заблокировать)",
+        "/setlimit <code>ID reset</code> — вернуть общий лимит",
+        "/status — техническое состояние",
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("setlimit"))
+async def setlimit_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    if not access.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    usage = "Использование: <code>/setlimit ID число</code> или <code>/setlimit ID reset</code>"
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit():
+        await message.answer(usage, parse_mode="HTML")
+        return
+    target = int(parts[1])
+    if access.is_admin(target):
+        await message.answer("👑 У администратора лимитов нет.")
+        return
+    value = parts[2].lower()
+    if value in ("reset", "default", "сброс"):
+        await access.set_user_limit(target, None)
+        await message.answer(f"✅ Для <code>{target}</code> действует общий лимит: {config.USER_DAILY_LIMIT}/сутки.",
+                             parse_mode="HTML")
+    elif value.isdigit():
+        await access.set_user_limit(target, int(value))
+        extra = " — пользователь заблокирован" if int(value) == 0 else ""
+        await message.answer(f"✅ Лимит для <code>{target}</code>: {int(value)}/сутки{extra}.", parse_mode="HTML")
+    else:
+        await message.answer(usage, parse_mode="HTML")
 
 
 @dp.message(Command("history"))
@@ -1674,12 +1910,17 @@ async def file_handler(message: types.Message):
         source_type = "file"
         if file_ext == "pdf":
             source_type = "pdf"
+        elif file_ext in ("md", "markdown", "mdown", "mkd"):
+            source_type = "markdown"
+        elif file_ext in ("srt", "vtt"):
+            source_type = "subtitles"
 
         asyncio.create_task(_bg_save_transcript(user_id, source_type, original_text, msg.message_id, message))
 
         preview = original_text[:config.PREVIEW_LENGTH]
         if len(original_text) > config.PREVIEW_LENGTH:
             preview += "..."
+        preview = html.escape(preview)   # в файлах (md/html/xml) бывают < и &, которые ломают parse_mode=HTML
 
         modes_text = "📝 Как есть, ✨ Красиво"
         if "summary" in available_modes:
@@ -1810,6 +2051,11 @@ async def process_callback(callback: types.CallbackQuery):
             result = original_text
 
         result_clean = sanitize_llm_output(result)
+        if result_clean.startswith("❌"):
+            # ошибка или лимит: не кэшируем и не меняем режим, даём повторить
+            await callback.message.edit_text(result_clean, parse_mode="HTML",
+                                             reply_markup=create_options_keyboard(user_id, msg_id))
+            return
         user_context[user_id][msg_id]["mode"] = mode
         user_context[user_id][msg_id]["cached_results"][mode] = result_clean
         schedule_persist(user_id, msg_id)
@@ -1880,6 +2126,10 @@ async def mode_callback(callback: types.CallbackQuery):
             processed = original_text
 
         processed_clean = sanitize_llm_output(processed)
+        if processed_clean.startswith("❌"):
+            # ошибка или лимит: прежний результат остаётся на экране, ошибку шлём отдельно
+            await callback.message.answer(processed_clean, parse_mode="HTML")
+            return
         user_context[user_id][msg_id]["mode"] = new_mode
         user_context[user_id][msg_id]["cached_results"][new_mode] = processed_clean
         schedule_persist(user_id, msg_id)
@@ -1948,6 +2198,10 @@ async def switch_callback(callback: types.CallbackQuery):
                 result = "❌ Неизвестный режим"
 
             result = sanitize_llm_output(result)
+            if result.startswith("❌"):
+                await callback.message.edit_text(result, parse_mode="HTML",
+                                                 reply_markup=create_switch_keyboard(target_user_id, msg_id))
+                return
             user_context[target_user_id][msg_id]["cached_results"][target_mode] = result
             schedule_persist(target_user_id, msg_id)
 

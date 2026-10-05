@@ -407,3 +407,82 @@ async def cleanup_stale_youtube_cache(max_age_days: int = 30) -> int:
     if result and result.data:
         return len(result.data)
     return 0
+
+
+# ============================================================================
+# НАСТРОЙКИ БОТА И ЛИМИТЫ (все функции молча работают без БД)
+# ============================================================================
+#
+# CREATE TABLE IF NOT EXISTS bot_settings (
+#     key TEXT PRIMARY KEY,
+#     value TEXT NOT NULL,
+#     updated_at TIMESTAMPTZ DEFAULT NOW()
+# );
+#
+# CREATE TABLE IF NOT EXISTS usage_daily (
+#     user_id BIGINT NOT NULL,
+#     day DATE NOT NULL,
+#     count INT NOT NULL DEFAULT 0,
+#     PRIMARY KEY (user_id, day)
+# );
+# CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day);
+#
+# bot_settings хранит: llm_default (модель по умолчанию для всех),
+# llm_user:<id> (личный выбор админа), limit:<id> (индивидуальный лимит).
+# Если таблиц нет — бот работает на памяти процесса (после рестарта сбрасывается).
+# ============================================================================
+
+
+async def get_setting(key: str) -> Optional[str]:
+    if not _available:
+        return None
+    result = await _run(lambda: (
+        _client.table("bot_settings").select("value").eq("key", key).limit(1).execute()
+    ))
+    if result and result.data:
+        return result.data[0].get("value")
+    return None
+
+
+async def set_setting(key: str, value: Optional[str]) -> bool:
+    """value=None — удалить настройку."""
+    if not _available:
+        return False
+    if value is None:
+        result = await _run(lambda: _client.table("bot_settings").delete().eq("key", key).execute())
+    else:
+        result = await _run(lambda: _client.table("bot_settings").upsert({
+            "key": key, "value": str(value), "updated_at": datetime.utcnow().isoformat(),
+        }, on_conflict="key").execute())
+    return result is not None
+
+
+async def get_usage(user_id: int, day: str) -> int:
+    if not _available:
+        return 0
+    result = await _run(lambda: (
+        _client.table("usage_daily").select("count")
+        .eq("user_id", user_id).eq("day", day).limit(1).execute()
+    ))
+    if result and result.data:
+        return int(result.data[0].get("count") or 0)
+    return 0
+
+
+async def set_usage(user_id: int, day: str, count: int) -> bool:
+    if not _available:
+        return False
+    result = await _run(lambda: _client.table("usage_daily").upsert({
+        "user_id": user_id, "day": day, "count": int(count),
+    }, on_conflict="user_id,day").execute())
+    return result is not None
+
+
+async def get_usage_day(day: str) -> List[Dict[str, Any]]:
+    """Все записи расхода за день: [{user_id, count}, ...]."""
+    if not _available:
+        return []
+    result = await _run(lambda: (
+        _client.table("usage_daily").select("user_id, count").eq("day", day).execute()
+    ))
+    return list(result.data) if result and result.data else []

@@ -225,7 +225,7 @@ START_MESSAGE = """👋 <b>iГрамотей v5</b>
 📥 <b>Что принимаю:</b>
 • Голосовые сообщения и кружочки 🎙️
 • Изображения с текстом 🖼️
-• Файлы: PDF, DOCX, TXT 📄
+• Файлы: PDF, DOCX, ODT, RTF, EPUB, FB2, TXT, MD, HTML, SRT/VTT 📄
 • Ссылки на сайты и статьи 🌐
 • Ссылки YouTube — субтитры без скачивания 📺
 • Прямой текст ✍️
@@ -245,7 +245,7 @@ HELP_MESSAGE = """📋 <b>Как пользоваться:</b>
 1. <b>Отправь мне что угодно:</b>
    • Голосовое или кружочек
    • Фото с текстом
-   • Файл (PDF, DOCX, TXT)
+   • Файл (PDF, DOCX, ODT, RTF, EPUB, FB2, TXT, MD, HTML, SRT/VTT)
    • Ссылку на статью или YouTube-видео
    • Просто текст
 
@@ -261,7 +261,7 @@ HELP_MESSAGE = """📋 <b>Как пользоваться:</b>
 Если субтитров нет — честно скажу об этом.
 
 📜 /history — последние 10 обработок
-📊 /status — состояние бота"""
+📊 /limit — остаток дневного лимита"""
 
 # Сообщения об ошибках
 ERROR_NO_GROQ = "❌ Для распознавания изображений нужны ключи Groq API."
@@ -269,6 +269,7 @@ ERROR_EMPTY_TEXT = "❌ Пустой текст"
 ERROR_TEXT_TOO_SHORT_FOR_SUMMARY = "📝 Текст слишком короткий для саммари. Используйте обычную коррекцию."
 ERROR_FILE_TOO_LARGE = "❌ Файл слишком большой (максимум 100 MB)"
 ERROR_NO_TEXT_IN_FILE = "❌ Не удалось найти текст в файле. Попробуйте: более чёткое изображение, файл с текстовым содержимым, прямой текст сообщением"
+ERROR_UNSUPPORTED_FORMAT = "❌ Этот формат не поддерживается. Принимаю: PDF, DOCX, ODT, RTF, EPUB, FB2, TXT, MD, HTML, SRT/VTT и изображения."
 ERROR_DOC_NOT_SUPPORTED = "❌ DOC файлы (старый формат Word) не поддерживаются. Сохраните файл как DOCX."
 ERROR_VIDEO_TOO_LONG = "❌ Видео слишком длинное (максимум 60 минут)"
 ERROR_PDF = "❌ Ошибка при чтении PDF. Возможно, файл защищён или содержит только изображения."
@@ -406,3 +407,79 @@ OPENROUTER_EXTRA_BODY = {
     "subtitles": {"reasoning": {"enabled": False}},
     "reasoning": {"reasoning": {"effort": "low"}},
 }
+
+
+# ============================================================================
+# ДОСТУП, ЛИМИТЫ И ВЫБОР МОДЕЛИ
+# ============================================================================
+# Администраторы задаются переменной окружения ADMIN_IDS (Telegram ID через
+# запятую; допустим и алиас ADMIN_ID). У администратора нет лимитов, и только
+# он может выбирать модель (/model), смотреть статистику (/admin) и менять
+# лимиты других пользователей (/setlimit).
+#
+# Все остальные пользователи ограничены. Значения можно менять переменными
+# окружения без правки кода:
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# 1 единица = 1 обращение к ИИ (распознавание голоса/фото, обработка текста,
+# перевод, разбор правок, вопрос по документу, форматирование субтитров).
+# Просмотр уже готового (кэшированного) результата и экспорт ничего не стоят.
+USER_DAILY_LIMIT = _env_int("USER_DAILY_LIMIT", 30)        # единиц в сутки
+USER_MAX_FILE_MB = _env_int("USER_MAX_FILE_MB", 10)        # размер файла/фото
+USER_MAX_AUDIO_SEC = _env_int("USER_MAX_AUDIO_SEC", 300)   # длина голоса/кружка/аудио
+USER_MAX_TEXT_CHARS = _env_int("USER_MAX_TEXT_CHARS", 15000)  # длина присланного текста
+USER_COOLDOWN_SEC = _env_int("USER_COOLDOWN_SEC", 3)       # пауза между сообщениями
+
+# Сутки считаются по этому часовому поясу (лимит сбрасывается в 00:00).
+LIMITS_TZ = os.environ.get("LIMITS_TZ", "Europe/Minsk")
+LIMITS_TZ_LABEL = os.environ.get("LIMITS_TZ_LABEL", "Минск")
+
+# Профили моделей для /model. models: None — штатные цепочки LLM_MODELS,
+# [] — без OpenRouter (только Groq), [..] — конкретная модель (строго: если она
+# недоступна, бот честно скажет об ошибке, а не подменит её другой).
+LLM_PROFILES = {
+    "auto": {
+        "label": "🤖 Авто",
+        "desc": "Gemma/Qwen на OpenRouter, при сбоях — Groq",
+        "models": None, "groq_fallback": True,
+    },
+    "gemma": {
+        "label": "✨ Gemma 4 31B",
+        "desc": "лучший русский слог",
+        "models": [_GEMMA], "groq_fallback": False,
+    },
+    "qwen": {
+        "label": "🧠 Qwen3.8 27B",
+        "desc": "длинные тексты, структура",
+        "models": [_QWEN], "groq_fallback": False,
+    },
+    "nemotron_super": {
+        "label": "🔬 Nemotron 3 Super",
+        "desc": "120B, рассуждающая",
+        "models": [_NEMOTRON_SUPER], "groq_fallback": False,
+    },
+    "nemotron_ultra": {
+        "label": "🏔 Nemotron 3 Ultra",
+        "desc": "550B, самая крупная",
+        "models": ["nvidia/nemotron-3-ultra-550b-a55b:free"], "groq_fallback": False,
+    },
+    "space_bunny": {
+        "label": "🐰 Space Bunny Alpha",
+        "desc": "stealth-модель, может исчезнуть",
+        "models": ["stealth/space-bunny-alpha"], "groq_fallback": False,
+    },
+    "groq": {
+        "label": "⚡ Groq gpt-oss",
+        "desc": "только Groq, без OpenRouter",
+        "models": [], "groq_fallback": True,
+    },
+}
+DEFAULT_LLM_PROFILE = os.environ.get("DEFAULT_LLM_PROFILE", "auto").strip().lower()
+if DEFAULT_LLM_PROFILE not in LLM_PROFILES:
+    DEFAULT_LLM_PROFILE = "auto"

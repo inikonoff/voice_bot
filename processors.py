@@ -20,6 +20,7 @@ from datetime import timedelta
 from openai import AsyncOpenAI
 
 import config
+import access
 
 # Попытка импорта дополнительных библиотек
 try:
@@ -89,6 +90,13 @@ async def _make_groq_request(groq_clients: list, func, *args, **kwargs):
     raise Exception(f"Все клиенты недоступны: {'; '.join(errors[:3])}")
 
 
+def _err_text(prefix: str, e: Exception, n: int = 100) -> str:
+    """Текст ошибки для пользователя; лимит показываем как лимит, а не как «ошибку»."""
+    if isinstance(e, access.QuotaExceeded):
+        return e.user_message
+    return f"❌ {prefix}: {str(e)[:n]}"
+
+
 def _truncate_text_for_model(text: str, model_type: str) -> str:
     model_limits = {
         "basic": 5000,
@@ -151,19 +159,38 @@ def _clean_llm_text(raw: Optional[str]) -> str:
     return s.strip()
 
 
+def _resolve_chain(kind: str) -> Tuple[list, bool]:
+    """
+    Цепочка моделей OpenRouter и разрешение отката на Groq для текущего
+    пользователя (профиль из /model; без пользователя — общий профиль).
+    """
+    prof = access.profile_for(access.current_user_id.get())
+    models = prof.get("models")
+    if models is None:
+        models = config.LLM_MODELS[kind]
+    return list(models), bool(prof.get("groq_fallback", True))
+
+
 async def _text_completion(kind: str, groq_clients: list, messages: list,
                            temperature: float, max_tokens: Optional[int] = None) -> str:
     """
     Один текстовый запрос к LLM.
-    1. OpenRouter: модели из config.LLM_MODELS[kind] по очереди, по
-       LLM_RETRIES_PER_MODEL попыток; 404 — сразу к следующей модели.
-    2. Если все модели недоступны — откат на Groq (config.GROQ_MODELS).
+    1. Списывает 1 единицу лимита у текущего пользователя (админу — нет).
+    2. OpenRouter: цепочка по профилю пользователя (см. /model и
+       config.LLM_PROFILES), по LLM_RETRIES_PER_MODEL попыток на модель;
+       404 — сразу к следующей модели.
+    3. Если профиль допускает откат — Groq (config.GROQ_MODELS).
     """
     last_err: Optional[Exception] = None
 
-    if _text_clients:
+    access.charge()   # 1 единица за обращение к ИИ (админ и фоновые задачи не списываются)
+    chain, groq_fallback = _resolve_chain(kind)
+
+    if chain and not _text_clients:
+        last_err = Exception("OpenRouter не настроен (нет OPENROUTER_API_KEYS)")
+    if chain and _text_clients:
         extra = config.OPENROUTER_EXTRA_BODY.get(kind)
-        for model in config.LLM_MODELS[kind]:
+        for model in chain:
             use_extra = bool(extra)
             for attempt in range(config.LLM_RETRIES_PER_MODEL):
                 client = random.choice(_text_clients)
@@ -192,9 +219,10 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
                         break                      # модели нет — следующая
                     if attempt < config.LLM_RETRIES_PER_MODEL - 1:   # после последней попытки не ждём
                         await asyncio.sleep(3 if ("429" in msg or "rate" in low) else 1)
-        logger.warning(f"[{kind}] все модели OpenRouter недоступны, откат на Groq")
+        logger.warning(f"[{kind}] все модели OpenRouter недоступны"
+                       + (", откат на Groq" if groq_fallback else ""))
 
-    if groq_clients:
+    if groq_clients and groq_fallback:
         gk = _GROQ_KIND.get(kind, kind)
 
         async def _groq_call(client):
@@ -219,10 +247,13 @@ async def _open_text_stream(kind: str, groq_clients: list, messages: list,
                             temperature: float, max_tokens: int):
     """Открывает потоковый запрос: OpenRouter по цепочке моделей, затем Groq."""
     last_err: Optional[Exception] = None
-    if _text_clients:
+    chain, groq_fallback = _resolve_chain(kind)
+    if chain and not _text_clients:
+        last_err = Exception("OpenRouter не настроен (нет OPENROUTER_API_KEYS)")
+    if chain and _text_clients:
         extra = config.OPENROUTER_EXTRA_BODY.get(kind)
         client = random.choice(_text_clients)
-        for model in config.LLM_MODELS[kind]:
+        for model in chain:
             use_extra = bool(extra)
             for _ in range(2):
                 kwargs: Dict[str, Any] = dict(model=model, messages=messages,
@@ -239,7 +270,7 @@ async def _open_text_stream(kind: str, groq_clients: list, messages: list,
                         use_extra = False
                         continue
                     break
-    if groq_clients:
+    if groq_clients and groq_fallback:
         gk = _GROQ_KIND.get(kind, kind)
         kwargs = dict(model=config.GROQ_MODELS[gk], messages=messages,
                       temperature=temperature, max_tokens=max_tokens, stream=True)
@@ -263,6 +294,10 @@ class VisionProcessor:
     async def extract_text(self, image_bytes: bytes) -> str:
         if not self.groq_clients:
             return config.ERROR_NO_GROQ
+        try:
+            access.charge()
+        except access.QuotaExceeded as qe:
+            return qe.user_message
 
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
@@ -285,7 +320,7 @@ class VisionProcessor:
             return await _make_groq_request(self.groq_clients, extract)
         except Exception as e:
             logger.error(f"Vision OCR error: {e}")
-            return f"❌ Ошибка распознавания текста: {str(e)[:100]}"
+            return _err_text("Ошибка распознавания текста", e)
 
 
 vision_processor = VisionProcessor()
@@ -352,6 +387,11 @@ def _segments_to_timecoded_text(segments: list) -> str:
 
 
 async def transcribe_voice(audio_bytes: bytes, groq_clients: list, with_timecodes: bool = False) -> str:
+    try:
+        access.charge()
+    except access.QuotaExceeded as qe:
+        return qe.user_message
+
     async def transcribe(client):
         if with_timecodes:
             response = await client.audio.transcriptions.create(
@@ -379,7 +419,7 @@ async def transcribe_voice(audio_bytes: bytes, groq_clients: list, with_timecode
         return await _make_groq_request(groq_clients, transcribe)
     except Exception as e:
         logger.error(f"Transcription error: {e}")
-        return f"❌ Ошибка распознавания: {str(e)[:100]}"
+        return _err_text("Ошибка распознавания", e)
 
 
 # ============================================================================
@@ -405,7 +445,7 @@ async def correct_text_basic(text: str, groq_clients: list) -> str:
                 return await _text_completion("basic", groq_clients, _msgs(shorter), temp, max_tokens=4000)
         except Exception as e2:
             e = e2
-        return f"❌ Ошибка коррекции: {str(e)[:100]}"
+        return _err_text("Ошибка коррекции", e)
 
 
 async def correct_text_premium(text: str, groq_clients: list) -> str:
@@ -427,7 +467,7 @@ async def correct_text_premium(text: str, groq_clients: list) -> str:
                 return await _text_completion("premium", groq_clients, _msgs(shorter), temp, max_tokens=4000)
         except Exception as e2:
             e = e2
-        return f"❌ Ошибка коррекции: {str(e)[:100]}"
+        return _err_text("Ошибка коррекции", e)
 
 
 # ============================================================================
@@ -463,7 +503,7 @@ async def summarize_text(text: str, groq_clients: list) -> str:
             e = e2
         if "empty_content" in str(e):
             return "❌ Модели вернули пустой ответ. Попробуйте ещё раз чуть позже."
-        return f"❌ Ошибка создания саммари: {str(e)[:100]}"
+        return _err_text("Ошибка создания саммари", e)
 
 
 # ============================================================================
@@ -1034,7 +1074,7 @@ async def translate_to_russian(text: str, groq_clients: list) -> str:
             "premium", groq_clients, [{"role": "user", "content": prompt}], 0.1, max_tokens=4000)
     except Exception as e:
         logger.error(f"Translation error: {e}")
-        return f"❌ Ошибка перевода: {str(e)[:100]}"
+        return _err_text("Ошибка перевода", e)
 
 
 # ============================================================================
@@ -1070,7 +1110,7 @@ async def explain_corrections(original_text: str, corrected_text: str, groq_clie
             "premium", groq_clients, [{"role": "user", "content": prompt}], 0.1, max_tokens=2000)
     except Exception as e:
         logger.error(f"Explain corrections error: {e}")
-        return f"❌ Ошибка при разборе правок: {str(e)[:100]}"
+        return _err_text("Ошибка при разборе правок", e)
 
 
 # ============================================================================
@@ -1114,6 +1154,12 @@ async def stream_document_answer(
 
     if user_id not in document_dialogues or msg_id not in document_dialogues[user_id]:
         yield "❌ Документ не найден. Сначала загрузите документ."
+        return
+
+    try:
+        access.charge()   # один вопрос = одна единица (повторы внутри не списываются)
+    except access.QuotaExceeded as qe:
+        yield qe.user_message
         return
 
     doc_data = document_dialogues[user_id][msg_id]
@@ -1232,7 +1278,7 @@ async def process_video_file(video_bytes: bytes, filename: str, groq_clients: li
 
     except Exception as e:
         logger.error(f"Error processing video file: {e}")
-        return f"❌ Ошибка обработки видеофайла: {str(e)[:100]}"
+        return _err_text("Ошибка обработки видеофайла", e)
 
 
 async def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -1294,22 +1340,373 @@ async def extract_text_from_docx(docx_bytes: bytes) -> str:
         return f"❌ Ошибка обработки DOCX: {str(e)}"
 
 
+def _decode_text_bytes(data: bytes) -> str:
+    """Декодирует байты в текст: BOM, UTF-16, UTF-8, затем кириллические кодировки."""
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for enc in ("utf-8-sig", "cp1251", "koi8-r", "cp866"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="ignore")
+
+
+def _normalize_text(text: str) -> str:
+    """Единый вид переносов, без NUL и лишних пустых строк."""
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def extract_text_from_txt(txt_bytes: bytes) -> str:
     try:
-        for encoding in ['utf-8', 'cp1251', 'koi8-r', 'windows-1251']:
-            try:
-                return txt_bytes.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return txt_bytes.decode('utf-8', errors='ignore')
+        return _normalize_text(_decode_text_bytes(txt_bytes))
     except Exception as e:
         logger.error(f"TXT reading error: {e}")
         return f"❌ Ошибка чтения текстового файла: {str(e)}"
 
 
+def _strip_markdown_front_matter(text: str) -> str:
+    """Убирает YAML front matter (--- ... ---) в начале .md файла."""
+    return re.sub(r"\A---\s*\n.*?\n(?:---|\.\.\.)\s*\n", "", text, count=1, flags=re.DOTALL)
+
+
+async def extract_text_from_markdown(md_bytes: bytes) -> str:
+    """Markdown читается как есть (разметка сохраняется), без front matter."""
+    return _normalize_text(_strip_markdown_front_matter(_decode_text_bytes(md_bytes)))
+
+
+_BLOCK_TAGS = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+               "section", "article", "blockquote", "pre", "ul", "ol", "table", "title"}
+_SKIP_TAGS = {"script", "style", "head", "noscript", "svg", "nav", "footer", "aside"}
+
+
+def _html_to_text(html_str: str) -> str:
+    from html.parser import HTMLParser
+
+    class _P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts: list = []
+            self.skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in _SKIP_TAGS:
+                self.skip += 1
+            if tag in _BLOCK_TAGS and not self.skip:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in _SKIP_TAGS and self.skip:
+                self.skip -= 1
+            if tag in _BLOCK_TAGS and not self.skip:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if not self.skip:
+                self.parts.append(data)
+
+    p = _P()
+    p.feed(html_str)
+    p.close()
+    text = "".join(p.parts)
+    text = re.sub(r"[ \t\u00a0]+", " ", text)
+    return _normalize_text(text)
+
+
+async def extract_text_from_html(html_bytes: bytes) -> str:
+    raw = html_bytes[:2000].decode("ascii", errors="ignore")
+    m = re.search(r'charset=["\']?([\w-]+)', raw, re.IGNORECASE)
+    text = None
+    if m:
+        try:
+            text = html_bytes.decode(m.group(1))
+        except (LookupError, UnicodeDecodeError):
+            text = None
+    if text is None:
+        text = _decode_text_bytes(html_bytes)
+    return await asyncio.to_thread(_html_to_text, text)
+
+
+def _xml_text_blocks(xml_bytes: bytes, block_tags: set) -> str:
+    """Собирает текст блочных элементов XML (абзацы, заголовки) в строки."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+    lines = []
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag in block_tags:
+            t = "".join(el.itertext()).strip()
+            if t:
+                lines.append(t)
+    return "\n\n".join(lines)
+
+
+async def extract_text_from_fb2(fb2_bytes: bytes) -> str:
+    """FB2: абзацы <p> из <body> (без бинарных вложений и заметок-обложек)."""
+    def _run():
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(fb2_bytes)
+        out = []
+        for body in root.iter():
+            if body.tag.rsplit("}", 1)[-1] != "body":
+                continue
+            for el in body.iter():
+                tag = el.tag.rsplit("}", 1)[-1]
+                if tag in ("p", "v", "subtitle", "text-author"):
+                    t = "".join(el.itertext()).strip()
+                    if t:
+                        out.append(t)
+                elif tag == "empty-line":
+                    out.append("")
+        return _normalize_text("\n".join(out))
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.error(f"FB2 error: {e}")
+        return f"❌ Ошибка чтения FB2: {str(e)[:100]}"
+
+
+async def extract_text_from_odt(odt_bytes: bytes) -> str:
+    def _run():
+        import zipfile
+        import xml.etree.ElementTree as ET
+        with zipfile.ZipFile(io.BytesIO(odt_bytes)) as z:
+            root = ET.fromstring(z.read("content.xml"))
+        ns_text = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+        lines = []
+
+        def walk(el):
+            for ch in el:
+                if ch.tag in (ns_text + "p", ns_text + "h"):
+                    parts = []
+                    for node in ch.iter():
+                        if node.tag == ns_text + "tab":
+                            parts.append("\t")
+                        elif node.tag == ns_text + "line-break":
+                            parts.append("\n")
+                        elif node.tag == ns_text + "s":
+                            parts.append(" " * int(node.get(ns_text + "c", "1")))
+                        if node.text and node.tag not in (ns_text + "tab", ns_text + "line-break"):
+                            parts.append(node.text)
+                        if node is not ch and node.tail:
+                            parts.append(node.tail)
+                    lines.append("".join(parts).strip())
+                else:
+                    walk(ch)
+        walk(root)
+        return _normalize_text("\n".join(lines))
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.error(f"ODT error: {e}")
+        return f"❌ Ошибка чтения ODT: {str(e)[:100]}"
+
+
+async def extract_text_from_epub(epub_bytes: bytes) -> str:
+    def _run():
+        import zipfile
+        import posixpath
+        import xml.etree.ElementTree as ET
+        z = zipfile.ZipFile(io.BytesIO(epub_bytes))
+        container = ET.fromstring(z.read("META-INF/container.xml"))
+        opf_path = next(e.get("full-path") for e in container.iter() if e.tag.endswith("rootfile"))
+        opf = ET.fromstring(z.read(opf_path))
+        base = posixpath.dirname(opf_path)
+        manifest = {}
+        for e in opf.iter():
+            if e.tag.endswith("}item") or e.tag == "item":
+                manifest[e.get("id")] = e.get("href")
+        order = [e.get("idref") for e in opf.iter() if e.tag.endswith("itemref") or e.tag == "itemref"]
+        chapters = []
+        for idref in order:
+            href = manifest.get(idref)
+            if not href:
+                continue
+            path = posixpath.normpath(posixpath.join(base, href.split("#")[0]))
+            if path not in z.namelist():
+                continue
+            raw = z.read(path)
+            chapters.append(_html_to_text(_decode_text_bytes(raw)))
+        return _normalize_text("\n\n".join(c for c in chapters if c))
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.error(f"EPUB error: {e}")
+        return f"❌ Ошибка чтения EPUB: {str(e)[:100]}"
+
+
+async def extract_text_from_rtf(rtf_bytes: bytes) -> str:
+    """Минимальный RTF → текст без внешних зависимостей (кириллица, \\uN, \\'hh)."""
+    def _run():
+        s = rtf_bytes.decode("latin-1")
+        m = re.search(r"\\ansicpg(\d+)", s)
+        cp = f"cp{m.group(1)}" if m else "cp1251"
+        skip_dest = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer",
+                     "footnote", "themedata", "colorschememapping", "latentstyles", "datastore",
+                     "listtable", "listoverridetable", "rsidtbl", "generator", "xmlnstbl", "fldinst"}
+        out = []
+        stack = []            # (skip, uc_skip)
+        skip = False
+        uc = 1
+        pending_skip = 0
+        pending_bytes = bytearray()
+
+        def flush_bytes():
+            if pending_bytes:
+                try:
+                    out.append(bytes(pending_bytes).decode(cp, errors="replace"))
+                except LookupError:
+                    out.append(bytes(pending_bytes).decode("cp1251", errors="replace"))
+                pending_bytes.clear()
+
+        i, n = 0, len(s)
+        while i < n:
+            c = s[i]
+            if c == "{":
+                flush_bytes()
+                stack.append((skip, uc))
+                i += 1
+                if s.startswith("\\*", i):
+                    skip = True
+                continue
+            if c == "}":
+                flush_bytes()
+                if stack:
+                    skip, uc = stack.pop()
+                i += 1
+                continue
+            if c == "\\":
+                i += 1
+                if i >= n:
+                    break
+                d = s[i]
+                if d in "\\{}":
+                    flush_bytes()
+                    if not skip and not pending_skip:
+                        out.append(d)
+                    elif pending_skip:
+                        pending_skip -= 1
+                    i += 1
+                elif d == "'":
+                    hx = s[i + 1:i + 3]
+                    i += 3
+                    if pending_skip:
+                        pending_skip -= 1
+                    elif not skip:
+                        try:
+                            pending_bytes.append(int(hx, 16))
+                        except ValueError:
+                            pass
+                elif d == "\n" or d == "\r":
+                    flush_bytes()
+                    if not skip:
+                        out.append("\n")
+                    i += 1
+                elif d == "~":
+                    flush_bytes()
+                    if not skip:
+                        out.append("\u00a0")
+                    i += 1
+                elif d == "-" or d == "_":
+                    i += 1
+                else:
+                    m2 = re.match(r"([a-zA-Z]+)(-?\d+)? ?", s[i:])
+                    if not m2:
+                        i += 1
+                        continue
+                    word, arg = m2.group(1), m2.group(2)
+                    i += m2.end()
+                    flush_bytes()
+                    if word in skip_dest:
+                        skip = True
+                    elif word == "uc" and arg is not None:
+                        uc = int(arg)
+                    elif word == "u" and arg is not None and not skip:
+                        code = int(arg)
+                        if code < 0:
+                            code += 65536
+                        out.append(chr(code))
+                        pending_skip = uc
+                    elif word in ("par", "line", "sect", "page") and not skip:
+                        out.append("\n")
+                    elif word == "tab" and not skip:
+                        out.append("\t")
+                    elif word == "emdash" and not skip:
+                        out.append("—")
+                    elif word == "endash" and not skip:
+                        out.append("–")
+                    elif word == "bullet" and not skip:
+                        out.append("•")
+                    elif word == "lquote" and not skip:
+                        out.append("‘")
+                    elif word == "rquote" and not skip:
+                        out.append("’")
+                    elif word == "ldblquote" and not skip:
+                        out.append("«")
+                    elif word == "rdblquote" and not skip:
+                        out.append("»")
+                continue
+            if c in "\r\n":
+                i += 1
+                continue
+            flush_bytes()
+            if pending_skip:
+                pending_skip -= 1
+            elif not skip:
+                out.append(c)
+            i += 1
+        flush_bytes()
+        return _normalize_text("".join(out))
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.error(f"RTF error: {e}")
+        return f"❌ Ошибка чтения RTF: {str(e)[:100]}"
+
+
+_SUB_TS = re.compile(r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{1,3}\s*-->\s*(?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{1,3}.*$")
+
+
+async def extract_text_from_subtitles(sub_bytes: bytes) -> str:
+    """SRT / VTT: убирает номера реплик, тайминги и теги, склеивает реплики в текст."""
+    text = _normalize_text(_decode_text_bytes(sub_bytes))
+    lines = []
+    for line in text.split("\n"):
+        t = line.strip()
+        if not t or t.upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        if re.fullmatch(r"\d+", t) or _SUB_TS.match(t):
+            continue
+        t = re.sub(r"<[^>]+>|\{\\[^}]*\}", "", t).strip()
+        if t:
+            lines.append(t)
+    return _normalize_text(" ".join(lines))
+
+
+_PLAIN_EXTS = {"txt", "text", "log", "rst", "tex", "org", "adoc", "nfo"}
+_MD_EXTS = {"md", "markdown", "mdown", "mkd"}
+_HTML_EXTS = {"html", "htm", "xhtml"}
+_SUB_EXTS = {"srt", "vtt"}
+
+
+def _looks_like_text(data: bytes) -> bool:
+    """Эвристика для неизвестных расширений: нет NUL-байтов и почти нет управляющих."""
+    sample = data[:4096]
+    if not sample or b"\x00" in sample and not sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return False
+    ctrl = sum(1 for b in sample if b < 9 or 13 < b < 32)
+    return ctrl / len(sample) < 0.02
+
+
 async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients: list) -> str:
     mime_type, _ = mimetypes.guess_type(filename)
-    file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
+    file_ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
 
     if mime_type and mime_type.startswith('image/') or file_ext in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
         vision_processor.init_clients(groq_clients)
@@ -1321,11 +1718,29 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, groq_clients:
     if mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or file_ext == 'docx':
         return await extract_text_from_docx(file_bytes)
 
-    if mime_type == 'text/plain' or file_ext == 'txt':
+    if file_ext == 'odt':
+        return await extract_text_from_odt(file_bytes)
+    if file_ext == 'rtf':
+        return await extract_text_from_rtf(file_bytes)
+    if file_ext == 'epub':
+        return await extract_text_from_epub(file_bytes)
+    if file_ext == 'fb2':
+        return await extract_text_from_fb2(file_bytes)
+    if file_ext in _MD_EXTS:
+        return await extract_text_from_markdown(file_bytes)
+    if file_ext in _HTML_EXTS:
+        return await extract_text_from_html(file_bytes)
+    if file_ext in _SUB_EXTS:
+        return await extract_text_from_subtitles(file_bytes)
+    if file_ext in _PLAIN_EXTS or mime_type == 'text/plain':
         return await extract_text_from_txt(file_bytes)
 
     if file_ext == 'doc':
         return config.ERROR_DOC_NOT_SUPPORTED
+
+    # Неизвестное расширение: если внутри похоже на текст — читаем как текст
+    if _looks_like_text(file_bytes) and not file_ext in ('zip', 'rar', '7z', 'exe', 'apk', 'mp3', 'mp4'):
+        return await extract_text_from_txt(file_bytes)
 
     return config.ERROR_UNSUPPORTED_FORMAT
 
@@ -1463,7 +1878,7 @@ async def breakdown_corrections(original_text: str, corrected_text: str, groq_cl
             "premium", groq_clients, [{"role": "user", "content": prompt}], 0.2, max_tokens=2000)
     except Exception as e:
         logger.error(f"Breakdown error: {e}")
-        return f"❌ Ошибка при разборе: {str(e)[:100]}"
+        return _err_text("Ошибка при разборе", e)
 
 
 # ============================================================================
