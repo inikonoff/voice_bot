@@ -8,7 +8,10 @@
 import os
 import io
 import sys
+import re
 import math
+import uuid
+import hashlib
 import signal
 import logging
 import asyncio
@@ -22,7 +25,7 @@ from openai import AsyncOpenAI
 import uvicorn
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -31,6 +34,7 @@ from aiogram.types import (
     TelegramObject,
     BotCommand,
     BotCommandScopeChat,
+    BotCommandScopeAllGroupChats,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramUnauthorizedError, TelegramNetworkError
@@ -41,6 +45,7 @@ import config
 import html
 import access
 import processors
+import textkit
 import database
 import link
 
@@ -183,6 +188,8 @@ def _serialize_ctx(ctx_data: Dict[str, Any]) -> Dict[str, Any]:
         "filename": ctx_data.get("filename"),
         "transcript_id": ctx_data.get("transcript_id"),
         "is_translated": ctx_data.get("is_translated", False),
+        "speaker_names": ctx_data.get("speaker_names", {}),
+        "dialogue_raw": ctx_data.get("dialogue_raw"),
     }
     t = ctx_data.get("time")
     if isinstance(t, datetime):
@@ -214,6 +221,8 @@ def _deserialize_ctx(payload: Dict[str, Any]) -> Dict[str, Any]:
         "filename": payload.get("filename"),
         "transcript_id": payload.get("transcript_id"),
         "is_translated": payload.get("is_translated", False),
+        "speaker_names": {int(k): v for k, v in (payload.get("speaker_names") or {}).items()},
+        "dialogue_raw": payload.get("dialogue_raw"),
         "time": t,
     }
 
@@ -296,6 +305,28 @@ processing_users: set = set()
 pending_filename_inputs: Dict[int, Dict[str, Any]] = {}
 
 groq_clients = []
+
+# img2prompt: режим ожидания картинок (user_id -> до какого времени, unix) и кэш
+# картинок для переключения стилей (token -> {user_id, jpeg, ratio, ts, results})
+awaiting_img2prompt: Dict[int, float] = {}
+img_prompt_cache: Dict[str, Dict[str, Any]] = {}
+img_detail_pref: Dict[int, int] = {}    # user_id -> выбранная подробность (1-3)
+
+# Имена собеседников: user_id -> {"msg_id": int, "ts": float} (ждём ответ пользователя)
+pending_speaker_names: Dict[int, Dict[str, Any]] = {}
+SPEAKER_NAMES_TIMEOUT = 600
+
+# Группы
+GROUP_TYPES = {"group", "supergroup"}
+group_auto: Dict[int, bool] = {}              # chat_id -> авто-расшифровка голосовых
+group_cache: Dict[str, Dict[str, Any]] = {}   # token -> {chat_id, text, ts, results}
+group_notified: Dict[int, str] = {}           # chat_id -> день, когда писали «лимит исчерпан»
+GROUP_CACHE_TTL = 3600
+GROUP_CACHE_MAX = 200
+
+# Inline-режим
+inline_cache: Dict[str, Dict[str, Any]] = {}  # token -> {user_id, text, ts}
+inline_claimed: Dict[str, float] = {}         # inline_message_id -> ts (защита от двойной обработки)
 
 
 # ============================================================================
@@ -393,9 +424,11 @@ class AccessMiddleware(BaseMiddleware):
     @staticmethod
     def _check_message(message: types.Message, uid: int) -> Optional[str]:
         text = message.text or ""
+        if message.chat.type != "private":    # группы: лимит чата и проверки делают групповые хендлеры
+            return None
         if text.startswith("/"):              # команды бесплатны
             return None
-        if uid in pending_filename_inputs:    # ввод имени файла для экспорта
+        if uid in pending_filename_inputs or uid in pending_speaker_names:   # ввод имени файла / имён
             return None
 
         wait = access.cooldown_left(uid)
@@ -415,6 +448,7 @@ class AccessMiddleware(BaseMiddleware):
 
 dp.message.middleware(AccessMiddleware())
 dp.callback_query.middleware(AccessMiddleware())
+dp.chosen_inline_result.middleware(AccessMiddleware())
 
 
 # ============================================================================
@@ -505,6 +539,7 @@ async def lifespan(app: FastAPI):
             BotCommand(command="start",   description="👋 О боте"),
             BotCommand(command="help",    description="📋 Инструкция"),
             BotCommand(command="history", description="📜 История обработок"),
+            BotCommand(command="img2prompt", description="🎨 Картинка → промпт"),
             BotCommand(command="limit",   description="📊 Мой дневной лимит"),
         ]
         await bot.set_my_commands(user_commands)
@@ -513,6 +548,14 @@ async def lifespan(app: FastAPI):
             BotCommand(command="admin",  description="👑 Статистика и лимиты"),
             BotCommand(command="status", description="🛠 Состояние бота"),
         ]
+        await bot.set_my_commands([
+            BotCommand(command="autovoice", description="🎙 Авто-расшифровка голосовых (вкл/выкл)"),
+            BotCommand(command="fix",       description="✨ Исправить сообщение (ответом)"),
+            BotCommand(command="summary",   description="📊 Саммари (ответом)"),
+            BotCommand(command="protocol",  description="📋 Протокол встречи (ответом)"),
+            BotCommand(command="dialogue",  description="👥 Диалог по ролям (ответом)"),
+            BotCommand(command="limit",     description="📊 Лимит чата"),
+        ], scope=BotCommandScopeAllGroupChats())
         for admin_id in access.ADMIN_IDS:
             try:
                 await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
@@ -899,7 +942,7 @@ def create_keyboard(msg_id: int, current_mode: str, available_modes: list = None
     if available_modes is None:
         available_modes = ["basic", "premium"]
 
-    mode_display = {"basic": "📝 Как есть", "premium": "✨ Красиво", "summary": "📊 Саммари"}
+    mode_display = config.MODE_LABELS
     mode_buttons = []
     for mode_code in available_modes:
         if mode_code in mode_display:
@@ -938,8 +981,14 @@ def create_options_keyboard(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✨ Красиво", callback_data=f"process_{user_id}_premium_{msg_id}"),
     )
     ctx_data = user_context.get(user_id, {}).get(msg_id)
-    if ctx_data and "summary" in ctx_data.get("available_modes", []):
-        builder.row(InlineKeyboardButton(text="📊 Саммари", callback_data=f"process_{user_id}_summary_{msg_id}"))
+    available = ctx_data.get("available_modes", []) if ctx_data else []
+    extra = [
+        InlineKeyboardButton(text=config.MODE_LABELS[m], callback_data=f"process_{user_id}_{m}_{msg_id}")
+        for m in ("summary", "protocol", "dialogue") if m in available
+    ]
+    for i in range(0, len(extra), 2):
+        builder.row(*extra[i:i + 2])
+    builder.row(InlineKeyboardButton(text="🎭 Стиль текста…", callback_data=f"stm_{user_id}_{msg_id}"))
     return builder.as_markup()
 
 
@@ -953,7 +1002,7 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
     available = ctx_data.get("available_modes", ["basic", "premium"])
     builder = InlineKeyboardBuilder()
 
-    mode_display = {"basic": "📝 Как есть", "premium": "✨ Красиво", "summary": "📊 Саммари"}
+    mode_display = config.MODE_LABELS
     mode_buttons = [
         InlineKeyboardButton(text=mode_display.get(m, m), callback_data=f"switch_{user_id}_{m}_{msg_id}")
         for m in available if m != current
@@ -971,12 +1020,22 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
             callback_data=f"dialog_start_{user_id}_{msg_id}"
         ))
 
+    # Стили и наглядный diff (diff бесплатный: считается кодом, без ИИ)
+    style_row = [InlineKeyboardButton(text="🎭 Стиль…", callback_data=f"stm_{user_id}_{msg_id}")]
+    if current in config.DIFF_MODES:
+        style_row.append(InlineKeyboardButton(text="🔍 Что изменилось", callback_data=f"diff_{msg_id}"))
+    builder.row(*style_row)
+
     # Кнопка "Работа над ошибками" — только для basic и premium
     if current in ("basic", "premium"):
         builder.row(InlineKeyboardButton(
             text="✏️ Работа над ошибками",
             callback_data=f"breakdown_{msg_id}"
         ))
+
+    # Диалог по ролям: подставить имена вместо «Говорящий N»
+    if current == "dialogue":
+        builder.row(InlineKeyboardButton(text="👥 Назвать собеседников", callback_data=f"spk_{msg_id}"))
 
     # Кнопка перевода — если оригинал не на русском
     original = ctx_data.get("original", "")
@@ -1000,6 +1059,37 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
         )
 
     return builder.as_markup()
+
+
+def _style_menu_kb(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    btns = [
+        InlineKeyboardButton(text=label, callback_data=f"switch_{user_id}_{key}_{msg_id}")
+        for key, (label, _) in config.EDIT_STYLES.items()
+    ]
+    for i in range(0, len(btns), 2):
+        builder.row(*btns[i:i + 2])
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"stmb_{user_id}_{msg_id}"))
+    return builder.as_markup()
+
+
+async def run_mode(mode: str, text: str, default: Optional[str] = None) -> str:
+    """Единая точка запуска режимов обработки (кнопки, группы, inline)."""
+    if mode == "basic":
+        return await processors.correct_text_basic(text, groq_clients)
+    if mode == "premium":
+        return await processors.correct_text_premium(text, groq_clients)
+    if mode == "summary":
+        return await processors.summarize_text(text, groq_clients)
+    if mode == "protocol":
+        return await processors.make_protocol(text, groq_clients)
+    if mode == "dialogue":
+        return await processors.make_dialogue(text, groq_clients)
+    if mode == "tr":
+        return await processors.translate_to_russian(text, groq_clients)
+    if mode in config.EDIT_STYLES:
+        return await processors.rewrite_in_style(text, mode, groq_clients)
+    return default if default is not None else "❌ Неизвестный режим"
 
 
 # ============================================================================
@@ -1216,9 +1306,234 @@ async def status_handler(message: types.Message):
     await message.answer(status_text, parse_mode="HTML")
 
 
+# ============================================================================
+# IMG2PROMPT — картинка → промпт для генератора изображений
+# ============================================================================
+
+_IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "bmp", "gif")
+
+
+def _image_file_id(message: Optional[types.Message]) -> Optional[str]:
+    """file_id картинки из сообщения: фото или документ-изображение."""
+    if message is None:
+        return None
+    if message.photo:
+        return message.photo[-1].file_id
+    doc = message.document
+    if doc is not None:
+        ext = (doc.file_name or "").lower().rsplit(".", 1)[-1] if "." in (doc.file_name or "") else ""
+        if (doc.mime_type or "").startswith("image/") or ext in _IMAGE_EXTS:
+            return doc.file_id
+    return None
+
+
+def _wants_img2prompt(message: types.Message) -> bool:
+    """Включён режим ожидания или подпись к картинке вида «промпт»."""
+    uid = message.from_user.id
+    deadline = awaiting_img2prompt.get(uid)
+    if deadline:
+        if time.time() < deadline:
+            awaiting_img2prompt[uid] = time.time() + config.IMG2PROMPT_AWAIT_SEC   # продлеваем
+            return True
+        awaiting_img2prompt.pop(uid, None)
+    caption = message.caption or ""
+    return bool(re.match(config.IMG2PROMPT_TRIGGER_RE, caption, re.IGNORECASE))
+
+
+def _img_cache_put(user_id: int, jpeg: bytes, ratio: str) -> str:
+    now = time.time()
+    for t in [t for t, e in img_prompt_cache.items() if now - e["ts"] > config.IMG2PROMPT_CACHE_TTL]:
+        img_prompt_cache.pop(t, None)
+    while len(img_prompt_cache) >= config.IMG2PROMPT_CACHE_MAX:
+        oldest = min(img_prompt_cache, key=lambda t: img_prompt_cache[t]["ts"])
+        img_prompt_cache.pop(oldest, None)
+    token = uuid.uuid4().hex[:8]
+    img_prompt_cache[token] = {"user_id": user_id, "jpeg": jpeg, "ratio": ratio, "ts": now, "results": {}}
+    return token
+
+
+async def _get_detail(user_id: int) -> int:
+    """Подробность пользователя: память → БД (один раз) → значение по умолчанию."""
+    if user_id in img_detail_pref:
+        return img_detail_pref[user_id]
+    d = config.IMG2PROMPT_DEFAULT_DETAIL
+    raw = await database.get_setting(f"img_detail:{user_id}")
+    if raw and raw.isdigit() and int(raw) in config.IMG2PROMPT_DETAILS:
+        d = int(raw)
+    img_detail_pref[user_id] = d
+    return d
+
+
+async def _set_detail(user_id: int, detail: int) -> None:
+    if detail in config.IMG2PROMPT_DETAILS:
+        img_detail_pref[user_id] = detail
+        await database.set_setting(f"img_detail:{user_id}", str(detail))
+
+
+def _render_img_prompt(raw: str, style: str, detail: int = 0) -> str:
+    detail = detail if detail in config.IMG2PROMPT_DETAILS else config.IMG2PROMPT_DEFAULT_DETAIL
+    parts = processors.fit_prompt_sections(processors.parse_img_prompt(raw), detail)
+    esc = lambda s, n: html.escape((s or "")[:n], quote=False)
+    label = config.IMG2PROMPT_STYLES[style][0]
+    dlabel = config.IMG2PROMPT_DETAILS[detail][0]
+    n_chars = len(parts.get("prompt", ""))
+    lines = [f"<b>{html.escape(label)}</b> · {html.escape(dlabel)} · <i>{n_chars} зн.</i>", ""]
+    if style == "r":
+        lines.append(esc(parts.get("prompt"), 3000))
+    else:
+        lines.append(f"<code>{esc(parts.get('prompt'), 2600)}</code>")
+        short, prompt = parts.get("short", ""), parts.get("prompt", "")
+        if short and short != prompt:
+            lines += ["", "⚡ <b>Коротко</b>", f"<code>{esc(short, 300)}</code>"]
+        if parts.get("negative"):
+            lines += ["", "🚫 <b>Negative</b>", f"<code>{esc(parts['negative'], 600)}</code>"]
+        if parts.get("ru"):
+            lines += ["", f"🇷🇺 <i>{esc(parts['ru'], 400)}</i>"]
+    lines += ["", "<i>Нажмите на промпт, чтобы скопировать</i>" if style != "r" else ""]
+    return "\n".join(lines).rstrip()
+
+
+def _img_prompt_kb(token: str, current: str, detail: int) -> InlineKeyboardMarkup:
+    # callback_data: ip_<действие>_<стиль>_<подробность>_<токен>; действие: s — стиль, d — подробность, r — заново
+    btns = []
+    for key, (label, _) in config.IMG2PROMPT_STYLES.items():
+        mark = "✅ " if key == current else ""
+        btns.append(InlineKeyboardButton(text=mark + label, callback_data=f"ip_s_{key}_{detail}_{token}"))
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([
+        InlineKeyboardButton(text=("✅ " if d == detail else "") + spec[0], callback_data=f"ip_d_{current}_{d}_{token}")
+        for d, spec in config.IMG2PROMPT_DETAILS.items()
+    ])
+    rows.append([InlineKeyboardButton(text="🔄 Другой вариант", callback_data=f"ip_r_{current}_{detail}_{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def run_img2prompt(message: types.Message, file_id: str, user_id: int, style: str = "u"):
+    if is_shutting_down:
+        await message.answer("🛑 Бот останавливается, попробуйте позже.")
+        return
+    if not processors.has_text_llm(groq_clients):
+        await message.answer("❌ Нет доступных LLM-клиентов")
+        return
+    if user_id in processing_users:
+        await message.answer(config.ERROR_BUSY)
+        return
+
+    processing_users.add(user_id)
+    status = await message.answer("🎨 Разглядываю картинку...")
+    try:
+        file_info = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        jpeg, ratio = await asyncio.to_thread(processors.prepare_image_for_vision, buf.getvalue())
+
+        detail = await _get_detail(user_id)
+        raw = await processors.image_to_prompt(jpeg, ratio, style, groq_clients, detail=detail)
+        if raw.startswith("❌"):
+            await status.edit_text(raw)
+            return
+        token = _img_cache_put(user_id, jpeg, ratio)
+        img_prompt_cache[token]["results"][f"{style}{detail}"] = raw
+        await status.edit_text(_render_img_prompt(raw, style, detail), parse_mode="HTML",
+                               reply_markup=_img_prompt_kb(token, style, detail))
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}")
+    except Exception as e:
+        logger.error(f"img2prompt error: {e}", exc_info=True)
+        if not is_shutting_down:
+            await status.edit_text("❌ Не удалось обработать картинку. Попробуйте ещё раз.")
+    finally:
+        processing_users.discard(user_id)
+
+
+@dp.message(Command("img2prompt", "prompt"))
+async def img2prompt_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    uid = message.from_user.id
+    # команда в подписи к картинке или ответом на картинку — обрабатываем сразу
+    file_id = _image_file_id(message) or _image_file_id(message.reply_to_message)
+    if file_id:
+        await run_img2prompt(message, file_id, uid)
+        return
+    awaiting_img2prompt[uid] = time.time() + config.IMG2PROMPT_AWAIT_SEC
+    await message.answer(config.IMG2PROMPT_HINT, parse_mode="HTML")
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    uid = message.from_user.id
+    did = False
+    if awaiting_img2prompt.pop(uid, None):
+        await message.answer("✅ Режим «картинка → промпт» выключен. Фото снова читаются как текст.")
+        did = True
+    if pending_speaker_names.pop(uid, None):
+        await message.answer("✅ Ввод имён собеседников отменён.")
+        did = True
+    if not did:
+        await message.answer("Отменять нечего.")
+
+
+@dp.callback_query(F.data.startswith("ip_"))
+async def img2prompt_callback(callback: types.CallbackQuery):
+    if is_shutting_down:
+        await callback.answer("🛑 Бот останавливается", show_alert=True)
+        return
+    parts = (callback.data or "").split("_")
+    if (len(parts) != 5 or parts[1] not in ("s", "d", "r") or parts[2] not in config.IMG2PROMPT_STYLES
+            or not parts[3].isdigit() or int(parts[3]) not in config.IMG2PROMPT_DETAILS):
+        await callback.answer()
+        return
+    _, action, style, detail_s, token = parts
+    detail = int(detail_s)
+    uid = callback.from_user.id
+    entry = img_prompt_cache.get(token)
+    if not entry or entry["user_id"] != uid:
+        await callback.answer("Картинка устарела — пришлите её заново", show_alert=True)
+        return
+    entry["ts"] = time.time()
+    if action == "d":
+        await _set_detail(uid, detail)      # запоминаем как предпочтение для новых картинок
+
+    regen = action == "r"
+    key = f"{style}{detail}"
+    cached = None if regen else entry["results"].get(key)
+    if cached:      # уже сгенерированный вариант — бесплатно
+        await callback.answer()
+        await callback.message.edit_text(_render_img_prompt(cached, style, detail), parse_mode="HTML",
+                                         reply_markup=_img_prompt_kb(token, style, detail))
+        return
+
+    if uid in processing_users:
+        await callback.answer("Подождите, идёт обработка", show_alert=True)
+        return
+    processing_users.add(uid)
+    await callback.answer("🎨 Пишу промпт...")
+    try:
+        raw = await processors.image_to_prompt(entry["jpeg"], entry["ratio"], style, groq_clients,
+                                               regenerate=regen, detail=detail)
+        if raw.startswith("❌"):
+            # ошибка или лимит: ничего не кэшируем, прежний результат остаётся, ошибка — отдельным сообщением
+            await callback.message.answer(raw)
+            return
+        entry["results"][key] = raw
+        await callback.message.edit_text(_render_img_prompt(raw, style, detail), parse_mode="HTML",
+                                         reply_markup=_img_prompt_kb(token, style, detail))
+    except Exception as e:
+        logger.error(f"img2prompt callback error: {e}", exc_info=True)
+        if not is_shutting_down:
+            await callback.message.answer("❌ Не удалось создать промпт. Попробуйте ещё раз.")
+    finally:
+        processing_users.discard(uid)
+
+
 @dp.message(Command("limit"))
 async def limit_handler(message: types.Message):
     stats["processed_messages"] += 1
+    if message.chat.type in GROUP_TYPES:      # в группе показываем лимит чата
+        await access.ensure_loaded(message.chat.id)
+        await message.answer(access.group_limits_text(message.chat.id), parse_mode="HTML")
+        return
     await message.answer(access.limits_text(message.from_user.id), parse_mode="HTML")
 
 
@@ -1407,6 +1722,296 @@ async def exit_dialog_handler(message: types.Message):
 # ============================================================================
 # ГОЛОСОВЫЕ И КРУЖОЧКИ
 # ============================================================================
+
+# ============================================================================
+# ГРУППЫ
+# ============================================================================
+# Бот в группе: авто-расшифровка голосовых и кружков (включается /autovoice on),
+# команды ответом на сообщение: /fix /summary /protocol /dialogue.
+# Расход списывается с лимита ЧАТА (config.GROUP_DAILY_LIMIT); сообщения
+# администратора бота бесплатны. Чтобы бот видел все голосовые, в @BotFather
+# отключите Group Privacy (/setprivacy → Disable) или сделайте бота админом группы.
+# Эти хендлеры стоят выше личных, поэтому личная логика в группах не срабатывает.
+
+_GROUP_COMMAND_MODES = {"fix": "premium", "summary": "summary", "protocol": "protocol", "dialogue": "dialogue"}
+_GROUP_ALLOWED_MODES = {"basic", "premium", "summary", "protocol", "dialogue"}
+
+
+async def _group_auto_enabled(chat_id: int) -> bool:
+    if chat_id not in group_auto:
+        group_auto[chat_id] = (await database.get_setting(f"group_auto:{chat_id}")) == "1"
+    return group_auto[chat_id]
+
+
+async def _can_manage_group(message: types.Message) -> bool:
+    if message.sender_chat and message.sender_chat.id == message.chat.id:   # анонимный админ
+        return True
+    uid = message.from_user.id if message.from_user else 0
+    if access.is_admin(uid):
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat.id, uid)
+        return member.status in ("creator", "administrator")
+    except Exception as e:
+        logger.debug(f"get_chat_member failed: {e}")
+        return False
+
+
+async def _group_billing(message: types.Message) -> int:
+    """Кого списывать: администратор бота — бесплатно (по его id), иначе лимит чата."""
+    chat = message.chat
+    access.remember_name(chat.id, f"👥 {chat.title or chat.id}")
+    sender = message.from_user.id if message.from_user else 0
+    if access.is_admin(sender):
+        billing = sender
+    else:
+        await access.ensure_loaded(chat.id)
+        billing = chat.id
+    access.current_user_id.set(billing)
+    return billing
+
+
+async def _group_quota_ok(message: types.Message, billing: int, notify: bool = True) -> bool:
+    if access.is_admin(billing) or (access.remaining(billing) or 0) > 0:
+        return True
+    day = access.today_str()
+    if notify and group_notified.get(message.chat.id) != day:      # не чаще раза в сутки
+        group_notified[message.chat.id] = day
+        try:
+            await message.reply(access.limit_exhausted_message(billing), parse_mode="HTML")
+        except Exception as e:
+            logger.debug(f"group notice failed: {e}")
+    return False
+
+
+def _group_cache_put(chat_id: int, text: str) -> str:
+    now = time.time()
+    for t in [t for t, e in group_cache.items() if now - e["ts"] > GROUP_CACHE_TTL]:
+        group_cache.pop(t, None)
+    while len(group_cache) >= GROUP_CACHE_MAX:
+        group_cache.pop(min(group_cache, key=lambda t: group_cache[t]["ts"]), None)
+    token = uuid.uuid4().hex[:8]
+    group_cache[token] = {"chat_id": chat_id, "text": text, "ts": now, "results": {}, "busy": set()}
+    return token
+
+
+def _group_kb(token: str, text: str) -> Optional[InlineKeyboardMarkup]:
+    modes = [m for m in ("premium", "summary", "protocol", "dialogue") if m in processors.get_available_modes(text)]
+    btns = [InlineKeyboardButton(text=config.MODE_LABELS[m], callback_data=f"gr_{m}_{token}") for m in modes]
+    if not btns:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[btns[i:i + 2] for i in range(0, len(btns), 2)])
+
+
+async def _download_media(file_id: str) -> bytes:
+    info = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(info.file_path, buf)
+    return buf.getvalue()
+
+
+def _media_of(message: Optional[types.Message]):
+    """(объект медиа, вид) для голосового, кружка, видео, аудио и аудио/видео-документов."""
+    if message is None:
+        return None, ""
+    if message.voice:
+        return message.voice, "audio"
+    if message.video_note:
+        return message.video_note, "video"
+    if message.video:
+        return message.video, "video"
+    if message.audio:
+        return message.audio, "audio"
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith("audio/"):
+        return doc, "audio"
+    if doc and (doc.mime_type or "").startswith("video/"):
+        return doc, "video"
+    return None, ""
+
+
+async def _transcribe_group_media(message: types.Message, billing: int) -> str:
+    media, kind = _media_of(message)
+    if media is None:
+        return ""
+    if not access.is_admin(billing):
+        if (getattr(media, "duration", 0) or 0) > config.USER_MAX_AUDIO_SEC:
+            return f"❌ Запись длиннее {config.USER_MAX_AUDIO_SEC // 60} мин. Длинные записи — в личку боту."
+        if (getattr(media, "file_size", 0) or 0) > config.USER_MAX_FILE_MB * 1024 * 1024:
+            return f"❌ Файл больше {config.USER_MAX_FILE_MB} МБ. Длинные записи — в личку боту."
+    try:
+        data = await _download_media(media.file_id)
+    except Exception as e:
+        logger.warning(f"group download failed: {e}")
+        return "❌ Не удалось скачать файл (Telegram отдаёт ботам файлы до 20 МБ)."
+    if kind == "video":
+        return await processors.process_video_file(data, "video.mp4", groq_clients)
+    return await processors.transcribe_voice(data, groq_clients)
+
+
+@dp.message(Command("autovoice"))
+async def autovoice_handler(message: types.Message, command: CommandObject):
+    stats["processed_messages"] += 1
+    if message.chat.type not in GROUP_TYPES:
+        await message.answer("🎙 Это команда для групп: добавьте бота в чат и напишите там /autovoice on.")
+        return
+    arg = (command.args or "").strip().lower()
+    chat_id = message.chat.id
+    if arg in ("on", "off", "вкл", "выкл"):
+        if not await _can_manage_group(message):
+            await message.reply("Включать и выключать могут только администраторы чата.")
+            return
+        on = arg in ("on", "вкл")
+        group_auto[chat_id] = on
+        await database.set_setting(f"group_auto:{chat_id}", "1" if on else "0")
+        await message.reply("🎙 Авто-расшифровка голосовых и кружков <b>включена</b>." if on
+                            else "🔇 Авто-расшифровка <b>выключена</b>.", parse_mode="HTML")
+        return
+    state = "включена" if await _group_auto_enabled(chat_id) else "выключена"
+    await message.reply(
+        f"🎙 Авто-расшифровка голосовых: <b>{state}</b>.\n"
+        "Включить/выключить: <code>/autovoice on</code> / <code>/autovoice off</code> (админы чата).\n\n"
+        "Ответом на любое сообщение: /fix — исправить, /summary — саммари, /protocol — протокол, "
+        "/dialogue — диалог по ролям. Работает и с голосовыми, и с аудиофайлами.\n"
+        "Лимит чата: /limit",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("fix", "summary", "protocol", "dialogue"), F.chat.type.in_(GROUP_TYPES))
+async def group_command_handler(message: types.Message, command: CommandObject):
+    stats["processed_messages"] += 1
+    if is_shutting_down:
+        return
+    mode = _GROUP_COMMAND_MODES[command.command]
+    target = message.reply_to_message
+    if target is None:
+        await message.reply(f"Ответьте командой /{command.command} на сообщение с текстом, голосовым или аудиофайлом.")
+        return
+    billing = await _group_billing(message)
+    if not await _group_quota_ok(message, billing):
+        return
+
+    status = await message.reply("⏳ Обрабатываю…")
+    try:
+        text = (target.text or target.caption or "").strip()
+        if not text:
+            media, _ = _media_of(target)
+            if media is None:
+                await status.edit_text("Не вижу текста или записи в этом сообщении.")
+                return
+            await status.edit_text("🎙 Расшифровываю…")
+            text = (await _transcribe_group_media(target, billing)).strip()
+            if text.startswith("❌"):
+                await status.edit_text(text)
+                return
+        if mode not in processors.get_available_modes(text):
+            await status.edit_text("Текст слишком короткий для этого режима. Для /fix подойдёт любой.")
+            return
+        await status.edit_text(f"⏳ {config.MODE_LABELS.get(mode, mode)}…")
+        result = await run_mode(mode, text)
+        if result.startswith("❌") or result.startswith("📝"):
+            await status.edit_text(result)
+            return
+        chunks = _split_for_telegram(sanitize_llm_output(result))
+        await status.edit_text(chunks[0], parse_mode="HTML")
+        for extra in chunks[1:]:
+            await message.answer(extra, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"group command error: {e}", exc_info=True)
+        try:
+            await status.edit_text("❌ Не удалось обработать сообщение.")
+        except Exception:
+            pass
+
+
+@dp.message(F.voice | F.video_note, F.chat.type.in_(GROUP_TYPES))
+async def group_voice_handler(message: types.Message):
+    """Авто-расшифровка голосовых и кружков (только если включено /autovoice on)."""
+    if is_shutting_down or not await _group_auto_enabled(message.chat.id):
+        return
+    media, _ = _media_of(message)
+    if media is None:
+        return
+    # тихо пропускаем слишком длинное/большое: в группах не шумим
+    if (media.duration or 0) > config.USER_MAX_AUDIO_SEC or \
+            (media.file_size or 0) > config.USER_MAX_FILE_MB * 1024 * 1024:
+        return
+    billing = await _group_billing(message)
+    if not await _group_quota_ok(message, billing):
+        return
+    text = (await _transcribe_group_media(message, billing)).strip()
+    if not text:
+        return
+    if text.startswith("❌"):
+        await message.reply(text, parse_mode="HTML")
+        return
+    author = html.escape(message.from_user.full_name if message.from_user else "Участник")
+    token = _group_cache_put(message.chat.id, text)
+    shown = text if len(text) <= 3500 else text[:3500].rstrip() + "…"
+    await message.reply(f"🎙 <b>{author}:</b>\n{html.escape(shown, quote=False)}", parse_mode="HTML",
+                        reply_markup=_group_kb(token, text))
+
+
+@dp.callback_query(F.data.startswith("gr_"))
+async def group_callback(callback: types.CallbackQuery):
+    parts = (callback.data or "").split("_", 2)
+    if len(parts) != 3 or parts[1] not in _GROUP_ALLOWED_MODES or callback.message is None:
+        await callback.answer()
+        return
+    _, mode, token = parts
+    entry = group_cache.get(token)
+    if not entry or entry["chat_id"] != callback.message.chat.id:
+        await callback.answer("Запись устарела. Отправьте голосовое заново.", show_alert=True)
+        return
+    entry["ts"] = time.time()
+
+    cached = entry["results"].get(mode)
+    if cached:      # уже готовый режим — повторяем бесплатно
+        await callback.answer()
+        for chunk in _split_for_telegram(cached):
+            await callback.message.reply(chunk, parse_mode="HTML")
+        return
+    if mode in entry["busy"]:
+        await callback.answer("Уже обрабатывается…")
+        return
+
+    # списываем лимит чата (админ бота — бесплатно)
+    chat = callback.message.chat
+    access.remember_name(chat.id, f"👥 {chat.title or chat.id}")
+    if access.is_admin(callback.from_user.id):
+        access.current_user_id.set(callback.from_user.id)
+    else:
+        await access.ensure_loaded(chat.id)
+        access.current_user_id.set(chat.id)
+        if (access.remaining(chat.id) or 0) <= 0:
+            await callback.answer(f"Лимит чата на сегодня исчерпан ({access.used_today(chat.id)}/{access.user_limit(chat.id)}).",
+                                  show_alert=True)
+            return
+
+    entry["busy"].add(mode)
+    await callback.answer("⏳ Обрабатываю…")
+    try:
+        result = await run_mode(mode, entry["text"])
+        if result.startswith("❌") or result.startswith("📝"):
+            await callback.message.reply(result)
+            return
+        rendered = sanitize_llm_output(result)
+        entry["results"][mode] = rendered
+        for chunk in _split_for_telegram(rendered):
+            await callback.message.reply(chunk, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"group callback error: {e}", exc_info=True)
+        await callback.message.reply("❌ Не удалось обработать запись.")
+    finally:
+        entry["busy"].discard(mode)
+
+
+@dp.message(F.chat.type.in_(GROUP_TYPES))
+async def group_sink(message: types.Message):
+    """Всё остальное в группах игнорируем: личные хендлеры там не должны срабатывать."""
+    return
+
 
 @dp.message(F.voice)
 async def voice_handler(message: types.Message):
@@ -1790,6 +2395,14 @@ async def text_handler(message: types.Message):
         await _handle_filename_input(message)
         return
 
+    # Перехват: пользователь называет собеседников (режим «Диалог»)
+    pend = pending_speaker_names.get(user_id)
+    if pend:
+        if time.time() - pend["ts"] < SPEAKER_NAMES_TIMEOUT:
+            await _handle_speaker_names(message, pend)
+            return
+        pending_speaker_names.pop(user_id, None)
+
     # Диалоговый режим
     if user_id in active_dialogs:
         msg_id = active_dialogs[user_id]
@@ -1852,6 +2465,13 @@ async def file_handler(message: types.Message):
         return
 
     user_id = message.from_user.id
+
+    # Картинка → промпт: режим ожидания (/img2prompt) или подпись «промпт» к фото
+    img_id = _image_file_id(message)
+    if img_id and _wants_img2prompt(message):
+        await run_img2prompt(message, img_id, user_id)
+        return
+
     active_dialogs.pop(user_id, None)
 
     if user_id in processing_users:
@@ -2039,16 +2659,8 @@ async def process_callback(callback: types.CallbackQuery):
 
         original_text = ctx_data.get("original", ctx_data.get("text", ""))
 
-        await callback.message.edit_text(f"⏳ Обрабатываю ({mode})...")
-
-        if mode == "basic":
-            result = await processors.correct_text_basic(original_text, groq_clients)
-        elif mode == "premium":
-            result = await processors.correct_text_premium(original_text, groq_clients)
-        elif mode == "summary":
-            result = await processors.summarize_text(original_text, groq_clients)
-        else:
-            result = original_text
+        await callback.message.edit_text(f"⏳ Обрабатываю ({config.MODE_LABELS.get(mode, mode)})...")
+        result = await run_mode(mode, original_text, default=original_text)
 
         result_clean = sanitize_llm_output(result)
         if result_clean.startswith("❌"):
@@ -2116,14 +2728,7 @@ async def mode_callback(callback: types.CallbackQuery):
         await callback.answer("Обрабатываю...")
         original_text = ctx_data.get("original", ctx_data.get("text", ""))
 
-        if new_mode == "basic":
-            processed = await processors.correct_text_basic(original_text, groq_clients)
-        elif new_mode == "premium":
-            processed = await processors.correct_text_premium(original_text, groq_clients)
-        elif new_mode == "summary":
-            processed = await processors.summarize_text(original_text, groq_clients)
-        else:
-            processed = original_text
+        processed = await run_mode(new_mode, original_text, default=original_text)
 
         processed_clean = sanitize_llm_output(processed)
         if processed_clean.startswith("❌"):
@@ -2176,7 +2781,7 @@ async def switch_callback(callback: types.CallbackQuery):
             return
 
         available_modes = ctx_data.get("available_modes", ["basic", "premium"])
-        if target_mode not in available_modes:
+        if target_mode not in available_modes and target_mode not in config.EDIT_STYLES:
             await callback.answer("⚠️ Этот режим недоступен", show_alert=True)
             return
 
@@ -2185,17 +2790,9 @@ async def switch_callback(callback: types.CallbackQuery):
         if cached:
             result = cached
         else:
-            await callback.message.edit_text(f"⏳ Обрабатываю ({target_mode})...")
+            await callback.message.edit_text(f"⏳ Обрабатываю ({config.MODE_LABELS.get(target_mode, target_mode)})...")
             original_text = ctx_data.get("original", ctx_data.get("text", ""))
-
-            if target_mode == "basic":
-                result = await processors.correct_text_basic(original_text, groq_clients)
-            elif target_mode == "premium":
-                result = await processors.correct_text_premium(original_text, groq_clients)
-            elif target_mode == "summary":
-                result = await processors.summarize_text(original_text, groq_clients)
-            else:
-                result = "❌ Неизвестный режим"
+            result = await run_mode(target_mode, original_text)
 
             result = sanitize_llm_output(result)
             if result.startswith("❌"):
@@ -2638,6 +3235,284 @@ async def breakdown_callback(callback: types.CallbackQuery):
         logger.error(f"Breakdown callback error: {e}")
         if not is_shutting_down:
             await callback.message.answer("❌ Ошибка при разборе правок")
+
+
+# ============================================================================
+# СТИЛИ ТЕКСТА, НАГЛЯДНЫЙ DIFF, ИМЕНА СОБЕСЕДНИКОВ
+# ============================================================================
+
+def _split_for_telegram(text: str, limit: int = 4000) -> List[str]:
+    """Режет длинный HTML-текст по переводам строк/пробелам (без разрыва слов)."""
+    parts: List[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text.strip():
+        parts.append(text)
+    return parts
+
+
+@dp.callback_query(F.data.startswith("stm_"))
+async def style_menu_callback(callback: types.CallbackQuery):
+    """«🎭 Стиль…»: подменяем клавиатуру на выбор стиля (текст сообщения не трогаем)."""
+    parts = (callback.data or "").split("_")
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit():
+        await callback.answer()
+        return
+    uid, msg_id = int(parts[1]), int(parts[2])
+    if callback.from_user.id != uid:
+        await callback.answer()
+        return
+    if not user_context.get(uid, {}).get(msg_id):
+        await callback.answer("❌ Данные устарели. Отправьте текст заново.", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=_style_menu_kb(uid, msg_id))
+    except Exception as e:
+        logger.debug(f"style menu edit skipped: {e}")
+
+
+@dp.callback_query(F.data.startswith("stmb_"))
+async def style_menu_back_callback(callback: types.CallbackQuery):
+    parts = (callback.data or "").split("_")
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit():
+        await callback.answer()
+        return
+    uid, msg_id = int(parts[1]), int(parts[2])
+    if callback.from_user.id != uid:
+        await callback.answer()
+        return
+    ctx = user_context.get(uid, {}).get(msg_id)
+    await callback.answer()
+    if not ctx:
+        return
+    has_result = bool(ctx["cached_results"].get(ctx.get("mode")))
+    kb = create_switch_keyboard(uid, msg_id) if has_result else create_options_keyboard(uid, msg_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception as e:
+        logger.debug(f"style menu back skipped: {e}")
+
+
+@dp.callback_query(F.data.startswith("diff_"))
+async def diff_callback(callback: types.CallbackQuery):
+    """Наглядный diff: что изменилось между оригиналом и текущим результатом. Не тратит лимит."""
+    parts = (callback.data or "").split("_")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await callback.answer()
+        return
+    msg_id = int(parts[1])
+    uid = callback.from_user.id
+    ctx = user_context.get(uid, {}).get(msg_id)
+    if not ctx:
+        await callback.answer("❌ Данные устарели. Обработайте текст заново.", show_alert=True)
+        return
+    mode = ctx.get("mode")
+    corrected = ctx["cached_results"].get(mode) if mode else None
+    if mode not in config.DIFF_MODES or not corrected:
+        await callback.answer("Сравнение доступно после «Как есть», «Красиво» или смены стиля.", show_alert=True)
+        return
+    await callback.answer("🔍 Сравниваю...")
+    original = ctx.get("original", "")
+    pages, changes = await asyncio.to_thread(textkit.make_diff_pages, original, textkit.strip_markup(corrected))
+    label = html.escape(config.MODE_LABELS.get(mode, mode))
+    for i, page in enumerate(pages):
+        if i == 0 and changes:
+            page = page.replace("Что изменилось</b>", f"Что изменилось</b> · {label}", 1)
+        await callback.message.answer(page, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("spk_"))
+async def speakers_callback(callback: types.CallbackQuery):
+    """«👥 Назвать собеседников»: следующим сообщением пользователь присылает имена."""
+    parts = (callback.data or "").split("_")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await callback.answer()
+        return
+    msg_id = int(parts[1])
+    uid = callback.from_user.id
+    ctx = user_context.get(uid, {}).get(msg_id)
+    dialogue = ctx["cached_results"].get("dialogue") if ctx else None
+    if not dialogue:
+        await callback.answer("❌ Сначала запустите режим «Диалог».", show_alert=True)
+        return
+    nums = textkit.speaker_numbers(ctx.get("dialogue_raw") or dialogue)
+    pending_speaker_names[uid] = {"msg_id": msg_id, "ts": time.time()}
+    await callback.answer()
+    found = f"Нашёл говорящих: <b>{len(nums)}</b>.\n" if nums else ""
+    await callback.message.answer(
+        "👥 <b>Как зовут собеседников?</b>\n" + found +
+        "\nНапишите имена по порядку через запятую: <code>Анна, Игорь</code>\n"
+        "или с номерами: <code>1=Анна, 2=Игорь</code>\n\n/cancel — отмена",
+        parse_mode="HTML",
+    )
+
+
+async def _handle_speaker_names(message: types.Message, pend: Dict[str, Any]):
+    uid = message.from_user.id
+    msg_id = pend["msg_id"]
+    ctx = user_context.get(uid, {}).get(msg_id)
+    if not ctx or not ctx["cached_results"].get("dialogue"):
+        pending_speaker_names.pop(uid, None)
+        await message.answer("❌ Данные устарели. Запустите «Диалог» заново.")
+        return
+    names = textkit.parse_speaker_names(message.text or "")
+    if not names:
+        await message.answer("Не разобрал имена. Пример: <code>Анна, Игорь</code> или <code>1=Анна, 2=Игорь</code>. "
+                             "/cancel — отмена", parse_mode="HTML")
+        return
+    pending_speaker_names.pop(uid, None)
+
+    raw = ctx.get("dialogue_raw") or ctx["cached_results"]["dialogue"]   # версия с «Говорящий N»
+    ctx["dialogue_raw"] = raw
+    merged = dict(ctx.get("speaker_names") or {})
+    merged.update(names)
+    ctx["speaker_names"] = merged
+    renamed = textkit.apply_speaker_names(raw, merged)
+    ctx["cached_results"]["dialogue"] = renamed
+    ctx["mode"] = "dialogue"
+    schedule_persist(uid, msg_id)
+
+    chunks = _split_for_telegram(renamed)
+    for i, chunk in enumerate(chunks):
+        last = i == len(chunks) - 1
+        await message.answer(chunk, parse_mode="HTML",
+                             reply_markup=create_switch_keyboard(uid, msg_id) if last else None)
+
+
+# ============================================================================
+# INLINE-РЕЖИМ: «@бот текст» в любом чате
+# ============================================================================
+# Запрос ограничен 256 символами (ограничение Telegram). Сам запрос ничего не
+# стоит: он лишь предлагает варианты. Обработка идёт после выбора варианта:
+#   • если у бота в @BotFather включён /setinlinefeedback — сразу автоматически;
+#   • иначе — по кнопке «▶️» в отправленном сообщении.
+
+_INLINE_ALLOWED = {m for m, _, _ in config.INLINE_MODES}
+
+
+def _inline_cache_put(user_id: int, text: str) -> str:
+    now = time.time()
+    for t in [t for t, e in inline_cache.items() if now - e["ts"] > config.INLINE_CACHE_TTL]:
+        inline_cache.pop(t, None)
+    for k in [k for k, ts in inline_claimed.items() if now - ts > config.INLINE_CACHE_TTL]:
+        inline_claimed.pop(k, None)
+    token = hashlib.sha1(f"{user_id}:{text}".encode("utf-8")).hexdigest()[:12]
+    if token not in inline_cache:
+        while len(inline_cache) >= config.INLINE_CACHE_MAX:
+            inline_cache.pop(min(inline_cache, key=lambda t: inline_cache[t]["ts"]), None)
+    inline_cache[token] = {"user_id": user_id, "text": text, "ts": now}
+    return token
+
+
+def _inline_button(mode: str, title: str, token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"▶️ {title}", callback_data=f"iq_{mode}_{token}")
+    ]])
+
+
+@dp.inline_query()
+async def inline_query_handler(query: types.InlineQuery):
+    text = (query.query or "").strip()
+    if len(text) < config.INLINE_MIN_CHARS:
+        hint = types.InlineQueryResultArticle(
+            id="hint",
+            title="Напишите текст после имени бота",
+            description="Исправлю ошибки, поменяю стиль, сокращу или переведу (до 256 знаков)",
+            input_message_content=types.InputTextMessageContent(
+                message_text="✍️ Напишите @имя_бота и текст, и я исправлю его прямо в переписке.",
+                parse_mode=None,
+            ),
+        )
+        await query.answer([hint], cache_time=1, is_personal=True)
+        return
+
+    token = _inline_cache_put(query.from_user.id, text)
+    preview = text if len(text) <= 60 else text[:57] + "…"
+    results = [
+        types.InlineQueryResultArticle(
+            id=f"{mode}:{token}",
+            title=title,
+            description=f"{desc} · {preview}",
+            input_message_content=types.InputTextMessageContent(message_text=text, parse_mode=None),
+            reply_markup=_inline_button(mode, title, token),
+        )
+        for mode, title, desc in config.INLINE_MODES
+    ]
+    await query.answer(results, cache_time=0, is_personal=True)
+
+
+async def _process_inline(inline_message_id: str, user_id: int, mode: str, token: str):
+    entry = inline_cache.get(token)
+    if not entry or entry["user_id"] != user_id or mode not in _INLINE_ALLOWED:
+        return
+    if inline_message_id in inline_claimed:
+        return                                  # уже обрабатывается (авто-режим + кнопка)
+    title = next((t for m, t, _ in config.INLINE_MODES if m == mode), mode)
+    access.current_user_id.set(user_id)
+    await access.ensure_loaded(user_id)
+
+    async def edit(text: str, parse_mode=None, markup=None):
+        try:
+            await bot.edit_message_text(text=text, inline_message_id=inline_message_id,
+                                        parse_mode=parse_mode, reply_markup=markup)
+        except Exception as e:
+            logger.debug(f"inline edit failed: {e}")
+
+    if not access.is_admin(user_id) and (access.remaining(user_id) or 0) <= 0:
+        await edit(access.limit_exhausted_message(user_id).replace("<b>", "").replace("</b>", ""),
+                   markup=_inline_button(mode, title, token))
+        return
+
+    inline_claimed[inline_message_id] = time.time()
+    await edit("⏳ Обрабатываю…")
+    try:
+        result = await run_mode(mode, entry["text"])
+    except Exception as e:
+        logger.error(f"inline process error: {e}", exc_info=True)
+        result = "❌ Ошибка обработки. Попробуйте ещё раз."
+    if result.startswith("❌") or result.startswith("📝"):
+        inline_claimed.pop(inline_message_id, None)          # можно повторить кнопкой
+        await edit(f"{result}\n\n{entry['text']}", markup=_inline_button(mode, title, token))
+        return
+    await edit(sanitize_llm_output(result)[:4000], parse_mode="HTML")
+
+
+@dp.chosen_inline_result()
+async def chosen_inline_handler(chosen: types.ChosenInlineResult):
+    """Приходит, если в @BotFather включён /setinlinefeedback: обрабатываем сразу после выбора."""
+    if not chosen.inline_message_id:
+        return
+    mode, _, token = (chosen.result_id or "").partition(":")
+    if token:
+        await _process_inline(chosen.inline_message_id, chosen.from_user.id, mode, token)
+
+
+@dp.callback_query(F.data.startswith("iq_"))
+async def inline_callback(callback: types.CallbackQuery):
+    parts = (callback.data or "").split("_", 2)
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    _, mode, token = parts
+    if not callback.inline_message_id:
+        await callback.answer("Кнопка работает только в сообщении, отправленном через inline.", show_alert=True)
+        return
+    entry = inline_cache.get(token)
+    if not entry:
+        await callback.answer("Запрос устарел. Напишите @бота и текст заново.", show_alert=True)
+        return
+    if callback.from_user.id != entry["user_id"]:
+        await callback.answer("Обработать может только автор сообщения.", show_alert=True)
+        return
+    await callback.answer()
+    await _process_inline(callback.inline_message_id, callback.from_user.id, mode, token)
 
 
 # ============================================================================

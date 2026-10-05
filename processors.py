@@ -19,8 +19,11 @@ from typing import Optional, Tuple, List, Dict, Any, AsyncGenerator
 from datetime import timedelta
 from openai import AsyncOpenAI
 
+from collections import OrderedDict
+
 import config
 import access
+import textkit
 
 # Попытка импорта дополнительных библиотек
 try:
@@ -115,7 +118,7 @@ def _truncate_text_for_model(text: str, model_type: str) -> str:
 # ============================================================================
 
 _text_clients: list = []   # клиенты OpenRouter
-_GROQ_KIND = {"subtitles": "premium"}   # какую Groq-модель брать при откате
+_GROQ_KIND = {"subtitles": "premium", "img2prompt": "vision"}   # какую Groq-модель брать при откате
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
@@ -164,6 +167,8 @@ def _resolve_chain(kind: str) -> Tuple[list, bool]:
     Цепочка моделей OpenRouter и разрешение отката на Groq для текущего
     пользователя (профиль из /model; без пользователя — общий профиль).
     """
+    if kind in config.FIXED_CHAIN_KINDS:
+        return list(config.LLM_MODELS[kind]), True
     prof = access.profile_for(access.current_user_id.get())
     models = prof.get("models")
     if models is None:
@@ -281,6 +286,248 @@ async def _open_text_stream(kind: str, groq_clients: list, messages: list,
 
 
 # ============================================================================
+# IMG2PROMPT: картинка → промпт для генератора изображений
+# ============================================================================
+
+_COMMON_RATIOS = [(1, 1), (5, 4), (4, 3), (3, 2), (16, 9), (21, 9),
+                  (4, 5), (3, 4), (2, 3), (9, 16), (9, 21)]
+
+
+def _closest_ratio(w: int, h: int) -> str:
+    import math
+    target = math.log(w / h)
+    a, b = min(_COMMON_RATIOS, key=lambda r: abs(math.log(r[0] / r[1]) - target))
+    return f"{a}:{b}"
+
+
+def prepare_image_for_vision(image_bytes: bytes) -> Tuple[bytes, str]:
+    """
+    Приводит картинку к JPEG разумного размера (PNG с прозрачностью, WEBP, HEIC-подобные
+    форматы Pillow умеет читать; EXIF-поворот применяется). Возвращает (jpeg, "3:2").
+    """
+    from PIL import Image, ImageOps
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+        if w < 1 or h < 1:
+            raise ValueError("empty image")
+        ratio = _closest_ratio(w, h)
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        side = config.IMG2PROMPT_MAX_SIDE
+        if max(img.size) > side:
+            img.thumbnail((side, side), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=config.IMG2PROMPT_JPEG_QUALITY, optimize=True)
+        return out.getvalue(), ratio
+    except Exception as e:
+        raise ValueError("Не удалось прочитать изображение. Пришлите JPG, PNG или WEBP.") from e
+
+
+def _fit_length(text: str, max_chars: int) -> str:
+    """
+    Мягко укорачивает слишком длинный промпт по границе предложения/запятой.
+    Хвост параметров Midjourney (--ar 16:9 --style raw) сохраняется.
+    """
+    text = (text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    m = re.search(r"\s(--\w+(?:\s+[^\s-][^\s]*)?(?:\s+--\w+(?:\s+[^\s-][^\s]*)?)*)\s*$", text)
+    tail = ""
+    if m:
+        tail = " " + m.group(1).strip()
+        text = text[:m.start()].rstrip()
+    budget = max(40, max_chars - len(tail))
+    if len(text) > budget:
+        cut = text[:budget]
+        pos = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("; "), cut.rfind(", "))
+        if pos < budget * 0.5:
+            pos = cut.rfind(" ")
+        cut = cut[:pos] if pos > 0 else cut
+        text = cut.rstrip(" ,;")
+        # точку добавляем только к прозе; у списков тегов (SD, Midjourney) её быть не должно
+        is_prose = bool(re.search(r"[.!?]\s+[A-ZА-ЯЁ]", text))
+        if is_prose and not text.endswith((".", "!", "?", "…")):
+            text += "."
+    return (text + tail).strip()
+
+
+def fit_prompt_sections(parts: Dict[str, str], detail: int) -> Dict[str, str]:
+    """Применяет потолок длины к основному промпту (1.25 × max_chars выбранной подробности)."""
+    spec = config.IMG2PROMPT_DETAILS.get(detail) or config.IMG2PROMPT_DETAILS[config.IMG2PROMPT_DEFAULT_DETAIL]
+    out = dict(parts)
+    out["prompt"] = _fit_length(parts.get("prompt", ""), int(spec[2] * 1.25))
+    return out
+
+
+async def image_to_prompt(jpeg_bytes: bytes, ratio: str, style: str, groq_clients: list,
+                          regenerate: bool = False, detail: int = 0) -> str:
+    """
+    Сырой ответ модели (секции ### PROMPT / SHORT / NEGATIVE / RU) или текст ошибки с «❌».
+    Лимит списывается внутри _text_completion (1 единица за вызов).
+    """
+    if style not in config.IMG2PROMPT_STYLES:
+        style = "u"
+    if detail not in config.IMG2PROMPT_DETAILS:
+        detail = config.IMG2PROMPT_DEFAULT_DETAIL
+    _label, lo, hi, dtext = config.IMG2PROMPT_DETAILS[detail]
+    instruction = config.IMG2PROMPT_STYLES[style][1].replace("{ratio}", ratio)
+    detail_instruction = dtext.replace("{lo}", str(lo)).replace("{hi}", str(hi))
+    prompt = (config.IMG2PROMPT_PROMPT.replace("{ratio}", ratio)
+              .replace("{style_instruction}", instruction)
+              .replace("{detail_instruction}", detail_instruction))
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ],
+    }]
+    temp = config.IMG2PROMPT_REGEN_TEMPERATURE if regenerate else config.IMG2PROMPT_TEMPERATURE
+    try:
+        return await _text_completion("img2prompt", groq_clients, messages, temp,
+                                      max_tokens=config.IMG2PROMPT_MAX_TOKENS)
+    except Exception as e:
+        logger.error(f"img2prompt error: {e}")
+        if "empty_content" in str(e):
+            return "❌ Модель вернула пустой ответ. Попробуйте ещё раз."
+        return _err_text("Ошибка создания промпта", e, 160)
+
+
+_SECTION_RE = re.compile(r"^\s*#{2,4}\s*(PROMPT|SHORT|NEGATIVE|RU)\s*:?\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_img_prompt(raw: str) -> Dict[str, str]:
+    """Разбирает ответ модели на секции. Если формат нарушен — весь текст идёт в prompt."""
+    raw = (raw or "").strip()
+    parts: Dict[str, str] = {}
+    matches = list(_SECTION_RE.finditer(raw))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        parts[m.group(1).lower()] = raw[m.end():end].strip()
+
+    def clean(v: str) -> str:
+        v = v.strip().strip("`").strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'«":
+            v = v[1:-1].strip()
+        return re.sub(r"\s*\n\s*", " ", v)
+
+    out = {k: clean(v) for k, v in parts.items()}
+    if not out.get("prompt"):
+        out["prompt"] = clean(re.sub(r"^\s*#{2,4}.*$", "", raw, flags=re.MULTILINE)) if raw else ""
+    if out.get("negative", "").lower().strip(" .") in ("none", "n/a", "нет", "-", ""):
+        out["negative"] = ""
+    return out
+
+
+# ============================================================================
+# СТИЛИ ПРАВКИ, ПРОТОКОЛ, ДИАЛОГ ПО РОЛЯМ
+# ============================================================================
+
+async def _single_llm_task(kind: str, groq_clients: list, build_messages, text: str, temperature: float,
+                           max_tokens: int, err_prefix: str, shorter_to: int) -> str:
+    """Один запрос к LLM с единым разбором ошибок (413 → повтор с укороченным текстом)."""
+    try:
+        return await _text_completion(kind, groq_clients, build_messages(text), temperature, max_tokens=max_tokens)
+    except Exception as e:
+        logger.error(f"{err_prefix}: {e}")
+        try:
+            if "413" in str(e) or "rate_limit_exceeded" in str(e):
+                return await _text_completion(kind, groq_clients,
+                                              build_messages(text[:shorter_to] + "... [обрезано]"),
+                                              temperature, max_tokens=max_tokens)
+        except Exception as e2:
+            e = e2
+        if "empty_content" in str(e):
+            return "❌ Модель вернула пустой ответ. Попробуйте ещё раз."
+        return _err_text(err_prefix, e)
+
+
+async def rewrite_in_style(text: str, style_key: str, groq_clients: list) -> str:
+    """Переписывает текст в выбранном стиле (config.EDIT_STYLES)."""
+    if not text.strip():
+        return config.ERROR_EMPTY_TEXT
+    if style_key not in config.EDIT_STYLES:
+        return "❌ Неизвестный стиль"
+    instruction = config.EDIT_STYLES[style_key][1]
+    text = _truncate_text_for_model(text, "premium")
+
+    def build(t: str) -> list:
+        prompt = config.STYLE_PROMPT.replace("{style}", instruction).replace("{text}", t)
+        return [{"role": "user", "content": prompt}]
+
+    return await _single_llm_task("premium", groq_clients, build, text, config.MODEL_TEMPERATURES["premium"],
+                                  4000, "Ошибка смены стиля", 6000)
+
+
+async def make_protocol(text: str, groq_clients: list) -> str:
+    """Протокол: тема, суть, решения, задачи (что, кто, срок), открытые вопросы."""
+    if not text.strip():
+        return config.ERROR_EMPTY_TEXT
+    text = _truncate_text_for_model(text, "reasoning")
+
+    def build(t: str) -> list:
+        return [{"role": "user", "content": config.PROTOCOL_PROMPT + f"\n\nРасшифровка:\n{t}"}]
+
+    return await _single_llm_task("reasoning", groq_clients, build, text, config.MODEL_TEMPERATURES["reasoning"],
+                                  2500, "Ошибка составления протокола", 12000)
+
+
+async def make_dialogue(text: str, groq_clients: list) -> str:
+    """
+    Разбивка расшифровки на реплики «Говорящий 1/2/…». Роли определяет LLM по смыслу
+    (по голосу Whisper их не различает). Длинные записи обрабатываются частями с
+    переносом нумерации; каждая часть стоит 1 единицу лимита.
+    """
+    if not text.strip():
+        return config.ERROR_EMPTY_TEXT
+
+    seg = segments_for(text)
+    units = seg.split("\n") if seg else textkit.split_sentences(text)
+    chunks = textkit.chunk_lines(units, config.DIALOGUE_CHUNK_CHARS)
+    skipped = max(0, len(chunks) - config.DIALOGUE_MAX_CHUNKS)
+    chunks = chunks[:config.DIALOGUE_MAX_CHUNKS]
+
+    outputs: List[str] = []
+    stop_note = ""
+    for i, chunk in enumerate(chunks):
+        prompt = config.DIALOGUE_PROMPT
+        if outputs:
+            prompt += "\n\n" + config.DIALOGUE_CONTINUATION.replace("{tail}", outputs[-1][-700:])
+        prompt += f"\n\nРасшифровка:\n{chunk}"
+        try:
+            out = await _text_completion("reasoning", groq_clients, [{"role": "user", "content": prompt}],
+                                         0.2, max_tokens=3800)
+        except access.QuotaExceeded as qe:
+            if not outputs:
+                return qe.user_message
+            stop_note = f"⚠️ Лимит исчерпан: обработано {len(outputs)} из {len(chunks)} частей."
+            break
+        except Exception as e:
+            logger.error(f"Dialogue error: {e}")
+            if not outputs:
+                return "❌ Модель вернула пустой ответ. Попробуйте ещё раз." if "empty_content" in str(e) \
+                    else _err_text("Ошибка разбивки по ролям", e)
+            stop_note = f"⚠️ Ошибка на части {i + 1} из {len(chunks)}: остальное не обработано."
+            break
+        outputs.append(out.strip())
+
+    result = "\n\n".join(outputs)
+    if skipped:
+        result += f"\n\n⚠️ Запись очень длинная: обработано {len(chunks)} частей, остальные {skipped} отброшены."
+    if stop_note:
+        result += "\n\n" + stop_note
+    return result + f"\n\n_{config.DIALOGUE_NOTE}_"
+
+
+# ============================================================================
 # VISION PROCESSOR (OCR)
 # ============================================================================
 
@@ -386,6 +633,39 @@ def _segments_to_timecoded_text(segments: list) -> str:
     return "\n".join(lines)
 
 
+# ============================================================================
+# СЕГМЕНТЫ РАСШИФРОВКИ (для режима «Диалог»)
+# ============================================================================
+
+_segments_by_text: "OrderedDict[str, str]" = OrderedDict()
+_SEGMENTS_KEEP = 60
+
+
+def _seg_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def remember_segments(text: str, segments: list) -> None:
+    """Запоминает построчные фразы Whisper под ключом расшифровки (небольшой LRU в памяти)."""
+    lines = []
+    for seg in segments:
+        t = (seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip()
+        if t:
+            lines.append(t)
+    key = _seg_key(text)
+    if not lines or not key:
+        return
+    _segments_by_text[key] = "\n".join(lines)
+    _segments_by_text.move_to_end(key)
+    while len(_segments_by_text) > _SEGMENTS_KEEP:
+        _segments_by_text.popitem(last=False)
+
+
+def segments_for(text: str) -> Optional[str]:
+    """Построчная расшифровка, если текст получен из аудио в этой сессии бота."""
+    return _segments_by_text.get(_seg_key(text))
+
+
 async def transcribe_voice(audio_bytes: bytes, groq_clients: list, with_timecodes: bool = False) -> str:
     try:
         access.charge()
@@ -406,14 +686,22 @@ async def transcribe_voice(audio_bytes: bytes, groq_clients: list, with_timecode
                 return _segments_to_timecoded_text(segments)
             return getattr(response, "text", str(response))
         else:
+            # verbose_json даёт те же слова плюс сегменты: по ним режим «Диалог»
+            # видит границы фраз. Текст возвращаем тот же, что и раньше.
             response = await client.audio.transcriptions.create(
                 model=config.GROQ_MODELS["transcription"],
                 file=("audio.ogg", audio_bytes, "audio/ogg"),
                 language=config.AUDIO_LANGUAGE,
-                response_format="text",
+                response_format="verbose_json",
                 temperature=config.MODEL_TEMPERATURES["transcription"],
             )
-            return response
+            if isinstance(response, str):
+                return response
+            text = (getattr(response, "text", None) or "").strip()
+            segments = getattr(response, "segments", None)
+            if segments:
+                remember_segments(text, segments)
+            return text or str(response)
 
     try:
         return await _make_groq_request(groq_clients, transcribe)
@@ -1891,6 +2179,9 @@ def get_available_modes(text: str) -> list:
     available = ["basic", "premium"]
     if words_count >= config.MIN_WORDS_FOR_SUMMARY and text_length >= config.MIN_CHARS_FOR_SUMMARY:
         available.append("summary")
+        available.append("protocol")
+    if words_count >= config.MIN_WORDS_FOR_DIALOGUE:
+        available.append("dialogue")
     return available
 
 

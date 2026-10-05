@@ -225,6 +225,7 @@ START_MESSAGE = """👋 <b>iГрамотей v5</b>
 📥 <b>Что принимаю:</b>
 • Голосовые сообщения и кружочки 🎙️
 • Изображения с текстом 🖼️
+• Картинки для промпта: /img2prompt 🎨
 • Файлы: PDF, DOCX, ODT, RTF, EPUB, FB2, TXT, MD, HTML, SRT/VTT 📄
 • Ссылки на сайты и статьи 🌐
 • Ссылки YouTube — субтитры без скачивания 📺
@@ -237,6 +238,10 @@ START_MESSAGE = """👋 <b>iГрамотей v5</b>
 • ✏️ <b>Работа над ошибками</b> — объясняю каждую правку
 • 🌐 <b>Перевод</b> — если текст не на русском
 • 💬 <b>Вопросы по тексту</b> — режим диалога с документом
+• 🎭 <b>Стили</b> — деловой, разговорный, короче, подробнее, пост, письмо
+• 🔍 <b>Что изменилось</b> — наглядные правки: зачёркнуто и добавлено
+• 📋 <b>Протокол</b> — решения и задачи из встречи или голосового
+• 👥 <b>Диалог</b> — кто что сказал: «Говорящий 1», «Говорящий 2» (имена можно подставить)
 
 💾 Экспорт в TXT, PDF или DOCX"""
 
@@ -244,7 +249,7 @@ HELP_MESSAGE = """📋 <b>Как пользоваться:</b>
 
 1. <b>Отправь мне что угодно:</b>
    • Голосовое или кружочек
-   • Фото с текстом
+   • Фото с текстом (для промпта из картинки — /img2prompt)
    • Файл (PDF, DOCX, ODT, RTF, EPUB, FB2, TXT, MD, HTML, SRT/VTT)
    • Ссылку на статью или YouTube-видео
    • Просто текст
@@ -259,6 +264,9 @@ HELP_MESSAGE = """📋 <b>Как пользоваться:</b>
 
 ⚡ <b>YouTube:</b> только субтитры — быстро, без скачивания.
 Если субтитров нет — честно скажу об этом.
+
+👥 <b>В группах:</b> /autovoice on — расшифровывать голосовые; ответом на сообщение: /fix, /summary, /protocol, /dialogue
+✏️ <b>Везде:</b> напишите @бот и текст — исправлю прямо в переписке (до 256 знаков)
 
 📜 /history — последние 10 обработок
 📊 /limit — остаток дневного лимита"""
@@ -483,3 +491,216 @@ LLM_PROFILES = {
 DEFAULT_LLM_PROFILE = os.environ.get("DEFAULT_LLM_PROFILE", "auto").strip().lower()
 if DEFAULT_LLM_PROFILE not in LLM_PROFILES:
     DEFAULT_LLM_PROFILE = "auto"
+
+
+# ============================================================================
+# IMG2PROMPT — промпт для генератора картинок по изображению
+# ============================================================================
+# Нужна мультимодальная (vision) модель. Цепочка OpenRouter пробуется по
+# порядку, затем откат на Groq-модель GROQ_MODELS["vision"]. Выбор /model на
+# эту функцию не влияет (не все профили умеют читать картинки).
+# Заменить модели без правки кода: OR_MODELS_IMG2PROMPT=модель1,модель2
+#
+# Проверенные vision-модели OpenRouter (free):
+#   google/gemma-4-31b-it:free                           — по умолчанию №1
+#   qwen/qwen3.8-27b:free                                — по умолчанию №2
+#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free   — запасной вариант
+#     (бесплатный эндпоинт NVIDIA логирует запросы и просит не слать лица людей)
+LLM_MODELS["img2prompt"] = _env_models("OR_MODELS_IMG2PROMPT", [_GEMMA, _QWEN])
+OPENROUTER_EXTRA_BODY["img2prompt"] = {"reasoning": {"enabled": False}}
+FIXED_CHAIN_KINDS = {"img2prompt"}      # профиль /model на эти задачи не влияет
+
+IMG2PROMPT_MAX_SIDE = 1568              # картинка уменьшается до этого размера по длинной стороне
+IMG2PROMPT_JPEG_QUALITY = 85
+IMG2PROMPT_MAX_TOKENS = 1100
+IMG2PROMPT_TEMPERATURE = 0.4
+IMG2PROMPT_REGEN_TEMPERATURE = 0.9      # для кнопки «Другой вариант»
+IMG2PROMPT_AWAIT_SEC = 600              # режим ожидания картинок после /img2prompt
+IMG2PROMPT_CACHE_TTL = 1800             # сколько живёт картинка для переключения стилей
+IMG2PROMPT_CACHE_MAX = 30               # максимум картинок в памяти
+
+IMG2PROMPT_TRIGGER_RE = r"^\s*(?:/img2prompt|/prompt|промпт|промт|prompt)\b"
+
+IMG2PROMPT_STYLES = {
+    # ключ: (кнопка, инструкция стиля)
+    "u": ("🎨 Универсальный",
+          "Target: modern natural-language generators (FLUX, DALL·E, Imagen, Ideogram). "
+          "Write flowing prose (sentences, no keyword lists, no parameters). Put the subject and action first."),
+    "m": ("🌌 Midjourney",
+          "Target: Midjourney. Write ONE line of comma-separated descriptive phrases ordered by importance "
+          "(subject, action, environment, composition, lighting, colors, medium/style, mood). "
+          "No full sentences. End the line with the parameters: --ar {ratio} --style raw. No other flags. "
+          "Write NEGATIVE as 'none'."),
+    "s": ("🧩 Stable Diffusion",
+          "Target: Stable Diffusion / SDXL. Write comma-separated tags and short phrases. "
+          "Start with quality tags only if the image deserves them (masterpiece, best quality, highly detailed). "
+          "Use weighting like (tag:1.2) sparingly for the 2-4 most important elements. "
+          "NEGATIVE must be a sensible comma-separated negative prompt for this kind of image "
+          "(e.g. lowres, blurry, bad anatomy, extra fingers, watermark, text artifacts)."),
+    "r": ("🇷🇺 По-русски",
+          "Do NOT write a generator prompt. Instead, in the PROMPT section write a vivid description of the "
+          "image in Russian (subjects, setting, composition, light, colors, style, mood). "
+          "Write SHORT as one Russian sentence. Write NEGATIVE as 'none'. In the RU section repeat the SHORT sentence."),
+}
+
+IMG2PROMPT_PROMPT = """You are an expert prompt engineer for text-to-image models.
+Look carefully at the attached image and write a prompt that would let an image generator recreate it as closely as possible.
+
+Describe only what is actually visible: subject(s) with appearance, pose, clothing and expression; setting and background; \
+composition and framing (shot type, camera angle, lens or depth of field); lighting; color palette; medium and style \
+(photo, 3D render, oil painting, anime, vector, etc.); mood; notable small details; any readable text (quote it exactly).
+Do not invent a backstory. Do not identify real people by name; name a character only if it is a clearly famous fictional one. \
+Never write phrases like "an image of" or "a photo of" unless the medium itself matters.
+The image aspect ratio is {ratio}.
+
+{style_instruction}
+
+{detail_instruction}
+
+Output EXACTLY these four sections and nothing else. Each header is on its own line:
+### PROMPT
+<the prompt>
+### SHORT
+<a one-line version, under 25 words>
+### NEGATIVE
+<negative prompt, or the word none>
+### RU
+<one or two sentences in Russian saying what is in the image>"""
+
+IMG2PROMPT_HINT = (
+    "🎨 <b>Картинка → промпт</b>\n\n"
+    "Пришлите картинку (фото или файлом), я опишу её промптом для генератора. "
+    "Можно слать несколько подряд.\n\n"
+    "Стили: универсальный (FLUX, DALL·E), Midjourney, Stable Diffusion, описание по-русски. "
+    "Подробность: кратко (~150–350 знаков), средне (~500–900), подробно (~1200–2000). "
+    "Всё переключается кнопками под результатом, выбранная подробность запоминается.\n\n"
+    "Выйти из режима: /cancel (сам выключится через 10 минут без картинок).\n"
+    "<i>Ещё можно ответить командой /prompt на любое фото или подписать фото словом «промпт».</i>"
+)
+
+
+# Подробность: целевая длина основного промпта в знаках и глубина детализации.
+# Модели попадают в диапазон приблизительно; если ответ длиннее max_chars × 1.25,
+# хвост аккуратно обрезается по границе предложения/запятой (параметры
+# Midjourney в конце строки сохраняются).
+IMG2PROMPT_DEFAULT_DETAIL = 2
+IMG2PROMPT_DETAILS = {
+    1: ("📏 Кратко", 150, 350,
+        "Level of detail: BRIEF. Between {lo} and {hi} characters for the PROMPT section. "
+        "Cover only the main subject, the setting, the overall style and the dominant light/colors. "
+        "Skip small details."),
+    2: ("📐 Средне", 500, 900,
+        "Level of detail: MEDIUM. Between {lo} and {hi} characters for the PROMPT section. "
+        "Cover subject with pose/clothing/expression, setting, composition and framing, lighting, color palette, "
+        "medium/style and mood."),
+    3: ("📚 Подробно", 1200, 2000,
+        "Level of detail: VERY DETAILED. Between {lo} and {hi} characters for the PROMPT section. "
+        "Cover everything: every visible subject with appearance, pose, clothing, materials and textures; "
+        "foreground, midground and background layers; camera angle, lens and depth of field; light direction, "
+        "quality and color temperature; a named color palette; medium/style cues; mood; small details; "
+        "readable text quoted exactly."),
+}
+
+
+# ============================================================================
+# ПОДПИСИ РЕЖИМОВ, СТИЛИ ПРАВКИ, ПРОТОКОЛ, ДИАЛОГ ПО РОЛЯМ
+# ============================================================================
+
+# Ключи стилей не содержат «_»: они вшиваются в callback_data (process_/switch_/export_).
+EDIT_STYLES = {
+    "stbiz": ("💼 Деловой",
+              "Деловой стиль: нейтральный вежливый тон, чёткие короткие предложения, без сленга и "
+              "эмоциональных оборотов; где уместно — деление на абзацы."),
+    "stcas": ("💬 Разговорный",
+              "Живой разговорный стиль, как в дружеской переписке: простые слова, короткие фразы, без "
+              "канцелярита. Не добавляй грубость и сленг, если их нет в исходном тексте."),
+    "stshort": ("✂️ Короче",
+                "Сократи текст примерно вдвое: оставь только суть и ключевые факты, убери повторы, "
+                "вводные слова и воду."),
+    "stlong": ("📖 Подробнее",
+               "Разверни текст: раскрой мысли, добавь связки и пояснения, вытекающие из контекста, "
+               "сделай изложение плавным. Не добавляй новых фактов, цифр, имён и дат."),
+    "stpost": ("📣 Пост для канала",
+               "Оформи как пост для Telegram-канала: цепляющая первая строка, короткие абзацы, при "
+               "уместности список и 1–3 эмодзи, в конце короткий вывод или призыв. Хэштеги не добавляй."),
+    "stmail": ("✉️ Офиц. письмо",
+               "Оформи как официальное деловое письмо: обращение, чёткое изложение сути, просьба или "
+               "предложение, вежливое завершение. Имена и должности, которых нет в тексте, оставь "
+               "в виде [Имя], [Должность]."),
+}
+
+MODE_LABELS = {
+    "basic": "📝 Как есть",
+    "premium": "✨ Красиво",
+    "summary": "📊 Саммари",
+    "protocol": "📋 Протокол",
+    "dialogue": "👥 Диалог",
+    **{k: v[0] for k, v in EDIT_STYLES.items()},
+}
+# режимы, для которых доступен наглядный diff «что изменилось»
+DIFF_MODES = {"basic", "premium", *EDIT_STYLES.keys()}
+
+MIN_WORDS_FOR_DIALOGUE = 25          # «Диалог» доступен уже на коротких расшифровках
+DIALOGUE_CHUNK_CHARS = 5000          # размер части при длинной расшифровке
+DIALOGUE_MAX_CHUNKS = 6              # максимум частей (≈30 000 знаков), остальное отбрасывается
+DIALOGUE_NOTE = "ℹ️ Роли определены по смыслу текста, а не по голосу — возможны ошибки."
+
+STYLE_PROMPT = """Перепиши текст в заданном стиле.
+
+Стиль: {style}
+
+Правила: сохрани смысл, факты, числа и имена; исправь орфографию и пунктуацию; ничего не выдумывай; \
+пиши на русском. Верни только готовый текст, без пояснений и без кавычек вокруг него.
+
+Текст:
+{text}"""
+
+PROTOCOL_PROMPT = """Составь протокол по расшифровке встречи или разговора. Пиши на русском, кратко и по делу.
+
+Структура (пустые разделы опусти):
+**📌 Тема** — одна строка.
+**👥 Участники** — только если они названы в тексте.
+**🧾 Суть** — 3–6 коротких пунктов.
+**✅ Решения** — что решили.
+**📝 Задачи** — по пункту на задачу в формате «• что сделать — кто — срок». Если исполнитель или срок не названы, пиши «исполнитель не назначен» или «срок не указан».
+**❓ Открытые вопросы** — что осталось без ответа.
+**📅 Договорённости по времени** — даты, встречи, дедлайны.
+
+Используй только то, что есть в тексте. Ничего не выдумывай и не додумывай.
+Верни только протокол, без вступления.
+"""
+
+DIALOGUE_PROMPT = """Ты расшифровываешь запись разговора. Ниже текст расшифровки; каждая строка — отдельная фраза, \
+записанная между паузами.
+
+Задача: разбей текст на реплики и пометь, кто говорит: «Говорящий 1», «Говорящий 2» и так далее.
+Определяй говорящего по смыслу: вопрос и ответ, обращения, реакции («да», «понятно»), смена темы и лица глаголов, \
+согласованность реплик. Если участник один, используй только «Говорящий 1». Не придумывай лишних участников.
+Если собеседники названы по имени, всё равно пиши «Говорящий N» (имена пользователь подставит сам).
+
+Правила: не меняй, не сокращай и не пропускай слова; можно исправить явные ошибки распознавания и расставить \
+пунктуацию. Каждая реплика с новой строки в формате:
+**Говорящий N:** текст реплики
+Верни только размеченный диалог, без пояснений."""
+
+DIALOGUE_CONTINUATION = """Это продолжение той же записи. Нумерация говорящих должна совпадать с предыдущей частью: \
+тот же человек — тот же номер. Конец предыдущей части для ориентира:
+{tail}
+"""
+
+# Группы: общий суточный лимит чата (учитывается отдельно от личных лимитов).
+GROUP_DAILY_LIMIT = _env_int("GROUP_DAILY_LIMIT", 40)
+
+# Inline-режим: что предлагать при вводе «@бот текст» (ключ режима, заголовок, описание).
+# Текст запроса в Telegram ограничен 256 символами.
+INLINE_MODES = [
+    ("basic", "📝 Как есть", "Исправить опечатки и знаки препинания"),
+    ("premium", "✨ Красиво", "Отредактировать, сохранив ваш голос"),
+    ("stbiz", "💼 Деловой", "Переписать в деловом стиле"),
+    ("stcas", "💬 Разговорный", "Переписать проще и живее"),
+    ("stshort", "✂️ Короче", "Сократить до сути"),
+    ("tr", "🌐 На русский", "Перевести на русский язык"),
+]
+INLINE_MIN_CHARS = 3
+INLINE_CACHE_TTL = 3600
+INLINE_CACHE_MAX = 300

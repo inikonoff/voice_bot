@@ -124,8 +124,14 @@ def remember_user(user) -> None:
         pass
 
 
+def remember_name(entity_id: int, name: str) -> None:
+    _names[entity_id] = name
+
+
 def user_limit(user_id: int) -> int:
-    return _limit_override.get(user_id, config.USER_DAILY_LIMIT)
+    """Личный лимит; для групп (отрицательный chat_id) — общий лимит чата."""
+    default = config.GROUP_DAILY_LIMIT if user_id < 0 else config.USER_DAILY_LIMIT
+    return _limit_override.get(user_id, default)
 
 
 def _entry(user_id: int) -> Dict:
@@ -245,8 +251,22 @@ def limit_exhausted_message(user_id: int) -> str:
             f"Остаток всегда виден по команде /limit")
 
 
+def group_limits_text(chat_id: int) -> str:
+    """Текст команды /limit в группе: лимит чата."""
+    limit = user_limit(chat_id)
+    used = used_today(chat_id)
+    return (
+        f"📊 <b>Лимит этого чата на сегодня</b>\n"
+        f"Использовано: <b>{used}</b> из <b>{limit}</b>, осталось <b>{max(0, limit - used)}</b>\n"
+        f"Сброс в 00:00 ({config.LIMITS_TZ_LABEL}), {reset_in_text()}.\n\n"
+        f"<i>Лимит общий на всех участников группы. Сообщения администратора бота не списываются.</i>"
+    )
+
+
 def limits_text(user_id: int) -> str:
     """Текст команды /limit."""
+    if user_id < 0:
+        return group_limits_text(user_id)
     if is_admin(user_id):
         return "👑 <b>Вы администратор</b> — лимитов нет."
     limit = user_limit(user_id)
