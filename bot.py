@@ -389,6 +389,8 @@ async def lifespan(app: FastAPI):
     # Groq клиенты
     init_groq_clients()
     processors.vision_processor.init_clients(groq_clients)
+    # OpenRouter (текстовые LLM)
+    processors.init_text_clients()
 
     if not hasattr(processors, 'document_dialogues'):
         processors.document_dialogues = {}
@@ -645,8 +647,8 @@ async def api_correct(
         logger.warning(f"API /correct unauthorized attempt with token: {'***' if x_app_token else None}")
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    if not groq_clients:
-        logger.error("API Correct error: No Groq clients available")
+    if not processors.has_text_llm(groq_clients):
+        logger.error("API Correct error: No LLM clients available")
         return {"status": "error", "text": "Сервис временно недоступен"}
 
     try:
@@ -976,8 +978,8 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
         if is_shutting_down:
             await placeholder.edit_text("🛑 Бот останавливается.")
             return
-        if not groq_clients:
-            await placeholder.edit_text("❌ Нет доступных Groq клиентов")
+        if not processors.has_text_llm(groq_clients):
+            await placeholder.edit_text("❌ Нет доступных LLM-клиентов")
             return
         if user_id not in user_context or msg_id not in user_context[user_id]:
             await placeholder.edit_text("❌ Документ не найден. Начните заново.")
@@ -1120,6 +1122,7 @@ async def status_handler(message: types.Message):
         db_status=db_status,
         temp_files=temp_files,
     )
+    status_text += f"\n🧠 Текстовая LLM: {processors.text_llm_label()}"
     status_text += f"\n\n💬 Активных диалогов: {len(active_dialogs)}"
     await message.answer(status_text, parse_mode="HTML")
 

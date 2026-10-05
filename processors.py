@@ -103,6 +103,153 @@ def _truncate_text_for_model(text: str, model_type: str) -> str:
 
 
 # ============================================================================
+# ТЕКСТОВАЯ LLM: OpenRouter (цепочка моделей) → откат на Groq
+# ============================================================================
+
+_text_clients: list = []   # клиенты OpenRouter
+_GROQ_KIND = {"subtitles": "premium"}   # какую Groq-модель брать при откате
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def init_text_clients() -> int:
+    """Создаёт клиентов OpenRouter из OPENROUTER_API_KEYS (или OPENROUTER_API_KEY)."""
+    raw = os.environ.get("OPENROUTER_API_KEYS") or os.environ.get("OPENROUTER_API_KEY", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    headers = {"X-Title": config.OPENROUTER_TITLE}
+    if config.OPENROUTER_REFERER:
+        headers["HTTP-Referer"] = config.OPENROUTER_REFERER
+    _text_clients.clear()
+    for key in keys:
+        _text_clients.append(AsyncOpenAI(
+            api_key=key,
+            base_url=config.OPENROUTER_BASE_URL,
+            timeout=config.GROQ_TIMEOUT,
+            default_headers=headers,
+        ))
+    if _text_clients:
+        logger.info(f"✅ OpenRouter клиентов: {len(_text_clients)}; модели: {config.LLM_MODELS}")
+    else:
+        logger.warning("OPENROUTER_API_KEYS не задан — текстовые задачи идут через Groq")
+    return len(_text_clients)
+
+
+def has_text_llm(groq_clients: Optional[list] = None) -> bool:
+    return bool(_text_clients or groq_clients)
+
+
+def text_llm_label() -> str:
+    if _text_clients:
+        return f"✅ OpenRouter ({len(_text_clients)} ключ.), запас — Groq"
+    return "Groq (OpenRouter не настроен)"
+
+
+def _clean_llm_text(raw: Optional[str]) -> str:
+    """Убирает <think>…</think>, если модель вернула рассуждения прямо в тексте."""
+    s = _THINK_RE.sub("", raw or "")
+    if re.search(r"<think>", s, re.IGNORECASE):   # незакрытый тег — всё после него мысли
+        s = re.split(r"<think>", s, flags=re.IGNORECASE)[0]
+    return s.strip()
+
+
+async def _text_completion(kind: str, groq_clients: list, messages: list,
+                           temperature: float, max_tokens: Optional[int] = None) -> str:
+    """
+    Один текстовый запрос к LLM.
+    1. OpenRouter: модели из config.LLM_MODELS[kind] по очереди, по
+       LLM_RETRIES_PER_MODEL попыток; 404 — сразу к следующей модели.
+    2. Если все модели недоступны — откат на Groq (config.GROQ_MODELS).
+    """
+    last_err: Optional[Exception] = None
+
+    if _text_clients:
+        extra = config.OPENROUTER_EXTRA_BODY.get(kind)
+        for model in config.LLM_MODELS[kind]:
+            use_extra = bool(extra)
+            for attempt in range(config.LLM_RETRIES_PER_MODEL):
+                client = random.choice(_text_clients)
+                kwargs: Dict[str, Any] = dict(model=model, messages=messages, temperature=temperature)
+                if max_tokens:
+                    kwargs["max_tokens"] = max_tokens
+                if use_extra:
+                    kwargs["extra_body"] = extra
+                try:
+                    r = await client.chat.completions.create(**kwargs)
+                    content = _clean_llm_text(r.choices[0].message.content if r.choices else "")
+                    if not content:
+                        raise Exception("empty_content")
+                    return content
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    low = msg.lower()
+                    logger.warning(f"[{kind}] {model}: {msg[:140]}")
+                    if use_extra and ("400" in msg or "reasoning" in low):
+                        use_extra = False          # модель не принимает reasoning-параметр
+                        continue
+                    if "413" in msg:
+                        raise                      # слишком длинный вход — пусть вызывающий обрежет
+                    if "404" in msg or "no endpoints" in low or "not a valid model" in low:
+                        break                      # модели нет — следующая
+                    if attempt < config.LLM_RETRIES_PER_MODEL - 1:   # после последней попытки не ждём
+                        await asyncio.sleep(3 if ("429" in msg or "rate" in low) else 1)
+        logger.warning(f"[{kind}] все модели OpenRouter недоступны, откат на Groq")
+
+    if groq_clients:
+        gk = _GROQ_KIND.get(kind, kind)
+
+        async def _groq_call(client):
+            kwargs: Dict[str, Any] = dict(
+                model=config.GROQ_MODELS[gk], messages=messages, temperature=temperature)
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            if gk == "reasoning":
+                kwargs["reasoning_effort"] = "low"
+            r = await client.chat.completions.create(**kwargs)
+            content = _clean_llm_text(r.choices[0].message.content if r.choices else "")
+            if not content:
+                raise Exception("empty_content")
+            return content
+
+        return await _make_groq_request(groq_clients, _groq_call)
+
+    raise last_err or Exception("Нет доступных LLM-клиентов")
+
+
+async def _open_text_stream(kind: str, groq_clients: list, messages: list,
+                            temperature: float, max_tokens: int):
+    """Открывает потоковый запрос: OpenRouter по цепочке моделей, затем Groq."""
+    last_err: Optional[Exception] = None
+    if _text_clients:
+        extra = config.OPENROUTER_EXTRA_BODY.get(kind)
+        client = random.choice(_text_clients)
+        for model in config.LLM_MODELS[kind]:
+            use_extra = bool(extra)
+            for _ in range(2):
+                kwargs: Dict[str, Any] = dict(model=model, messages=messages,
+                                              temperature=temperature, max_tokens=max_tokens, stream=True)
+                if use_extra:
+                    kwargs["extra_body"] = extra
+                try:
+                    return await client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    logger.warning(f"[{kind}/stream] {model}: {msg[:140]}")
+                    if use_extra and ("400" in msg or "reasoning" in msg.lower()):
+                        use_extra = False
+                        continue
+                    break
+    if groq_clients:
+        gk = _GROQ_KIND.get(kind, kind)
+        kwargs = dict(model=config.GROQ_MODELS[gk], messages=messages,
+                      temperature=temperature, max_tokens=max_tokens, stream=True)
+        if gk == "reasoning":
+            kwargs["reasoning_effort"] = "low"
+        return await random.choice(groq_clients).chat.completions.create(**kwargs)
+    raise last_err or Exception("Нет доступных LLM-клиентов")
+
+
+# ============================================================================
 # VISION PROCESSOR (OCR)
 # ============================================================================
 
@@ -244,28 +391,20 @@ async def correct_text_basic(text: str, groq_clients: list) -> str:
         return config.ERROR_EMPTY_TEXT
     text = _truncate_text_for_model(text, "basic")
 
-    async def correct(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["basic"],
-            messages=[{"role": "user", "content": config.BASIC_CORRECTION_PROMPT + f"\n\nТекст:\n{text}"}],
-            temperature=config.MODEL_TEMPERATURES["basic"],
-        )
-        return response.choices[0].message.content.strip()
+    def _msgs(t: str) -> list:
+        return [{"role": "user", "content": config.BASIC_CORRECTION_PROMPT + f"\n\nТекст:\n{t}"}]
 
+    temp = config.MODEL_TEMPERATURES["basic"]
     try:
-        return await _make_groq_request(groq_clients, correct)
+        return await _text_completion("basic", groq_clients, _msgs(text), temp, max_tokens=4000)
     except Exception as e:
         logger.error(f"Basic correction error: {e}")
-        if "413" in str(e) or "rate_limit_exceeded" in str(e):
-            shorter = text[:3000] + "... [обрезано]"
-            async def retry(client):
-                r = await client.chat.completions.create(
-                    model=config.GROQ_MODELS["basic"],
-                    messages=[{"role": "user", "content": config.BASIC_CORRECTION_PROMPT + f"\n\nТекст:\n{shorter}"}],
-                    temperature=config.MODEL_TEMPERATURES["basic"],
-                )
-                return r.choices[0].message.content.strip()
-            return await _make_groq_request(groq_clients, retry)
+        try:
+            if "413" in str(e) or "rate_limit_exceeded" in str(e):
+                shorter = text[:3000] + "... [обрезано]"
+                return await _text_completion("basic", groq_clients, _msgs(shorter), temp, max_tokens=4000)
+        except Exception as e2:
+            e = e2
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
 
@@ -274,28 +413,20 @@ async def correct_text_premium(text: str, groq_clients: list) -> str:
         return config.ERROR_EMPTY_TEXT
     text = _truncate_text_for_model(text, "premium")
 
-    async def correct(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["premium"],
-            messages=[{"role": "user", "content": config.PREMIUM_CORRECTION_PROMPT + f"\n\nТекст:\n{text}"}],
-            temperature=config.MODEL_TEMPERATURES["premium"],
-        )
-        return response.choices[0].message.content.strip()
+    def _msgs(t: str) -> list:
+        return [{"role": "user", "content": config.PREMIUM_CORRECTION_PROMPT + f"\n\nТекст:\n{t}"}]
 
+    temp = config.MODEL_TEMPERATURES["premium"]
     try:
-        return await _make_groq_request(groq_clients, correct)
+        return await _text_completion("premium", groq_clients, _msgs(text), temp, max_tokens=4000)
     except Exception as e:
         logger.error(f"Premium correction error: {e}")
-        if "413" in str(e) or "rate_limit_exceeded" in str(e):
-            shorter = text[:5000] + "... [обрезано]"
-            async def retry(client):
-                r = await client.chat.completions.create(
-                    model=config.GROQ_MODELS["premium"],
-                    messages=[{"role": "user", "content": config.PREMIUM_CORRECTION_PROMPT + f"\n\nТекст:\n{shorter}"}],
-                    temperature=config.MODEL_TEMPERATURES["premium"],
-                )
-                return r.choices[0].message.content.strip()
-            return await _make_groq_request(groq_clients, retry)
+        try:
+            if "413" in str(e) or "rate_limit_exceeded" in str(e):
+                shorter = text[:5000] + "... [обрезано]"
+                return await _text_completion("premium", groq_clients, _msgs(shorter), temp, max_tokens=4000)
+        except Exception as e2:
+            e = e2
         return f"❌ Ошибка коррекции: {str(e)[:100]}"
 
 
@@ -313,49 +444,25 @@ async def summarize_text(text: str, groq_clients: list) -> str:
 
     text = _truncate_text_for_model(text, "reasoning")
 
-    # openai/gpt-oss-120b на Groq — reasoning-модель: без явного reasoning_effort
-    # она иногда тратит весь токен-бюджет на "размышление" и возвращает ПУСТОЙ
-    # message.content — без ошибки, API формально отвечает 200. Раньше это
-    # тихо приходило как пустое саммари. reasoning_effort="low" + запас
-    # max_tokens снижают шанс, а ретрай ниже подстраховывает, если всё же
-    # случится.
-    async def summarize(client, busted=False):
-        prompt = config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{text}"
-        if busted:
-            prompt += f"\n\n(intent-id: {int(time.time() * 1000)})"
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["reasoning"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=config.MODEL_TEMPERATURES["reasoning"],
-            max_tokens=2000,
-            reasoning_effort="low",
-        )
-        content = (response.choices[0].message.content or "").strip()
-        if not content:
-            raise Exception("empty_content")
-        return content
+    # Рассуждающие модели иногда тратят весь бюджет токенов на «размышление»
+    # и отдают пустой content без ошибки. _text_completion считает пустой ответ
+    # ошибкой и переходит к следующей модели цепочки (затем к Groq).
+    def _msgs(t: str) -> list:
+        return [{"role": "user", "content": config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{t}"}]
 
+    temp = config.MODEL_TEMPERATURES["reasoning"]
     try:
-        return await _make_groq_request(groq_clients, summarize)
+        return await _text_completion("reasoning", groq_clients, _msgs(text), temp, max_tokens=2000)
     except Exception as e:
         logger.error(f"Summarization error: {e}")
-        if "413" in str(e) or "rate_limit_exceeded" in str(e):
-            shorter = text[:10000] + "... [обрезано]"
-            async def retry(client):
-                r = await client.chat.completions.create(
-                    model=config.GROQ_MODELS["reasoning"],
-                    messages=[{"role": "user", "content": config.SUMMARIZATION_PROMPT + f"\n\nТекст:\n{shorter}"}],
-                    temperature=config.MODEL_TEMPERATURES["reasoning"],
-                    max_tokens=2000,
-                    reasoning_effort="low",
-                )
-                content = (r.choices[0].message.content or "").strip()
-                if not content:
-                    raise Exception("empty_content")
-                return content
-            return await _make_groq_request(groq_clients, retry)
-        if str(e) == "empty_content":
-            return "❌ Модель дважды вернула пустой ответ (известная особенность gpt-oss-120b на Groq). Попробуйте ещё раз чуть позже."
+        try:
+            if "413" in str(e) or "rate_limit_exceeded" in str(e):
+                shorter = text[:10000] + "... [обрезано]"
+                return await _text_completion("reasoning", groq_clients, _msgs(shorter), temp, max_tokens=2000)
+        except Exception as e2:
+            e = e2
+        if "empty_content" in str(e):
+            return "❌ Модели вернули пустой ответ. Попробуйте ещё раз чуть позже."
         return f"❌ Ошибка создания саммари: {str(e)[:100]}"
 
 
@@ -553,16 +660,9 @@ async def format_subtitles_as_dialogue(raw_text: str, groq_clients: list) -> str
 Субтитры:
 {truncated}"""
 
-    async def fmt(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["premium"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return response.choices[0].message.content.strip()
-
     try:
-        return await _make_groq_request(groq_clients, fmt)
+        return await _text_completion(
+            "subtitles", groq_clients, [{"role": "user", "content": prompt}], 0.2, max_tokens=6000)
     except Exception as e:
         logger.error(f"Subtitle formatting error: {e}")
         # Fallback — возвращаем сырой текст
@@ -929,16 +1029,9 @@ async def translate_to_russian(text: str, groq_clients: list) -> str:
         f"Текст:\n{text_to_translate}"
     )
 
-    async def translate(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["premium"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        return response.choices[0].message.content.strip()
-
     try:
-        return await _make_groq_request(groq_clients, translate)
+        return await _text_completion(
+            "premium", groq_clients, [{"role": "user", "content": prompt}], 0.1, max_tokens=4000)
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return f"❌ Ошибка перевода: {str(e)[:100]}"
@@ -971,17 +1064,10 @@ async def explain_corrections(original_text: str, corrected_text: str, groq_clie
         + f"\n\nИСПРАВЛЕННЫЙ ТЕКСТ:\n{corr_truncated}"
     )
 
-    async def explain(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["premium"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,   # низкая температура — нужна точность, не творчество
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content.strip()
-
     try:
-        return await _make_groq_request(groq_clients, explain)
+        # низкая температура — нужна точность, не творчество
+        return await _text_completion(
+            "premium", groq_clients, [{"role": "user", "content": prompt}], 0.1, max_tokens=2000)
     except Exception as e:
         logger.error(f"Explain corrections error: {e}")
         return f"❌ Ошибка при разборе правок: {str(e)[:100]}"
@@ -1022,8 +1108,8 @@ async def stream_document_answer(
     question: str,
     groq_clients: list
 ) -> AsyncGenerator[str, None]:
-    if not groq_clients:
-        yield "❌ Нет доступных Groq клиентов"
+    if not has_text_llm(groq_clients):
+        yield "❌ Нет доступных LLM-клиентов"
         return
 
     if user_id not in document_dialogues or msg_id not in document_dialogues[user_id]:
@@ -1059,20 +1145,15 @@ async def stream_document_answer(
 Ответь на вопрос, используя только информацию из документа. Если ответа нет в документе, так и скажи.
 Ответ должен быть подробным, но по существу."""
 
-    client = groq_clients[0 % len(groq_clients)]
-
     async def _ask_once(busted=False):
         p = prompt if not busted else prompt + f"\n\n(intent-id: {int(time.time() * 1000)})"
-        return await client.chat.completions.create(
-            model=config.GROQ_MODELS["reasoning"],
-            messages=[
+        return await _open_text_stream(
+            "reasoning", groq_clients,
+            [
                 {"role": "system", "content": "Ты отвечаешь строго по документу."},
                 {"role": "user", "content": p},
             ],
-            temperature=0.2,
-            max_tokens=2000,
-            reasoning_effort="low",
-            stream=True,
+            0.2, 2000,
         )
 
     try:
@@ -1377,16 +1458,9 @@ async def breakdown_corrections(original_text: str, corrected_text: str, groq_cl
         + f"\n\nИСПРАВЛЕННЫЙ ТЕКСТ:\n{corr}"
     )
 
-    async def analyze(client):
-        response = await client.chat.completions.create(
-            model=config.GROQ_MODELS["premium"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return response.choices[0].message.content.strip()
-
     try:
-        return await _make_groq_request(groq_clients, analyze)
+        return await _text_completion(
+            "premium", groq_clients, [{"role": "user", "content": prompt}], 0.2, max_tokens=2000)
     except Exception as e:
         logger.error(f"Breakdown error: {e}")
         return f"❌ Ошибка при разборе: {str(e)[:100]}"

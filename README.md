@@ -39,7 +39,8 @@
 |---|---|
 | Bot Framework | [aiogram 3.x](https://docs.aiogram.dev/) |
 | Web Server | [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) |
-| LLM / STT | [Groq Cloud](https://groq.com/) — Llama 4 Scout, Llama 3.3 70B, Whisper large-v3-turbo |
+| Текстовые LLM | [OpenRouter](https://openrouter.ai/) — бесплатные модели (Gemma 4 31B, Qwen3.8 27B, запас Nemotron 3 Super), откат на Groq |
+| STT | [Groq Cloud](https://groq.com/) — Whisper large-v3-turbo |
 | OCR | Groq Vision (Qwen 3.8 27B) |
 | PDF | pdfplumber (чтение), reportlab (запись) |
 | DOCX | python-docx |
@@ -67,7 +68,11 @@ pip install -r requirements.txt
 ### 3. Переменные окружения (`.env`)
 ```env
 BOT_TOKEN=ваш_токен_телеграм_бота
-GROQ_API_KEYS=ключ1,ключ2,ключ3
+GROQ_API_KEYS=ключ1,ключ2,ключ3          # Whisper, OCR и запасной откат
+OPENROUTER_API_KEYS=sk-or-...             # текстовые LLM (можно несколько через запятую)
+# необязательно: свой порядок моделей (через запятую, первая — основная)
+# OR_MODELS_BASIC=google/gemma-4-31b-it:free,qwen/qwen3.8-27b:free
+# OR_MODELS_PREMIUM=...  OR_MODELS_SUBTITLES=...  OR_MODELS_REASONING=...
 SUPABASE_URL=https://xxx.supabase.co   # опционально
 SUPABASE_KEY=ваш_anon_ключ             # опционально
 PORT=8080

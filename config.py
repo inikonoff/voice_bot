@@ -353,3 +353,56 @@ GROQ_MODELS = {
     # explain_corrections, breakdown_corrections).
     "reasoning": "openai/gpt-oss-120b",
 }
+
+
+# ============================================================================
+# МОДЕЛИ OPENROUTER (текстовые задачи)
+# ============================================================================
+# Whisper (транскрибация) и OCR остаются на Groq. Все текстовые задачи —
+# коррекция, «красиво», саммари, перевод, разбор правок, диалог по документу,
+# форматирование субтитров — идут через OpenRouter по цепочке моделей:
+# первая в списке — основная, следующие — запасные (на случай 404/429/пустого
+# ответа). Если все бесплатные модели недоступны, бот откатывается на Groq
+# (GROQ_MODELS выше). Без OPENROUTER_API_KEYS всё работает как раньше, на Groq.
+#
+# Список можно переопределить без правки кода переменными окружения
+# (через запятую, по приоритету):
+#   OR_MODELS_BASIC, OR_MODELS_PREMIUM, OR_MODELS_SUBTITLES, OR_MODELS_REASONING
+
+def _env_models(var: str, default: list) -> list:
+    raw = os.environ.get(var, "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return default
+
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_TITLE = "iGramotey"
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "")
+LLM_RETRIES_PER_MODEL = 2   # попыток на каждую модель, прежде чем идти к следующей
+
+_GEMMA = "google/gemma-4-31b-it:free"          # лучший кандидат по русскому слогу
+_QWEN = "qwen/qwen3.8-27b:free"                # длинные тексты, структура, саммари
+_NEMOTRON_SUPER = "nvidia/nemotron-3-super-120b-a12b:free"
+
+LLM_MODELS = {
+    # «Как есть» — строгая минимальная коррекция
+    "basic": _env_models("OR_MODELS_BASIC", [_GEMMA, _QWEN]),
+    # «Красиво», перевод, разбор правок
+    "premium": _env_models("OR_MODELS_PREMIUM", [_GEMMA, _QWEN]),
+    # Форматирование субтитров YouTube (длинный вход)
+    "subtitles": _env_models("OR_MODELS_SUBTITLES", [_QWEN, _GEMMA]),
+    # Саммари и диалог по документу
+    "reasoning": _env_models("OR_MODELS_REASONING", [_QWEN, _NEMOTRON_SUPER, _GEMMA]),
+}
+
+# Параметры reasoning для OpenRouter. Для правки текста размышления не нужны
+# (они только съедают токены и дают пустые ответы), для саммари — минимум.
+# Если модель не поддерживает параметр и вернёт 400 — бот сам повторит запрос
+# без него.
+OPENROUTER_EXTRA_BODY = {
+    "basic": {"reasoning": {"enabled": False}},
+    "premium": {"reasoning": {"enabled": False}},
+    "subtitles": {"reasoning": {"enabled": False}},
+    "reasoning": {"reasoning": {"effort": "low"}},
+}
