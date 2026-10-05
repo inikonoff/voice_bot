@@ -14,6 +14,7 @@ import subprocess
 import mimetypes
 import re
 import time
+import uuid
 import random
 from typing import Optional, Tuple, List, Dict, Any, AsyncGenerator
 from datetime import timedelta
@@ -1534,39 +1535,48 @@ async def stream_document_answer(
 # ============================================================================
 
 async def process_video_file(video_bytes: bytes, filename: str, groq_clients: list, with_timecodes: bool = False) -> str:
-    try:
-        file_ext = filename.split('.')[-1] if '.' in filename else 'mp4'
-        temp_video_path = f"{config.TEMP_DIR}/video_{int(time.time())}_{os.getpid()}.{file_ext}"
-        temp_audio_path = f"{config.TEMP_DIR}/audio_{int(time.time())}_{os.getpid()}.mp3"
+    # Лимит проверяем до тяжёлой работы: ffmpeg на исчерпавшем лимит пользователе не запускаем.
+    uid = access.current_user_id.get()
+    if uid is not None and not access.is_admin(uid) and (access.remaining(uid) or 0) <= 0:
+        return access.QuotaExceeded(access.used_today(uid), access.user_limit(uid)).user_message
 
+    # Расширение приходит от пользователя (имя файла): оставляем только буквы/цифры.
+    raw_ext = filename.rsplit(".", 1)[-1] if "." in filename else "mp4"
+    file_ext = re.sub(r"[^a-z0-9]", "", raw_ext.lower())[:5] or "mp4"
+    # Уникальный суффикс: два пользователя в одну секунду больше не перезаписывают файлы друг друга.
+    stamp = f"{int(time.time())}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    temp_video_path = f"{config.TEMP_DIR}/video_{stamp}.{file_ext}"
+    temp_audio_path = f"{config.TEMP_DIR}/audio_{stamp}.mp3"
+
+    try:
         with open(temp_video_path, 'wb') as f:
             f.write(video_bytes)
 
         duration = await video_processor.check_video_duration(temp_video_path)
         if duration and duration > 3600:
-            os.remove(temp_video_path)
             return config.ERROR_VIDEO_TOO_LONG
 
         if not await video_processor.extract_audio_from_video(temp_video_path, temp_audio_path):
-            os.remove(temp_video_path)
             return "❌ Ошибка извлечения звука из видео"
 
         with open(temp_audio_path, 'rb') as f:
             audio_bytes = f.read()
 
-        text = await transcribe_voice(audio_bytes, groq_clients, with_timecodes=with_timecodes)
-
-        for p in [temp_video_path, temp_audio_path]:
-            try:
-                os.remove(p)
-            except:
-                pass
-
-        return text
+        return await transcribe_voice(audio_bytes, groq_clients, with_timecodes=with_timecodes)
 
     except Exception as e:
         logger.error(f"Error processing video file: {e}")
         return _err_text("Ошибка обработки видеофайла", e)
+
+    finally:
+        # Временные файлы удаляются при любом исходе: успех, ошибка, отмена задачи.
+        for p in (temp_video_path, temp_audio_path):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.debug(f"temp file cleanup failed for {p}: {e}")
 
 
 async def extract_text_from_pdf(pdf_bytes: bytes) -> str:

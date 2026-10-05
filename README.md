@@ -125,6 +125,7 @@ bot.py          — хендлеры, клавиатуры, роутинг, Fast
 processors.py   — OCR, транскрибация, коррекция, YouTube, скрейпинг, перевод, экспорт
 config.py       — промпты, константы, тексты сообщений
 database.py     — Supabase-слой с полным fallback
+.gitignore / .dockerignore — секреты (.env, cookies) не попадают ни в git, ни в Docker-образ
 textkit.py      — diff правок, имена собеседников, нарезка текста (без ИИ)
 access.py       — администратор, лимиты, выбор модели
 requirements.txt
