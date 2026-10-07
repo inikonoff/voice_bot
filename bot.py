@@ -1097,6 +1097,41 @@ def create_switch_keyboard(user_id: int, msg_id: int) -> Optional[InlineKeyboard
     return builder.as_markup()
 
 
+TG_LIMIT = 3800   # запас до лимита Telegram (4096) на теги и клавиатуру
+
+
+async def show_long(message: types.Message, text: str, reply_markup=None, parse_mode: Optional[str] = "HTML",
+                    prefix: str = "", **kwargs) -> None:
+    """
+    Показывает текст любой длины. Короткий — правкой сообщения; длинный — делится на несколько
+    сообщений по абзацам (теги не рвутся). Первая часть заменяет текущее сообщение,
+    остальные идут новыми; клавиатура — под последней частью.
+    prefix — заголовок, который остаётся только в первой части.
+    """
+    if parse_mode == "HTML":
+        parts = textkit.split_html(text, TG_LIMIT, first_limit=max(500, TG_LIMIT - len(prefix)))
+    else:
+        parts = [p for p in textkit.chunk_lines((text or "").split("\n"), TG_LIMIT)] or [""]
+    if not parts:
+        parts = [""]
+    parts[0] = prefix + parts[0]
+    last = len(parts) - 1
+    try:
+        await message.edit_text(parts[0], parse_mode=parse_mode,
+                                reply_markup=reply_markup if last == 0 else None, **kwargs)
+    except Exception as e:
+        logger.debug(f"show_long edit failed ({e}); sending as a new message")
+        await message.answer(parts[0], parse_mode=parse_mode,
+                             reply_markup=reply_markup if last == 0 else None, **kwargs)
+    for i, part in enumerate(parts[1:], start=1):
+        await message.answer(part, parse_mode=parse_mode, reply_markup=reply_markup if i == last else None, **kwargs)
+
+
+def _tail_for_stream(text: str, limit: int = 4000) -> str:
+    """Во время потоковой генерации показываем хвост ответа, а не обрезанное начало."""
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
 def _style_menu_kb(user_id: int, msg_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     btns = [
@@ -1213,9 +1248,7 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
                 accumulated += chunk
                 if len(accumulated) - last_edit_length > 30:
                     try:
-                        display = accumulated + "▌"
-                        if len(display) > 4096:
-                            display = display[:4093] + "..."
+                        display = _tail_for_stream(accumulated + "▌", 4000)
                         await placeholder.edit_text(display, reply_markup=create_dialog_keyboard(user_id))
                     except Exception as e:
                         # типичный кейс — "message is not modified"
@@ -1226,9 +1259,7 @@ async def handle_streaming_answer(message: types.Message, user_id: int, msg_id: 
             return
 
         final = sanitize_llm_output(accumulated) if accumulated else "❌ Пустой ответ"
-        if len(final) > 4096:
-            final = final[:4093] + "..."
-        await placeholder.edit_text(final, parse_mode="HTML", reply_markup=create_dialog_keyboard(user_id))
+        await show_long(placeholder, final, reply_markup=create_dialog_keyboard(user_id))
 
     except asyncio.CancelledError:
         try:
@@ -1984,9 +2015,13 @@ async def group_voice_handler(message: types.Message):
         return
     author = html.escape(message.from_user.full_name if message.from_user else "Участник")
     token = _group_cache_put(message.chat.id, text)
-    shown = text if len(text) <= 3500 else text[:3500].rstrip() + "…"
-    await message.reply(f"🎙 <b>{author}:</b>\n{html.escape(shown, quote=False)}", parse_mode="HTML",
-                        reply_markup=_group_kb(token, text))
+    head = f"🎙 <b>{author}:</b>\n"
+    chunks = textkit.chunk_lines(text.split("\n"), 3500) or [text]
+    kb = _group_kb(token, text)
+    for i, chunk in enumerate(chunks):
+        body = html.escape(chunk, quote=False)
+        await message.reply((head if i == 0 else "") + body, parse_mode="HTML",
+                            reply_markup=kb if i == len(chunks) - 1 else None)
 
 
 @dp.callback_query(F.data.startswith("gr_"))
@@ -2319,13 +2354,10 @@ async def youtube_handler(message: types.Message):
         asyncio.create_task(_bg_save_transcript(user_id, "youtube", dialogue_text, msg.message_id, message))
 
         lang_flag = "🇷🇺" if lang == "ru" else "🌐"
-        display = summary if len(summary) <= 4000 else summary[:3997] + "..."
-
-        await msg.edit_text(
-            f"📺 <b>YouTube</b> {lang_flag}\n"
-            f"<a href='{url}'>youtu.be/{video_id}</a>\n\n"
-            f"{display}",
-            parse_mode="HTML",
+        await show_long(
+            msg, summary,
+            prefix=(f"📺 <b>YouTube</b> {lang_flag}\n"
+                    f"<a href='{url}'>youtu.be/{video_id}</a>\n\n"),
             disable_web_page_preview=True,
             reply_markup=create_switch_keyboard(user_id, msg.message_id)
         )
@@ -2398,13 +2430,8 @@ async def url_handler(message: types.Message):
         asyncio.create_task(_bg_save_transcript(user_id, "url", page_text, msg.message_id, message))
 
         domain = url.split("/")[2] if len(url.split("/")) > 2 else url
-        display = summary if len(summary) <= 4000 else summary[:3997] + "..."
-
-        await msg.edit_text(
-            f"🌐 <b>{domain}</b>\n\n{display}",
-            parse_mode="HTML",
-            reply_markup=create_switch_keyboard(user_id, msg.message_id)
-        )
+        await show_long(msg, summary, prefix=f"🌐 <b>{domain}</b>\n\n",
+                        reply_markup=create_switch_keyboard(user_id, msg.message_id))
         try:
             await message.delete()
         except Exception as e:
@@ -2715,21 +2742,7 @@ async def process_callback(callback: types.CallbackQuery):
 
         available_modes = ctx_data.get("available_modes", ["basic", "premium"])
 
-        if len(result_clean) > 4000:
-            await callback.message.delete()
-            for i in range(0, len(result_clean), 4000):
-                await callback.message.answer(result_clean[i:i+4000], parse_mode="HTML")
-            await callback.message.answer(
-                "💾 <b>Переключение и экспорт:</b>",
-                parse_mode="HTML",
-                reply_markup=create_switch_keyboard(user_id, msg_id)
-            )
-        else:
-            await callback.message.edit_text(
-                result_clean,
-                parse_mode="HTML",
-                reply_markup=create_switch_keyboard(user_id, msg_id)
-            )
+        await show_long(callback.message, result_clean, reply_markup=create_switch_keyboard(user_id, msg_id))
 
     except Exception as e:
         logger.error(f"Process callback error: {e}")
@@ -2779,11 +2792,8 @@ async def mode_callback(callback: types.CallbackQuery):
         if transcript_id:
             asyncio.create_task(database.save_result(transcript_id, new_mode, processed_clean))
 
-        await callback.message.edit_text(
-            processed_clean,
-            parse_mode="HTML",
-            reply_markup=create_keyboard(msg_id, new_mode, ctx_data.get("available_modes", ["basic", "premium"]))
-        )
+        await show_long(callback.message, processed_clean,
+                        reply_markup=create_keyboard(msg_id, new_mode, ctx_data.get("available_modes", ["basic", "premium"])))
 
     except Exception as e:
         logger.error(f"Mode callback error: {e}")
@@ -2846,17 +2856,7 @@ async def switch_callback(callback: types.CallbackQuery):
         # Санитизируем для Telegram (если result пришёл из кэша — ещё не обработан)
         result = sanitize_llm_output(result)
 
-        if len(result) > 4000:
-            await callback.message.delete()
-            for i in range(0, len(result), 4000):
-                await callback.message.answer(result[i:i+4000], parse_mode="HTML")
-            await callback.message.answer(
-                "💾 <b>Переключение и экспорт:</b>",
-                parse_mode="HTML",
-                reply_markup=create_switch_keyboard(target_user_id, msg_id)
-            )
-        else:
-            await callback.message.edit_text(result, parse_mode="HTML", reply_markup=create_switch_keyboard(target_user_id, msg_id))
+        await show_long(callback.message, result, reply_markup=create_switch_keyboard(target_user_id, msg_id))
 
     except Exception as e:
         logger.error(f"Switch callback error: {e}")
@@ -3165,8 +3165,8 @@ async def translate_back_callback(callback: types.CallbackQuery):
     original_result = ctx_data["cached_results"].get(current_mode) or ctx_data.get("original", "")
     ctx_data["is_translated"] = False
 
-    display = original_result if len(original_result) <= 4000 else original_result[:3997] + "..."
-    await callback.message.edit_text(display, reply_markup=create_switch_keyboard(user_id, msg_id))
+    await show_long(callback.message, original_result, parse_mode=None,
+                    reply_markup=create_switch_keyboard(user_id, msg_id))
 
 
 @dp.callback_query(F.data.regexp(r'^translate_\d+_\d+$'))
@@ -3210,8 +3210,8 @@ async def translate_callback(callback: types.CallbackQuery):
 
         ctx_data["is_translated"] = True
 
-        display = translated if len(translated) <= 4000 else translated[:3997] + "..."
-        await callback.message.edit_text(sanitize_llm_output(display), parse_mode="HTML", reply_markup=create_switch_keyboard(user_id, msg_id))
+        await show_long(callback.message, sanitize_llm_output(translated),
+                        reply_markup=create_switch_keyboard(user_id, msg_id))
 
     except Exception as e:
         logger.error(f"Translate callback error: {e}")
@@ -3262,10 +3262,8 @@ async def breakdown_callback(callback: types.CallbackQuery):
         result = await processors.breakdown_corrections(original_text, corrected_text, groq_clients)
 
         mode_label = "«Как есть»" if current_mode == "basic" else "«Красиво»"
-        await status_msg.edit_text(
-            f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n{sanitize_llm_output(result)}",
-            parse_mode="HTML"
-        )
+        await show_long(status_msg, sanitize_llm_output(result),
+                        prefix=f"🧠 <b>Разбор правок — режим {mode_label}:</b>\n\n")
 
     except Exception as e:
         logger.error(f"Breakdown callback error: {e}")
@@ -3277,20 +3275,9 @@ async def breakdown_callback(callback: types.CallbackQuery):
 # СТИЛИ ТЕКСТА, НАГЛЯДНЫЙ DIFF, ИМЕНА СОБЕСЕДНИКОВ
 # ============================================================================
 
-def _split_for_telegram(text: str, limit: int = 4000) -> List[str]:
-    """Режет длинный HTML-текст по переводам строк/пробелам (без разрыва слов)."""
-    parts: List[str] = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit * 0.5:
-            cut = text.rfind(" ", 0, limit)
-        if cut <= 0:
-            cut = limit
-        parts.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    if text.strip():
-        parts.append(text)
-    return parts
+def _split_for_telegram(text: str, limit: int = 3800) -> List[str]:
+    """Делит длинный HTML на сообщения по абзацам, не разрывая теги (см. textkit.split_html)."""
+    return textkit.split_html(text, limit)
 
 
 @dp.callback_query(F.data.startswith("stm_"))
@@ -3517,7 +3504,10 @@ async def _process_inline(inline_message_id: str, user_id: int, mode: str, token
         inline_claimed.pop(inline_message_id, None)          # можно повторить кнопкой
         await edit(f"{result}\n\n{entry['text']}", markup=_inline_button(mode, title, token))
         return
-    await edit(sanitize_llm_output(result)[:4000], parse_mode="HTML")
+    # inline-сообщение одно и не делится: берём первую часть целиком, без обрыва посреди тега
+    parts = textkit.split_html(sanitize_llm_output(result), 3800)
+    shown = parts[0] + ("\n\n<i>…сокращено: длинный текст лучше обработать в личке с ботом</i>" if len(parts) > 1 else "")
+    await edit(shown, parse_mode="HTML")
 
 
 @dp.chosen_inline_result()

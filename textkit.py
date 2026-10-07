@@ -200,3 +200,78 @@ def chunk_lines(lines: List[str], max_chars: int) -> List[str]:
     if cur:
         chunks.append("\n".join(cur))
     return chunks
+
+
+# ============================================================================
+# НАРЕЗКА ДЛИННОГО HTML ДЛЯ TELEGRAM (лимит сообщения — 4096 знаков)
+# ============================================================================
+
+_HTML_TAG_RE = re.compile(r"<(/?)(b|i|u|s|code|pre|a)(\s[^>]*)?>", re.IGNORECASE)
+
+
+def _open_tags_after(piece: str, stack: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Какие теги остались открытыми после piece. stack — [(имя, исходный открывающий тег)]."""
+    stack = list(stack)
+    for m in _HTML_TAG_RE.finditer(piece):
+        name = m.group(2).lower()
+        if m.group(1):
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][0] == name:
+                    del stack[i:]
+                    break
+        else:
+            stack.append((name, m.group(0)))
+    return stack
+
+
+def _safe_cut(text: str, limit: int) -> int:
+    """Позиция разреза ≤ limit: по абзацу, строке, предложению, пробелу; не внутри тега и &сущности;."""
+    if len(text) <= limit:
+        return len(text)
+    window = text[:limit]
+    cut = -1
+    for sep, min_pos in (("\n\n", 0.3), ("\n", 0.4), (". ", 0.5), ("! ", 0.5), ("? ", 0.5), ("; ", 0.5), (", ", 0.6), (" ", 0.6)):
+        pos = window.rfind(sep)
+        if pos >= limit * min_pos:
+            cut = pos + len(sep.rstrip(" ")) if sep.strip() else pos
+            break
+    if cut <= 0:
+        cut = limit
+    # не режем внутри тега «<b …» и внутри «&amp;»
+    lt, gt = window[:cut].rfind("<"), window[:cut].rfind(">")
+    if lt > gt:
+        cut = lt
+    amp = window[:cut].rfind("&")
+    if amp != -1 and ";" not in window[amp:cut] and cut - amp < 10:
+        cut = amp
+    return max(cut, 1)
+
+
+def split_html(text: str, limit: int = 3800, first_limit: int = 0) -> List[str]:
+    """
+    Делит длинный HTML-текст на части ≤ limit знаков (первая — ≤ first_limit, если задан).
+    Режет по абзацам/предложениям; теги, открытые на границе, закрываются в конце
+    части и открываются заново в начале следующей, поэтому каждая часть валидна для Telegram.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts: List[str] = []
+    stack: List[Tuple[str, str]] = []
+    first = True
+    while text:
+        lim = first_limit if (first and first_limit) else limit
+        prefix = "".join(t for _, t in stack)
+        reserve = 20 * len(stack) + 12
+        room = max(200, lim - len(prefix) - reserve)
+        if len(prefix) + len(text) + len("".join(f"</{n}>" for n, _ in stack)) <= lim:
+            parts.append(prefix + text)
+            break
+        cut = _safe_cut(text, room)
+        piece, text = text[:cut], text[cut:].lstrip("\n ")
+        new_stack = _open_tags_after(prefix + piece, [])
+        closing = "".join(f"</{n}>" for n, _ in reversed(new_stack))
+        parts.append(prefix + piece.rstrip() + closing)
+        stack = new_stack
+        first = False
+    return [p for p in parts if p.strip()]
