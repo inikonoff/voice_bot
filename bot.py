@@ -73,6 +73,20 @@ def sanitize_llm_output(text: str) -> str:
     # 1. Null-байты
     text = text.replace('\x00', '')
 
+    # 1.5. Некоторые модели отвечают готовыми HTML-тегами вместо Markdown (<b>…</b>).
+    # Разрешённые теги прячем за служебными символами, чтобы экранирование их не сломало.
+    _TAGS = {'b': '\ue001', 'strong': '\ue001', 'i': '\ue002', 'em': '\ue002',
+             'u': '\ue003', 's': '\ue004', 'code': '\ue005'}
+    _REAL = {'\ue001': 'b', '\ue002': 'i', '\ue003': 'u', '\ue004': 's', '\ue005': 'code'}
+    for ch in _REAL:
+        text = text.replace(ch, '')
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(
+        r'<(/?)(b|strong|i|em|u|s|code)>',
+        lambda m: ('\ue0f0' if m.group(1) else '') + _TAGS[m.group(2).lower()],
+        text, flags=re.IGNORECASE)
+
     # 2. Экранируем HTML-спецсимволы в сыром тексте
     text = text.replace('&', '&amp;')
     text = text.replace('<', '&lt;')
@@ -96,6 +110,28 @@ def sanitize_llm_output(text: str) -> str:
 
     # Заголовки Markdown (### / ## / #) → bold
     text = re.sub(r'^#{1,6}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    # Возвращаем разрешённые теги; закрывающий — с маркером \ue0f0 перед служебным символом
+    text = re.sub('\ue0f0([\ue001-\ue005])', lambda m: '</' + _REAL[m.group(1)] + '>', text)
+    text = re.sub('[\ue001-\ue005]', lambda m: '<' + _REAL[m.group(0)] + '>', text)
+    text = text.replace('\ue0f0', '')
+
+    # Модель могла прислать незакрытые или криво вложенные теги — Telegram отвергает такой HTML.
+    # Выравниваем: лишние закрывающие убираем, незакрытые закрываем в конце.
+    stack, out, pos = [], [], 0
+    for m in re.finditer(r'<(/?)(b|i|u|s|code)>', text):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        closing, name = bool(m.group(1)), m.group(2)
+        if not closing:
+            stack.append(name)
+            out.append(m.group(0))
+        elif stack and stack[-1] == name:
+            stack.pop()
+            out.append(m.group(0))
+        # иначе: закрывающий без пары или с нарушенной вложенностью — пропускаем
+    out.append(text[pos:])
+    text = ''.join(out) + ''.join(f'</{n}>' for n in reversed(stack))
 
     # Telegram rejects an empty message. This can happen when a reasoning-only
     # response is stripped completely (for example, <think>...</think>).
