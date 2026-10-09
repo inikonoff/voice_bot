@@ -494,14 +494,20 @@ async def llm_check(groq_clients: list) -> str:
         try:
             r = await coro
             txt = (r.choices[0].message.content or "").strip()[:20] if r.choices else ""
-            lines.append(f"✅ {label}: {time.time() - t0:.1f} с «{txt}»")
+            dt = time.time() - t0
+            if txt:
+                lines.append(f"✅ {label}: {dt:.1f} с «{txt}»")
+            else:   # рассуждающая модель потратила токены на размышления — модель жива
+                lines.append(f"✅ {label}: {dt:.1f} с (ответ пустой: токены ушли на размышления)")
         except Exception as e:
-            lines.append(f"❌ {label}: {str(e)[:110]}")
+            msg = str(e)
+            hint = " — временный лимит провайдера, модель на месте" if "429" in msg else ""
+            lines.append(f"❌ {label}: {msg[:100]}{hint}")
 
     if _yandex_client:
         for m in _yandex_models():
             await probe(f"Yandex {m.split('/')[-1]}", _yandex_client.chat.completions.create(
-                model=m, messages=msgs, temperature=0, max_tokens=8))
+                model=m, messages=msgs, temperature=0, max_tokens=64))
         if not _yandex_ready():
             lines.append("⏸ Yandex на паузе после сбоев (предохранитель)")
     else:
@@ -510,14 +516,14 @@ async def llm_check(groq_clients: list) -> str:
     if _text_clients:
         m = config.LLM_MODELS["premium"][0]
         await probe(f"OpenRouter {m}", random.choice(_text_clients).chat.completions.create(
-            model=m, messages=msgs, temperature=0, max_tokens=8))
+            model=m, messages=msgs, temperature=0, max_tokens=64))
     else:
         lines.append("⚪ OpenRouter: ключ не задан")
 
     if groq_clients:
         m = config.GROQ_MODELS["premium"]
         await probe(f"Groq {m}", random.choice(groq_clients).chat.completions.create(
-            model=m, messages=msgs, temperature=0, max_tokens=8))
+            model=m, messages=msgs, temperature=0, max_tokens=64))
     else:
         lines.append("⚪ Groq: клиентов нет")
 
