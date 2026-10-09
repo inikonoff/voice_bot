@@ -731,7 +731,7 @@ async def api_dictate(
     API для Android приложения:
     - Принимает аудиофайл (m4a)
     - Распознает речь (Whisper)
-    - Делает красивую обработку (Llama)
+    - Делает красивую обработку (всегда режим «Красиво»)
     - Возвращает чистый текст
     """
     # Простейшая защита
@@ -770,11 +770,9 @@ async def api_dictate(
         if len(raw_text.strip()) < 2:
             return {"status": "error", "text": "Ничего не расслышал"}
         
-        # Делаем коррекцию выбранным стилем (APP_CORR_STYLE: basic или premium)
-        if APP_CORR_STYLE == "basic":
-            corrected_text = await processors.correct_text_basic(raw_text, groq_clients)
-        else:
-            corrected_text = await processors.correct_text_premium(raw_text, groq_clients)
+        # Голос из приложения всегда идёт через «✨ Красиво» (PREMIUM_CORRECTION_PROMPT),
+        # независимо от APP_CORR_STYLE: диктовка без слов-паразитов — смысл приложения
+        corrected_text = await processors.correct_text_premium(raw_text, groq_clients)
         
         if corrected_text.startswith("❌"):
             logger.error(f"API Dictate correction error: {corrected_text}")
