@@ -44,7 +44,7 @@
 |---|---|
 | Bot Framework | [aiogram 3.x](https://docs.aiogram.dev/) |
 | Web Server | [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) |
-| Текстовые LLM | [OpenRouter](https://openrouter.ai/) — бесплатные модели (Gemma 4 31B, Qwen3.8 27B, запас Nemotron 3 Super), откат на Groq |
+| Текстовые LLM | [OpenRouter](https://openrouter.ai/) — бесплатные модели (Nemotron 3 Super, запас Nemotron 3 Ultra), откат на Groq |
 | STT | [Groq Cloud](https://groq.com/) — Whisper large-v3-turbo |
 | OCR | Groq Vision (Qwen 3.8 27B) |
 | PDF | pdfplumber (чтение), reportlab (запись) |
@@ -76,7 +76,7 @@ BOT_TOKEN=ваш_токен_телеграм_бота
 GROQ_API_KEYS=ключ1,ключ2,ключ3          # Whisper, OCR и запасной откат
 OPENROUTER_API_KEYS=sk-or-...             # текстовые LLM (можно несколько через запятую)
 # необязательно: свой порядок моделей (через запятую, первая — основная)
-# OR_MODELS_BASIC=google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free
+# OR_MODELS_BASIC=nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3-ultra-550b-a55b:free
 # OR_MODELS_PREMIUM=...  OR_MODELS_SUBTITLES=...  OR_MODELS_REASONING=...
 # YandexGPT (необязательно). Включает профили «Yandex (с fallback)» и «Yandex (only)» в /model
 # YANDEX_API_KEY=...         # API-ключ сервисного аккаунта (роль ai.languageModels.user)
@@ -100,10 +100,10 @@ ADMIN_IDS=123456789                       # ваш Telegram ID (нескольк
 # USER_COOLDOWN_SEC=3        # пауза между сообщениями
 # GROUP_DAILY_LIMIT=40       # обращений к ИИ в сутки на каждый групповой чат
 # LIMITS_TZ=Europe/Minsk     # сутки считаются по этому поясу, сброс в 00:00
-# OR_MODELS_IMG2PROMPT=google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free   # vision-модели для /img2prompt
+# OR_MODELS_IMG2PROMPT=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,thinkingmachines/inkling-small:free   # vision-модели для /img2prompt
 # GROQ_VISION_MODELS=qwen/qwen3.8-27b,qwen/qwen3.6-27b   # vision на Groq (OCR): основная и запасная
 # (в /model показываются только рабочие модели: список сверяется с провайдерами раз в 10 минут)
-# DEFAULT_LLM_PROFILE=auto   # модель по умолчанию: auto, gemma, gemma26, nemotron_super,
+# DEFAULT_LLM_PROFILE=auto   # модель по умолчанию: auto, nemotron_super,
 #                            # nemotron_ultra, groq, yandex, yandex_only
 ```
 
@@ -223,7 +223,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day);
 
 **Подробность** (отдельный ряд кнопок): 📏 кратко (~150–350 знаков, только главное), 📐 средне (~500–900, по умолчанию) и 📚 подробно (~1200–2000, слои фона, материалы, оптика, свет, палитра, мелкие детали и надписи). Рядом с названием стиля показывается фактическая длина в знаках. Модели попадают в диапазон приблизительно, поэтому слишком длинный ответ (больше max × 1,25) аккуратно обрезается по границе предложения или запятой, а параметры Midjourney в конце строки сохраняются. Диапазоны и тексты уровней меняются в `config.IMG2PROMPT_DETAILS`. Выбранная подробность запоминается для следующих картинок (в Supabase, если он подключён). Каждая комбинация «стиль × подробность» кэшируется отдельно: повторное переключение на уже готовую бесплатно. Уже сгенерированные стили переключаются бесплатно, каждая новая генерация стоит 1 единицу лимита.
 
-Модели: цепочка vision-моделей OpenRouter из `OR_MODELS_IMG2PROMPT` (по умолчанию Gemma 4 31B, затем Qwen3.8 27B), при сбоях откат на Groq (`GROQ_MODELS["vision"]`). Выбор `/model` на эту функцию не влияет. Если модель отключат, достаточно поменять переменную окружения. Проверенная запасная: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` (бесплатный эндпоинт NVIDIA логирует запросы и не рекомендует слать лица людей).
+Модели: цепочка vision-моделей OpenRouter из `OR_MODELS_IMG2PROMPT` (по умолчанию Nemotron 3 Nano Omni, затем Inkling Small), при сбоях откат на Groq (`GROQ_MODELS["vision"]`). Выбор `/model` на эту функцию не влияет. Если модель отключат, достаточно поменять переменную окружения. Проверенная запасная: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` (бесплатный эндпоинт NVIDIA логирует запросы и не рекомендует слать лица людей).
 
 ---
 
