@@ -523,6 +523,8 @@ async def lifespan(app: FastAPI):
     processors.vision_processor.init_clients(groq_clients)
     # OpenRouter (текстовые LLM)
     processors.init_text_clients()
+    # YandexGPT (YANDEX_API_KEY + YANDEX_FOLDER_ID)
+    processors.init_yandex_client()
 
     if not hasattr(processors, 'document_dialogues'):
         processors.document_dialogues = {}
@@ -1620,7 +1622,11 @@ def _model_menu_text(uid: int) -> str:
         f"Сейчас у вас: <b>{mine}</b>\n"
         f"Для всех пользователей: <b>{profiles[access.global_profile_key()]['label']}</b>\n\n"
         "<i>Конкретная модель работает строго: если она недоступна, вы увидите "
-        "ошибку, а не тихую подмену. «Авто» сама переключается между моделями и Groq.</i>"
+        "ошибку, а не тихую подмену. «Авто» сама переключается между моделями и Groq. "
+        "«Yandex (с fallback)» сначала пробует YandexGPT, при сбое идёт по цепочке «Авто»; "
+        "«Yandex (only)» — только YandexGPT.</i>\n"
+        + ("🟡 YandexGPT подключён" if processors.yandex_configured()
+           else "⚪ YandexGPT не настроен (нет YANDEX_API_KEY / YANDEX_FOLDER_ID)")
     )
 
 
@@ -1711,11 +1717,25 @@ async def admin_handler(message: types.Message):
         f"🗄 БД: {'✅ Supabase (счётчики сохраняются)' if database.is_available() else '❌ нет (счётчики сбросятся при рестарте)'}",
         "\n<b>Команды:</b>",
         "/model — выбор модели",
+        "/llmcheck — проверка всех звеньев LLM (Yandex, OpenRouter, Groq)",
         "/setlimit <code>ID число</code> — индивидуальный лимит (0 — заблокировать)",
         "/setlimit <code>ID reset</code> — вернуть общий лимит",
         "/status — техническое состояние",
     ]
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("llmcheck"))
+async def llmcheck_handler(message: types.Message):
+    stats["processed_messages"] += 1
+    if not access.is_admin(message.from_user.id):
+        return
+    wait = await message.answer("🔎 Проверяю модели…")
+    try:
+        report = await processors.llm_check(groq_clients)
+    except Exception as e:
+        report = f"❌ Проверка не удалась: {str(e)[:150]}"
+    await wait.edit_text("🔎 <b>Проверка LLM</b>\n\n" + html.escape(report), parse_mode="HTML")
 
 
 @dp.message(Command("setlimit"))

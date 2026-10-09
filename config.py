@@ -405,6 +405,32 @@ LLM_MODELS = {
     "reasoning": _env_models("OR_MODELS_REASONING", [_QWEN, _NEMOTRON_SUPER, _GEMMA]),
 }
 
+# ----------------------------------------------------------------------------
+# YandexGPT (Yandex AI Studio, OpenAI-совместимый API)
+# ----------------------------------------------------------------------------
+# Включается переменными окружения YANDEX_API_KEY и YANDEX_FOLDER_ID (ключ
+# сервисного аккаунта с ролью ai.languageModels.user). Без них профили Yandex
+# в /model остаются, но работают как «не настроен»: «с fallback» молча идёт
+# дальше по цепочке, «only» честно сообщает об ошибке.
+# Переопределение без правки кода:
+#   YANDEX_BASE_URL    — по умолчанию https://llm.api.cloud.yandex.net/v1
+#                        (в новой документации также https://ai.api.cloud.yandex.net/v1)
+#   YANDEX_MODELS      — через запятую, по приоритету; имя без «gpt://» дополняется
+#                        до gpt://<folder_id>/<имя>; по умолчанию yandexgpt-5.1,yandexgpt-lite
+#   YANDEX_TIMEOUT     — таймаут запроса, сек (по умолчанию 30)
+#   YANDEX_MAX_CONCURRENT — одновременных запросов (квота каталога: 10 синхронных)
+#   YANDEX_BREAKER_FAILS / YANDEX_BREAKER_PAUSE — после N сбоев подряд Yandex
+#                        пропускается на PAUSE секунд (чтобы не ждать таймаут на каждом запросе)
+#   YANDEX_DATA_LOGGING — 1 разрешает Яндексу логировать запросы (по умолчанию выключено)
+YANDEX_BASE_URL = os.environ.get("YANDEX_BASE_URL", "https://llm.api.cloud.yandex.net/v1").strip()
+YANDEX_MODELS = _env_models("YANDEX_MODELS", ["yandexgpt-5.1", "yandexgpt-lite"])
+YANDEX_TIMEOUT = float(os.environ.get("YANDEX_TIMEOUT", "30") or 30)
+YANDEX_MAX_CONCURRENT = int(os.environ.get("YANDEX_MAX_CONCURRENT", "8") or 8)
+YANDEX_BREAKER_FAILS = int(os.environ.get("YANDEX_BREAKER_FAILS", "3") or 3)
+YANDEX_BREAKER_PAUSE = float(os.environ.get("YANDEX_BREAKER_PAUSE", "120") or 120)
+YANDEX_DATA_LOGGING = os.environ.get("YANDEX_DATA_LOGGING", "0").strip() in ("1", "true", "yes")
+
+
 # Параметры reasoning для OpenRouter. Для правки текста размышления не нужны
 # (они только съедают токены и дают пустые ответы), для саммари — минимум.
 # Если модель не поддерживает параметр и вернёт 400 — бот сам повторит запрос
@@ -481,6 +507,18 @@ LLM_PROFILES = {
         "label": "🐰 Space Bunny Alpha",
         "desc": "stealth-модель, может исчезнуть",
         "models": ["stealth/space-bunny-alpha"], "groq_fallback": False,
+    },
+    # Ключ "yandex": "first" — сначала YandexGPT, при сбое обычная цепочка
+    # OpenRouter и Groq; "only" — только YandexGPT, без подмены.
+    "yandex": {
+        "label": "🟡 Yandex (с fallback)",
+        "desc": "YandexGPT, при сбоях — Gemma/Qwen и Groq",
+        "models": None, "groq_fallback": True, "yandex": "first",
+    },
+    "yandex_only": {
+        "label": "🟡 Yandex (only)",
+        "desc": "только YandexGPT, без подмены",
+        "models": [], "groq_fallback": False, "yandex": "only",
     },
     "groq": {
         "label": "⚡ Groq gpt-oss",

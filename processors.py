@@ -145,13 +145,155 @@ def init_text_clients() -> int:
     return len(_text_clients)
 
 
+# ----------------------------------------------------------------------------
+# YandexGPT (OpenAI-совместимый API Yandex AI Studio)
+# ----------------------------------------------------------------------------
+
+_yandex_client: Optional[AsyncOpenAI] = None
+_yandex_folder: str = ""
+_yandex_sem: Optional[asyncio.Semaphore] = None
+_yandex_fails = 0               # сбоев подряд
+_yandex_down_until = 0.0        # предохранитель: до этого момента Yandex пропускаем
+
+# Вежливые отказы YandexGPT на «чувствительные» темы — это не правка, а заглушка
+_YANDEX_REFUSAL_RE = re.compile(
+    r"(не могу (ничего )?(сказать|обсуждать|ответить)|давайте (сменим|поговорим о чём)|"
+    r"не могу помочь с (этим|данным)|не имею права обсуждать)", re.IGNORECASE)
+
+
+class YandexRefusal(Exception):
+    """Модель отказалась обрабатывать текст (фильтр контента)."""
+
+
+def init_yandex_client() -> bool:
+    """Создаёт клиента YandexGPT из YANDEX_API_KEY и YANDEX_FOLDER_ID."""
+    global _yandex_client, _yandex_folder, _yandex_sem, _yandex_fails, _yandex_down_until
+    key = os.environ.get("YANDEX_API_KEY", "").strip()
+    folder = os.environ.get("YANDEX_FOLDER_ID", "").strip()
+    _yandex_client, _yandex_folder = None, folder
+    _yandex_fails, _yandex_down_until = 0, 0.0
+    if not (key and folder):
+        logger.info("YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы — YandexGPT выключен")
+        return False
+    headers = {}
+    if not config.YANDEX_DATA_LOGGING:
+        headers["x-data-logging-enabled"] = "false"     # не отдавать запросы Яндексу для обучения
+    _yandex_client = AsyncOpenAI(
+        api_key=key,
+        base_url=config.YANDEX_BASE_URL,
+        project=folder,                      # каталог → заголовок OpenAI-Project
+        timeout=config.YANDEX_TIMEOUT,
+        max_retries=0,                       # повторы и откат — наши
+        default_headers=headers,
+    )
+    _yandex_sem = asyncio.Semaphore(max(1, config.YANDEX_MAX_CONCURRENT))
+    logger.info(f"✅ YandexGPT: {config.YANDEX_BASE_URL}; модели: {_yandex_models()}")
+    return True
+
+
+def _yandex_models() -> List[str]:
+    """Полные URI моделей: gpt://<folder>/<имя>."""
+    return [m if m.startswith(("gpt://", "ds://")) else f"gpt://{_yandex_folder}/{m}"
+            for m in config.YANDEX_MODELS]
+
+
+def yandex_configured() -> bool:
+    return _yandex_client is not None
+
+
+def _yandex_ready() -> bool:
+    return _yandex_client is not None and time.time() >= _yandex_down_until
+
+
+def _yandex_ok() -> None:
+    global _yandex_fails
+    _yandex_fails = 0
+
+
+def _yandex_failed(e: Exception) -> None:
+    """Считает сбой инфраструктуры и при серии сбоев открывает предохранитель."""
+    global _yandex_fails, _yandex_down_until
+    _yandex_fails += 1
+    if _yandex_fails >= config.YANDEX_BREAKER_FAILS:
+        _yandex_down_until = time.time() + config.YANDEX_BREAKER_PAUSE
+        _yandex_fails = 0
+        logger.warning(f"YandexGPT: {config.YANDEX_BREAKER_FAILS} сбоя подряд — пауза "
+                       f"{int(config.YANDEX_BREAKER_PAUSE)}с, идём по запасной цепочке ({str(e)[:80]})")
+
+
+def _yandex_mode(kind: str) -> Optional[str]:
+    """None / "first" / "only" — режим Yandex в профиле текущего пользователя."""
+    if kind in config.FIXED_CHAIN_KINDS:      # vision-задачи: у YandexGPT нет картинок
+        return None
+    return access.profile_for(access.current_user_id.get()).get("yandex")
+
+
+def _check_yandex_reply(r, src_len: int) -> str:
+    choice = r.choices[0] if r.choices else None
+    content = _clean_llm_text(choice.message.content if choice else "")
+    if choice is not None and getattr(choice, "finish_reason", None) == "content_filter":
+        raise YandexRefusal("content_filter")
+    if not content:
+        raise Exception("empty_content")
+    if len(content) < 220 and _YANDEX_REFUSAL_RE.search(content):
+        raise YandexRefusal(content[:80])
+    return content
+
+
+async def _yandex_completion(kind: str, messages: list, temperature: float,
+                             max_tokens: Optional[int]) -> str:
+    """
+    Запрос к YandexGPT по цепочке моделей (config.YANDEX_MODELS).
+    Исключения: YandexRefusal (отказ модели), прочие — сбой; вызывающий решает,
+    идти ли дальше по запасной цепочке.
+    """
+    last_err: Optional[Exception] = None
+    src_len = sum(len(m.get("content") or "") for m in messages if isinstance(m.get("content"), str))
+    for model in _yandex_models():
+        for attempt in range(2):
+            kwargs: Dict[str, Any] = dict(model=model, messages=messages, temperature=temperature)
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            try:
+                async with _yandex_sem:
+                    r = await _yandex_client.chat.completions.create(**kwargs)
+                content = _check_yandex_reply(r, src_len)
+                _yandex_ok()
+                return content
+            except YandexRefusal as e:
+                logger.warning(f"[{kind}] Yandex {model}: отказ модели ({e})")
+                raise
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                low = msg.lower()
+                logger.warning(f"[{kind}] Yandex {model}: {msg[:140]}")
+                if "413" in msg or ("context" in low and "length" in low):
+                    raise                          # слишком длинный вход — пусть вызывающий обрежет
+                if "401" in msg or "403" in msg:   # ключ/роль/каталог — повторять бессмысленно
+                    _yandex_failed(e)
+                    raise
+                if "404" in msg or "not found" in low:
+                    break                          # такой модели нет — следующая
+                if attempt == 0:
+                    await asyncio.sleep(2 if "429" in msg else 0.5)
+                    continue
+                _yandex_failed(e)
+    raise last_err or Exception("YandexGPT недоступен")
+
+
 def has_text_llm(groq_clients: Optional[list] = None) -> bool:
-    return bool(_text_clients or groq_clients)
+    return bool(_text_clients or groq_clients or _yandex_client)
 
 
 def text_llm_label() -> str:
+    parts = []
+    if _yandex_client:
+        parts.append("🟡 YandexGPT" + (" (пауза)" if not _yandex_ready() else ""))
     if _text_clients:
-        return f"✅ OpenRouter ({len(_text_clients)} ключ.), запас — Groq"
+        parts.append(f"✅ OpenRouter ({len(_text_clients)} ключ.)")
+    if parts:
+        return " → ".join(parts) + ", запас — Groq"
     return "Groq (OpenRouter не настроен)"
 
 
@@ -191,6 +333,23 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
 
     access.charge()   # 1 единица за обращение к ИИ (админ и фоновые задачи не списываются)
     chain, groq_fallback = _resolve_chain(kind)
+
+    ymode = _yandex_mode(kind)
+    if ymode:
+        if _yandex_ready():
+            try:
+                return await _yandex_completion(kind, messages, temperature, max_tokens)
+            except Exception as e:
+                last_err = e
+                if "413" in str(e):
+                    raise
+                if ymode == "only":
+                    raise
+                logger.warning(f"[{kind}] Yandex недоступен → запасная цепочка")
+        elif ymode == "only":
+            raise Exception("YandexGPT недоступен: " + (
+                "не заданы YANDEX_API_KEY/YANDEX_FOLDER_ID" if not _yandex_client
+                else "временная пауза после сбоев"))
 
     if chain and not _text_clients:
         last_err = Exception("OpenRouter не настроен (нет OPENROUTER_API_KEYS)")
@@ -249,11 +408,72 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
     raise last_err or Exception("Нет доступных LLM-клиентов")
 
 
+async def llm_check(groq_clients: list) -> str:
+    """Проверка всех звеньев цепочки (для админ-команды /llmcheck). Квоту не списывает."""
+    msgs = [{"role": "user", "content": "Ответь одним словом: ок"}]
+    lines: List[str] = []
+
+    async def probe(label: str, coro):
+        t0 = time.time()
+        try:
+            r = await coro
+            txt = (r.choices[0].message.content or "").strip()[:20] if r.choices else ""
+            lines.append(f"✅ {label}: {time.time() - t0:.1f} с «{txt}»")
+        except Exception as e:
+            lines.append(f"❌ {label}: {str(e)[:110]}")
+
+    if _yandex_client:
+        for m in _yandex_models():
+            await probe(f"Yandex {m.split('/')[-1]}", _yandex_client.chat.completions.create(
+                model=m, messages=msgs, temperature=0, max_tokens=8))
+        if not _yandex_ready():
+            lines.append("⏸ Yandex на паузе после сбоев (предохранитель)")
+    else:
+        lines.append("⚪ Yandex: не заданы YANDEX_API_KEY / YANDEX_FOLDER_ID")
+
+    if _text_clients:
+        m = config.LLM_MODELS["premium"][0]
+        await probe(f"OpenRouter {m}", random.choice(_text_clients).chat.completions.create(
+            model=m, messages=msgs, temperature=0, max_tokens=8))
+    else:
+        lines.append("⚪ OpenRouter: ключ не задан")
+
+    if groq_clients:
+        m = config.GROQ_MODELS["premium"]
+        await probe(f"Groq {m}", random.choice(groq_clients).chat.completions.create(
+            model=m, messages=msgs, temperature=0, max_tokens=8))
+    else:
+        lines.append("⚪ Groq: клиентов нет")
+    return "\n".join(lines)
+
+
 async def _open_text_stream(kind: str, groq_clients: list, messages: list,
                             temperature: float, max_tokens: int):
     """Открывает потоковый запрос: OpenRouter по цепочке моделей, затем Groq."""
     last_err: Optional[Exception] = None
     chain, groq_fallback = _resolve_chain(kind)
+
+    ymode = _yandex_mode(kind)
+    if ymode:
+        if _yandex_ready():
+            for model in _yandex_models():
+                try:
+                    return await _yandex_client.chat.completions.create(
+                        model=model, messages=messages, temperature=temperature,
+                        max_tokens=max_tokens, stream=True)
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"[{kind}/stream] Yandex {model}: {str(e)[:140]}")
+                    if "401" in str(e) or "403" in str(e):
+                        break
+            _yandex_failed(last_err or Exception("stream"))
+            if ymode == "only":
+                raise last_err or Exception("YandexGPT недоступен")
+        elif ymode == "only":
+            raise Exception("YandexGPT недоступен: " + (
+                "не заданы YANDEX_API_KEY/YANDEX_FOLDER_ID" if not _yandex_client
+                else "временная пауза после сбоев"))
+
     if chain and not _text_clients:
         last_err = Exception("OpenRouter не настроен (нет OPENROUTER_API_KEYS)")
     if chain and _text_clients:
