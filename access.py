@@ -49,6 +49,8 @@ def is_admin(user_id: Optional[int]) -> bool:
 # Пользователь, чьё сообщение сейчас обрабатывается. Выставляется middleware и
 # автоматически виден во всех await-цепочках (processors списывает лимит по нему).
 current_user_id: contextvars.ContextVar = contextvars.ContextVar("current_user_id", default=None)
+# Принудительный профиль модели для текущего запроса (используют API-эндпоинты приложения)
+profile_override: contextvars.ContextVar = contextvars.ContextVar("profile_override", default=None)
 
 
 # ============================================================================
@@ -324,6 +326,9 @@ def profile_key_for(user_id: Optional[int]) -> str:
 
 
 def profile_for(user_id: Optional[int]) -> dict:
+    ov = profile_override.get()
+    if ov and _valid(ov):
+        return config.LLM_PROFILES[ov]
     return config.LLM_PROFILES[profile_key_for(user_id)]
 
 

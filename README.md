@@ -85,6 +85,7 @@ OPENROUTER_API_KEYS=sk-or-...             # текстовые LLM (можно �
 # YANDEX_BASE_URL=https://llm.api.cloud.yandex.net/v1   # или https://ai.api.cloud.yandex.net/v1
 # YANDEX_TIMEOUT=30  YANDEX_MAX_CONCURRENT=8   # таймаут, сек; одновременных запросов (квота — 10)
 # YANDEX_BREAKER_FAILS=3  YANDEX_BREAKER_PAUSE=120   # после 3 сбоев подряд Yandex пропускается на 120 с
+# APP_LLM_PROFILE=yandex   # модель правки для Android-приложения: yandex (с откатом), yandex_only, auto… (речь всегда на Groq)
 # YANDEX_DATA_LOGGING=0      # 1 — разрешить Яндексу логировать запросы (по умолчанию запрещено)
 SUPABASE_URL=https://xxx.supabase.co   # опционально
 SUPABASE_KEY=ваш_anon_ключ             # опционально

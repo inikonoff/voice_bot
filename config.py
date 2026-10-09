@@ -429,6 +429,12 @@ LLM_MODELS = {
 #   YANDEX_BREAKER_FAILS / YANDEX_BREAKER_PAUSE — после N сбоев подряд Yandex
 #                        пропускается на PAUSE секунд (чтобы не ждать таймаут на каждом запросе)
 #   YANDEX_DATA_LOGGING — 1 разрешает Яндексу логировать запросы (по умолчанию выключено)
+# Профиль модели для запросов из Android-приложения (/api/dictate и /api/correct).
+# Не зависит от /model: по умолчанию правка идёт через YandexGPT с откатом на запасные
+# модели. "yandex_only" — только Yandex; "auto"/"groq" и т.д. — как в /model.
+# Распознавание речи (Whisper) всегда на Groq.
+APP_LLM_PROFILE = os.environ.get("APP_LLM_PROFILE", "yandex").strip().lower()
+
 YANDEX_BASE_URL = os.environ.get("YANDEX_BASE_URL", "https://llm.api.cloud.yandex.net/v1").strip()
 YANDEX_MODELS = _env_models("YANDEX_MODELS", ["yandexgpt-5.1", "yandexgpt-lite"])
 YANDEX_TIMEOUT = float(os.environ.get("YANDEX_TIMEOUT", "30") or 30)

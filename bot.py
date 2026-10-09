@@ -739,6 +739,10 @@ async def api_dictate(
         logger.warning(f"API unauthorized attempt with token: {'***' if x_app_token else None}")
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # Правка текста для приложения идёт по профилю APP_LLM_PROFILE (по умолчанию YandexGPT),
+    # независимо от /model; распознавание речи ниже остаётся на Groq
+    access.profile_override.set(config.APP_LLM_PROFILE)
+
     # Проверяем наличие Groq клиентов
     if not groq_clients:
         logger.error("API Dictate error: No Groq clients available")
@@ -814,6 +818,8 @@ async def api_correct(
     if x_app_token != APP_SECRET_TOKEN:
         logger.warning(f"API /correct unauthorized attempt with token: {'***' if x_app_token else None}")
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    access.profile_override.set(config.APP_LLM_PROFILE)
 
     if not processors.has_text_llm(groq_clients):
         logger.error("API Correct error: No LLM clients available")
