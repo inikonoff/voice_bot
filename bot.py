@@ -525,6 +525,8 @@ async def lifespan(app: FastAPI):
     processors.init_text_clients()
     # YandexGPT (YANDEX_API_KEY + YANDEX_FOLDER_ID)
     processors.init_yandex_client()
+    # Фоновая сверка моделей из config с живыми списками провайдеров (в лог)
+    asyncio.create_task(processors.log_model_audit(groq_clients))
 
     if not hasattr(processors, 'document_dialogues'):
         processors.document_dialogues = {}

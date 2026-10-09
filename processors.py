@@ -305,6 +305,22 @@ def _clean_llm_text(raw: Optional[str]) -> str:
     return s.strip()
 
 
+# Модели OpenRouter, ответившие 404 (в т.ч. «unavailable for free»): на время пропускаем,
+# чтобы не тратить запрос и секунды на заведомо мёртвую модель в начале цепочки.
+_dead_models: Dict[str, float] = {}
+_DEAD_TTL = 3600.0
+
+
+def _mark_dead(model: str) -> None:
+    _dead_models[model] = time.time() + _DEAD_TTL
+
+
+def _live_chain(chain: list) -> list:
+    now = time.time()
+    live = [m for m in chain if _dead_models.get(m, 0) <= now]
+    return live or list(chain)      # если «мертвы» все — пробуем всё равно
+
+
 def _resolve_chain(kind: str) -> Tuple[list, bool]:
     """
     Цепочка моделей OpenRouter и разрешение отката на Groq для текущего
@@ -355,7 +371,8 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
         last_err = Exception("OpenRouter не настроен (нет OPENROUTER_API_KEYS)")
     if chain and _text_clients:
         extra = config.OPENROUTER_EXTRA_BODY.get(kind)
-        for model in chain:
+        strict = len(chain) == 1            # конкретная модель из /model — без пропусков
+        for model in (chain if strict else _live_chain(chain)):
             use_extra = bool(extra)
             for attempt in range(config.LLM_RETRIES_PER_MODEL):
                 client = random.choice(_text_clients)
@@ -381,6 +398,7 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
                     if "413" in msg:
                         raise                      # слишком длинный вход — пусть вызывающий обрежет
                     if "404" in msg or "no endpoints" in low or "not a valid model" in low:
+                        _mark_dead(model)
                         break                      # модели нет — следующая
                     if attempt < config.LLM_RETRIES_PER_MODEL - 1:   # после последней попытки не ждём
                         await asyncio.sleep(3 if ("429" in msg or "rate" in low) else 1)
@@ -406,6 +424,64 @@ async def _text_completion(kind: str, groq_clients: list, messages: list,
         return await _make_groq_request(groq_clients, _groq_call)
 
     raise last_err or Exception("Нет доступных LLM-клиентов")
+
+
+async def _list_ids(client) -> set:
+    ids = set()
+    async for m in client.models.list():
+        ids.add(m.id)
+    return ids
+
+
+async def audit_models(groq_clients: list) -> List[str]:
+    """
+    Сверяет модели из config с живыми списками провайдеров (GET /models).
+    Возвращает строки о проблемах: модель отсутствует у провайдера (снята, переименована,
+    бесплатный вариант отозван). Пустой список — всё на месте.
+    """
+    problems: List[str] = []
+
+    if _text_clients:
+        try:
+            live = await _list_ids(_text_clients[0])
+            used: Dict[str, List[str]] = {}
+            for kind, models in config.LLM_MODELS.items():
+                for m in models:
+                    used.setdefault(m, []).append(kind)
+            for prof_key, prof in config.LLM_PROFILES.items():
+                for m in (prof.get("models") or []):
+                    used.setdefault(m, []).append(f"/model:{prof_key}")
+            for m, where in sorted(used.items()):
+                if m not in live:
+                    problems.append(f"OpenRouter: «{m}» нет в списке ({', '.join(where)})")
+        except Exception as e:
+            problems.append(f"OpenRouter: список моделей не получен ({str(e)[:80]})")
+
+    if groq_clients:
+        try:
+            live = await _list_ids(groq_clients[0])
+            need = {config.GROQ_MODELS[k]: k for k in ("transcription", "basic", "premium", "reasoning")}
+            for m in config.GROQ_VISION_MODELS:
+                need.setdefault(m, "vision")
+            for m, k in need.items():
+                if m not in live:
+                    problems.append(f"Groq: «{m}» нет в списке ({k})")
+        except Exception as e:
+            problems.append(f"Groq: список моделей не получен ({str(e)[:80]})")
+    return problems
+
+
+async def log_model_audit(groq_clients: list) -> None:
+    """Фоновая проверка при старте: результат в лог."""
+    try:
+        problems = await audit_models(groq_clients)
+        if problems:
+            for line in problems:
+                logger.warning(f"⚠️ МОДЕЛЬ: {line}")
+        else:
+            logger.info("✅ Все модели из config найдены у провайдеров")
+    except Exception as e:
+        logger.warning(f"Проверка моделей не выполнена: {e}")
 
 
 async def llm_check(groq_clients: list) -> str:
@@ -444,6 +520,17 @@ async def llm_check(groq_clients: list) -> str:
             model=m, messages=msgs, temperature=0, max_tokens=8))
     else:
         lines.append("⚪ Groq: клиентов нет")
+
+    problems = await audit_models(groq_clients)
+    lines.append("")
+    if problems:
+        lines.append("⚠️ Модели из настроек, которых нет у провайдера:")
+        lines += [f"• {p}" for p in problems]
+    else:
+        lines.append("✅ Все модели из настроек найдены у провайдеров")
+    dead = [m for m, t in _dead_models.items() if t > time.time()]
+    if dead:
+        lines.append("⏸ Временно пропускаются после 404: " + ", ".join(dead))
     return "\n".join(lines)
 
 
@@ -479,7 +566,7 @@ async def _open_text_stream(kind: str, groq_clients: list, messages: list,
     if chain and _text_clients:
         extra = config.OPENROUTER_EXTRA_BODY.get(kind)
         client = random.choice(_text_clients)
-        for model in chain:
+        for model in (chain if len(chain) == 1 else _live_chain(chain)):
             use_extra = bool(extra)
             for _ in range(2):
                 kwargs: Dict[str, Any] = dict(model=model, messages=messages,
@@ -495,6 +582,8 @@ async def _open_text_stream(kind: str, groq_clients: list, messages: list,
                     if use_extra and ("400" in msg or "reasoning" in msg.lower()):
                         use_extra = False
                         continue
+                    if "404" in msg:
+                        _mark_dead(model)
                     break
     if groq_clients and groq_fallback:
         gk = _GROQ_KIND.get(kind, kind)
@@ -770,19 +859,30 @@ class VisionProcessor:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
         async def extract(client):
-            response = await client.chat.completions.create(
-                model=config.GROQ_MODELS["vision"],
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": config.OCR_PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]
-                }],
-                temperature=config.VISION_TEMPERATURE,
-                max_tokens=config.VISION_MAX_TOKENS,
-            )
-            return response.choices[0].message.content
+            last: Optional[Exception] = None
+            for model in config.GROQ_VISION_MODELS:
+                try:
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": config.OCR_PROMPT},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            ]
+                        }],
+                        temperature=config.VISION_TEMPERATURE,
+                        max_tokens=config.VISION_MAX_TOKENS,
+                    )
+                    return response.choices[0].message.content
+                except Exception as e:
+                    low = str(e).lower()
+                    if "404" in low or "model_not_found" in low or "decommission" in low or "does not exist" in low:
+                        logger.warning(f"Vision: модель {model} недоступна на Groq → следующая")
+                        last = e
+                        continue
+                    raise
+            raise last or Exception("Нет доступной vision-модели Groq")
 
         try:
             return await _make_groq_request(self.groq_clients, extract)

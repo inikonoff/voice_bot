@@ -76,7 +76,7 @@ BOT_TOKEN=ваш_токен_телеграм_бота
 GROQ_API_KEYS=ключ1,ключ2,ключ3          # Whisper, OCR и запасной откат
 OPENROUTER_API_KEYS=sk-or-...             # текстовые LLM (можно несколько через запятую)
 # необязательно: свой порядок моделей (через запятую, первая — основная)
-# OR_MODELS_BASIC=google/gemma-4-31b-it:free,qwen/qwen3.8-27b:free
+# OR_MODELS_BASIC=google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free
 # OR_MODELS_PREMIUM=...  OR_MODELS_SUBTITLES=...  OR_MODELS_REASONING=...
 # YandexGPT (необязательно). Включает профили «Yandex (с fallback)» и «Yandex (only)» в /model
 # YANDEX_API_KEY=...         # API-ключ сервисного аккаунта (роль ai.languageModels.user)
@@ -100,9 +100,10 @@ ADMIN_IDS=123456789                       # ваш Telegram ID (нескольк
 # USER_COOLDOWN_SEC=3        # пауза между сообщениями
 # GROUP_DAILY_LIMIT=40       # обращений к ИИ в сутки на каждый групповой чат
 # LIMITS_TZ=Europe/Minsk     # сутки считаются по этому поясу, сброс в 00:00
-# OR_MODELS_IMG2PROMPT=google/gemma-4-31b-it:free,qwen/qwen3.8-27b:free   # vision-модели для /img2prompt
-# DEFAULT_LLM_PROFILE=auto   # модель по умолчанию: auto, gemma, qwen, nemotron_super,
-#                            # nemotron_ultra, space_bunny, groq, yandex, yandex_only
+# OR_MODELS_IMG2PROMPT=google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free   # vision-модели для /img2prompt
+# GROQ_VISION_MODELS=qwen/qwen3.8-27b,qwen/qwen3.6-27b   # vision на Groq (OCR): основная и запасная
+# DEFAULT_LLM_PROFILE=auto   # модель по умолчанию: auto, gemma, gemma26, nemotron_super,
+#                            # nemotron_ultra, groq, yandex, yandex_only
 ```
 
 > Без `SUPABASE_URL` / `SUPABASE_KEY` бот работает без базы данных — история `/history` недоступна, всё хранится в памяти процесса.

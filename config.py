@@ -385,24 +385,31 @@ def _env_models(var: str, default: list) -> list:
     return default
 
 
+# Vision на Groq: если основная модель вернёт 404/снята, пробуем следующую
+# (Groq в своих рекомендациях заменой Llama 4 Scout называет qwen/qwen3.6-27b).
+# Переопределение: GROQ_VISION_MODELS=модель1,модель2
+GROQ_VISION_MODELS = _env_models("GROQ_VISION_MODELS", [GROQ_MODELS["vision"], "qwen/qwen3.6-27b"])
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_TITLE = "iGramotey"
 OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "")
 LLM_RETRIES_PER_MODEL = 2   # попыток на каждую модель, прежде чем идти к следующей
 
 _GEMMA = "google/gemma-4-31b-it:free"          # лучший кандидат по русскому слогу
-_QWEN = "qwen/qwen3.8-27b:free"                # длинные тексты, структура, саммари
+_GEMMA_MOE = "google/gemma-4-26b-a4b-it:free"  # быстрая MoE-версия Gemma 4, тоже понимает картинки
+# qwen/qwen3.8-27b:free убран: OpenRouter отозвал бесплатный вариант 05.10.2026 (404
+# "This model is unavailable for free"), остался только платный qwen/qwen3.8-27b.
 _NEMOTRON_SUPER = "nvidia/nemotron-3-super-120b-a12b:free"
 
 LLM_MODELS = {
     # «Как есть» — строгая минимальная коррекция
-    "basic": _env_models("OR_MODELS_BASIC", [_GEMMA, _QWEN]),
+    "basic": _env_models("OR_MODELS_BASIC", [_GEMMA, _GEMMA_MOE, _NEMOTRON_SUPER]),
     # «Красиво», перевод, разбор правок
-    "premium": _env_models("OR_MODELS_PREMIUM", [_GEMMA, _QWEN]),
+    "premium": _env_models("OR_MODELS_PREMIUM", [_GEMMA, _GEMMA_MOE, _NEMOTRON_SUPER]),
     # Форматирование субтитров YouTube (длинный вход)
-    "subtitles": _env_models("OR_MODELS_SUBTITLES", [_QWEN, _GEMMA]),
+    "subtitles": _env_models("OR_MODELS_SUBTITLES", [_NEMOTRON_SUPER, _GEMMA, _GEMMA_MOE]),
     # Саммари и диалог по документу
-    "reasoning": _env_models("OR_MODELS_REASONING", [_QWEN, _NEMOTRON_SUPER, _GEMMA]),
+    "reasoning": _env_models("OR_MODELS_REASONING", [_NEMOTRON_SUPER, _GEMMA, _GEMMA_MOE]),
 }
 
 # ----------------------------------------------------------------------------
@@ -480,7 +487,7 @@ LIMITS_TZ_LABEL = os.environ.get("LIMITS_TZ_LABEL", "Минск")
 LLM_PROFILES = {
     "auto": {
         "label": "🤖 Авто",
-        "desc": "Gemma/Qwen на OpenRouter, при сбоях — Groq",
+        "desc": "Gemma/Nemotron на OpenRouter, при сбоях — Groq",
         "models": None, "groq_fallback": True,
     },
     "gemma": {
@@ -488,10 +495,10 @@ LLM_PROFILES = {
         "desc": "лучший русский слог",
         "models": [_GEMMA], "groq_fallback": False,
     },
-    "qwen": {
-        "label": "🧠 Qwen3.8 27B",
-        "desc": "длинные тексты, структура",
-        "models": [_QWEN], "groq_fallback": False,
+    "gemma26": {
+        "label": "🌀 Gemma 4 26B",
+        "desc": "быстрая MoE-версия Gemma",
+        "models": [_GEMMA_MOE], "groq_fallback": False,
     },
     "nemotron_super": {
         "label": "🔬 Nemotron 3 Super",
@@ -502,11 +509,6 @@ LLM_PROFILES = {
         "label": "🏔 Nemotron 3 Ultra",
         "desc": "550B, самая крупная",
         "models": ["nvidia/nemotron-3-ultra-550b-a55b:free"], "groq_fallback": False,
-    },
-    "space_bunny": {
-        "label": "🐰 Space Bunny Alpha",
-        "desc": "stealth-модель, может исчезнуть",
-        "models": ["stealth/space-bunny-alpha"], "groq_fallback": False,
     },
     # Ключ "yandex": "first" — сначала YandexGPT, при сбое обычная цепочка
     # OpenRouter и Groq; "only" — только YandexGPT, без подмены.
@@ -541,10 +543,11 @@ if DEFAULT_LLM_PROFILE not in LLM_PROFILES:
 #
 # Проверенные vision-модели OpenRouter (free):
 #   google/gemma-4-31b-it:free                           — по умолчанию №1
-#   qwen/qwen3.8-27b:free                                — по умолчанию №2
-#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free   — запасной вариант
+#   google/gemma-4-26b-a4b-it:free                       — по умолчанию №2
+#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free   — по умолчанию №3
 #     (бесплатный эндпоинт NVIDIA логирует запросы и просит не слать лица людей)
-LLM_MODELS["img2prompt"] = _env_models("OR_MODELS_IMG2PROMPT", [_GEMMA, _QWEN])
+LLM_MODELS["img2prompt"] = _env_models("OR_MODELS_IMG2PROMPT",
+                                       [_GEMMA, _GEMMA_MOE, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"])
 OPENROUTER_EXTRA_BODY["img2prompt"] = {"reasoning": {"enabled": False}}
 FIXED_CHAIN_KINDS = {"img2prompt"}      # профиль /model на эти задачи не влияет
 
