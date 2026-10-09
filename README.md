@@ -102,6 +102,7 @@ ADMIN_IDS=123456789                       # ваш Telegram ID (нескольк
 # LIMITS_TZ=Europe/Minsk     # сутки считаются по этому поясу, сброс в 00:00
 # OR_MODELS_IMG2PROMPT=google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free   # vision-модели для /img2prompt
 # GROQ_VISION_MODELS=qwen/qwen3.8-27b,qwen/qwen3.6-27b   # vision на Groq (OCR): основная и запасная
+# (в /model показываются только рабочие модели: список сверяется с провайдерами раз в 10 минут)
 # DEFAULT_LLM_PROFILE=auto   # модель по умолчанию: auto, gemma, gemma26, nemotron_super,
 #                            # nemotron_ultra, groq, yandex, yandex_only
 ```

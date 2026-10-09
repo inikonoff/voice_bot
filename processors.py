@@ -433,6 +433,58 @@ async def _list_ids(client) -> set:
     return ids
 
 
+# Кэш живых списков моделей провайдеров (для /model и аудита). None — список не получен.
+_live: Dict[str, Any] = {"or": None, "groq": None, "or_err": None, "groq_err": None,
+                         "groq_n": 0, "ts": 0.0}
+_LIVE_TTL = 600.0
+
+
+async def refresh_live_models(groq_clients: list, force: bool = False) -> None:
+    """Обновляет кэш списков моделей (GET /models у OpenRouter и Groq), не чаще раза в 10 минут."""
+    if not force and time.time() - _live["ts"] < _LIVE_TTL:
+        return
+    _live["groq_n"] = len(groq_clients or [])
+    for key, clients in (("or", _text_clients), ("groq", groq_clients)):
+        if not clients:
+            _live[key], _live[key + "_err"] = None, None
+            continue
+        try:
+            _live[key], _live[key + "_err"] = await _list_ids(clients[0]), None
+        except Exception as e:
+            _live[key], _live[key + "_err"] = None, str(e)[:80]
+    _live["ts"] = time.time()
+
+
+def profile_status(key: str) -> Optional[str]:
+    """
+    None — профиль рабочий, иначе причина, почему его не стоит показывать в /model.
+    Если список моделей у провайдера не получен, профиль не скрывается (неизвестно ≠ сломано).
+    """
+    prof = config.LLM_PROFILES[key]
+    ymode = prof.get("yandex")
+    if ymode and not _yandex_client:
+        return "Yandex не настроен"
+    if ymode == "only":
+        return None
+    models = prof.get("models")
+    if models is None:                       # штатная цепочка / Yandex с откатом
+        return None
+    if not models:                           # профиль «только Groq»
+        if _live["ts"] and _live["groq_n"] == 0:
+            return "Groq не настроен"
+        return None
+    if not _text_clients:
+        return "OpenRouter не настроен"
+    live = _live["or"]
+    now = time.time()
+    for m in models:
+        if live is not None and m not in live:
+            return "модели нет у провайдера (снята или платная)"
+        if _dead_models.get(m, 0) > now:
+            return "модель отвечает 404"
+    return None
+
+
 async def audit_models(groq_clients: list) -> List[str]:
     """
     Сверяет модели из config с живыми списками провайдеров (GET /models).
@@ -440,10 +492,13 @@ async def audit_models(groq_clients: list) -> List[str]:
     бесплатный вариант отозван). Пустой список — всё на месте.
     """
     problems: List[str] = []
+    await refresh_live_models(groq_clients, force=True)
 
     if _text_clients:
-        try:
-            live = await _list_ids(_text_clients[0])
+        if _live["or"] is None:
+            problems.append(f"OpenRouter: список моделей не получен ({_live['or_err']})")
+        else:
+            live = _live["or"]
             used: Dict[str, List[str]] = {}
             for kind, models in config.LLM_MODELS.items():
                 for m in models:
@@ -454,20 +509,18 @@ async def audit_models(groq_clients: list) -> List[str]:
             for m, where in sorted(used.items()):
                 if m not in live:
                     problems.append(f"OpenRouter: «{m}» нет в списке ({', '.join(where)})")
-        except Exception as e:
-            problems.append(f"OpenRouter: список моделей не получен ({str(e)[:80]})")
 
     if groq_clients:
-        try:
-            live = await _list_ids(groq_clients[0])
+        if _live["groq"] is None:
+            problems.append(f"Groq: список моделей не получен ({_live['groq_err']})")
+        else:
+            live = _live["groq"]
             need = {config.GROQ_MODELS[k]: k for k in ("transcription", "basic", "premium", "reasoning")}
             for m in config.GROQ_VISION_MODELS:
                 need.setdefault(m, "vision")
             for m, k in need.items():
                 if m not in live:
                     problems.append(f"Groq: «{m}» нет в списке ({k})")
-        except Exception as e:
-            problems.append(f"Groq: список моделей не получен ({str(e)[:80]})")
     return problems
 
 

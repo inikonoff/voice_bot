@@ -1612,6 +1612,20 @@ async def limit_handler(message: types.Message):
 # ВЫБОР МОДЕЛИ (только администратор)
 # ============================================================================
 
+def _hidden_note(uid: int) -> str:
+    """Предупреждение, если выбранная модель недоступна, и список скрытых профилей."""
+    lines = []
+    cur = access.profile_key_for(uid)
+    why = processors.profile_status(cur)
+    if why:
+        lines.append(f"⚠️ <b>Выбранная модель сейчас недоступна</b> ({html.escape(why)}) — выберите другую.\n")
+    hidden = [(k, p) for k, p in config.LLM_PROFILES.items() if processors.profile_status(k)]
+    if hidden:
+        lines.append("<i>Скрыты как нерабочие: " + ", ".join(
+            f"{html.escape(p['label'])} — {html.escape(processors.profile_status(k))}" for k, p in hidden) + "</i>\n")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def _model_menu_text(uid: int) -> str:
     profiles = config.LLM_PROFILES
     personal = access.personal_profile_key(uid)
@@ -1623,6 +1637,7 @@ def _model_menu_text(uid: int) -> str:
         "субтитры. Whisper и OCR остаются на Groq.\n\n"
         f"Сейчас у вас: <b>{mine}</b>\n"
         f"Для всех пользователей: <b>{profiles[access.global_profile_key()]['label']}</b>\n\n"
+        + _hidden_note(uid) +
         "<i>Конкретная модель работает строго: если она недоступна, вы увидите "
         "ошибку, а не тихую подмену. «Авто» сама переключается между моделями и Groq. "
         "«Yandex (с fallback)» сначала пробует YandexGPT, при сбое идёт по цепочке «Авто»; "
@@ -1637,6 +1652,8 @@ def _model_menu_kb(uid: int) -> InlineKeyboardMarkup:
     personal = access.personal_profile_key(uid)
     rows, row = [], []
     for key, prof in config.LLM_PROFILES.items():
+        if processors.profile_status(key):      # в списке только рабочие модели
+            continue
         mark = "✅ " if key == current else ""
         row.append(InlineKeyboardButton(text=mark + prof["label"], callback_data=f"llm_set_{key}"))
         if len(row) == 2:
@@ -1658,6 +1675,7 @@ async def model_handler(message: types.Message):
     if not access.is_admin(uid):
         await message.answer("🧠 Модель подбирается автоматически. Выбирать её может только администратор.")
         return
+    await processors.refresh_live_models(groq_clients)     # актуальные списки моделей (не чаще раза в 10 мин)
     await message.answer(_model_menu_text(uid), parse_mode="HTML", reply_markup=_model_menu_kb(uid))
 
 
@@ -1668,17 +1686,23 @@ async def model_callback(callback: types.CallbackQuery):
         await callback.answer("Только для администратора", show_alert=True)
         return
 
+    await processors.refresh_live_models(groq_clients)
     data = callback.data
     note = ""
     if data.startswith("llm_set_"):
         key = data[len("llm_set_"):]
-        if key in config.LLM_PROFILES:
+        if key in config.LLM_PROFILES and processors.profile_status(key):
+            note = "Эта модель сейчас недоступна"      # кнопка могла остаться от старого меню
+        elif key in config.LLM_PROFILES:
             await access.set_personal_profile(uid, key)
             note = f"Выбрано: {config.LLM_PROFILES[key]['label']}"
     elif data == "llm_global":
         key = access.profile_key_for(uid)
-        await access.set_global_profile(key)
-        note = f"Для всех: {config.LLM_PROFILES[key]['label']}"
+        if processors.profile_status(key):
+            note = "Эта модель сейчас недоступна"
+        else:
+            await access.set_global_profile(key)
+            note = f"Для всех: {config.LLM_PROFILES[key]['label']}"
     elif data == "llm_reset":
         await access.reset_personal_profile(uid)
         note = "Личный выбор сброшен"
