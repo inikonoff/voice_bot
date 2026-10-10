@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Rounded "card" glyph, echoing the swipe-card stack in the app. -->
+    <path
+        android:fillColor="#C86D51"
+        android:pathData="M34,30 h40 a10,10 0 0 1 10,10 v40 a10,10 0 0 1 -10,10 h-40 a10,10 0 0 1 -10,-10 v-40 a10,10 0 0 1 10,-10 z" />
+    <path
+        android:fillColor="#9DB59B"
+        android:pathData="M40,40 h28 a6,6 0 0 1 6,6 v28 a6,6 0 0 1 -6,6 h-28 a6,6 0 0 1 -6,-6 v-28 a6,6 0 0 1 6,-6 z" />
+</vector>
